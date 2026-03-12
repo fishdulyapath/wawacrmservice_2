@@ -1,0 +1,29 @@
+{
+  "name": "crm-backend",
+  "version": "1.0.0",
+  "description": "CRM Backend API — WAWA CRM",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.3.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.1.1",
+    "node-cron": "^3.0.3",
+    "pg": "^8.12.0",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "http-proxy-middleware": "^3.0.5",
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
