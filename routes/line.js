@@ -116,6 +116,17 @@ async function handleMessage(event, replyToken) {
 
 // ── OTP Link: ผูก LINE กับ Employee ───────────────────────────
 async function handleLinkByOTP(lineUserId, token, replyToken) {
+  // Debug: ตรวจสอบว่า token มีอยู่ในระบบไหม (ไม่ว่าจะหมดอายุหรือใช้แล้ว)
+  const debugResult = await crmDB.query(`
+    SELECT t.token, t.is_used, t.expires_at, t.created_at,
+           NOW() AS db_now,
+           (t.expires_at > NOW()) AS is_valid
+    FROM crm_line_link_token t
+    WHERE t.token = $1
+  `, [token])
+  console.log(`[OTP Debug] token="${token}", lineUserId="${lineUserId}"`)
+  console.log(`[OTP Debug] found=${debugResult.rows.length}`, debugResult.rows[0] || 'NOT FOUND')
+
   const tokenResult = await crmDB.query(`
     SELECT t.user_id, t.expires_at, u.name, u.code
     FROM crm_line_link_token t
@@ -124,6 +135,15 @@ async function handleLinkByOTP(lineUserId, token, replyToken) {
   `, [token])
 
   if (tokenResult.rows.length === 0) {
+    // Debug: บอกรายละเอียดว่าทำไมไม่เจอ
+    if (debugResult.rows.length === 0) {
+      console.warn(`[OTP] Token "${token}" ไม่มีในระบบเลย — อาจ generate จากคนละ DB/server`)
+    } else {
+      const d = debugResult.rows[0]
+      if (d.is_used) console.warn(`[OTP] Token "${token}" ถูกใช้ไปแล้ว`)
+      if (!d.is_valid) console.warn(`[OTP] Token "${token}" หมดอายุแล้ว — expires_at=${d.expires_at}, db_now=${d.db_now}`)
+    }
+
     await lineService.replyOrPush(replyToken, lineUserId, [{
       type: 'text',
       text: '❌ รหัสยืนยันไม่ถูกต้องหรือหมดอายุ\nกรุณาขอรหัสใหม่จากระบบ CRM'
@@ -235,22 +255,31 @@ router.post('/generate-otp', authMiddleware, async (req, res) => {
     `, [userId])
 
     // สร้าง OTP ใหม่ (6 หลัก อ่านง่าย)
-    const otp       = String(Math.floor(100000 + Math.random() * 900000))
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000) // 10 นาที
+    const otp = String(Math.floor(100000 + Math.random() * 900000))
 
-    await crmDB.query(`
+    // ⚠️ ใช้ DB NOW() + INTERVAL เพื่อให้ timezone ตรงกับ verify query
+    const insertResult = await crmDB.query(`
       INSERT INTO crm_line_link_token (user_id, token, expires_at)
-      VALUES ($1, $2, $3)
-    `, [userId, otp, expiresAt])
+      VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
+      RETURNING expires_at
+    `, [userId, otp])
+
+    const expiresAt = insertResult.rows[0].expires_at
+
+    // Debug: log เพื่อตรวจ timezone
+    const dbNow = await crmDB.query(`SELECT NOW() AS db_now, current_setting('TIMEZONE') AS tz`)
+    console.log(`[OTP Generated] otp=${otp}, userId=${userId}, expires_at=${expiresAt}`)
+    console.log(`[OTP Generated] DB NOW=${dbNow.rows[0].db_now}, DB TZ=${dbNow.rows[0].tz}, JS Date=${new Date().toISOString()}`)
 
     res.json({
       otp,
       expires_at: expiresAt,
-      bot_id:    process.env.LINE_BOT_BASIC_ID,     // @bc-crm หรือ ตาม config
+      bot_id:    process.env.LINE_BOT_BASIC_ID,
       qr_url:    `https://line.me/R/ti/p/${process.env.LINE_BOT_BASIC_ID}`,
       instructions: `ส่งรหัส ${otp} ไปหา LINE Bot ภายใน 10 นาที`
     })
   } catch (err) {
+    console.error('[generate-otp error]', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -356,6 +385,49 @@ router.post('/log-call', authMiddleware, async (req, res) => {
     `, [ar_code])
 
     res.json({ success: true, call_log_id: result.rows[0].id })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/line/debug-otp  — Debug: ตรวจสอบ OTP ล่าสุดและ timezone
+// ⚠️ ลบออกหลัง debug เสร็จ
+// ─────────────────────────────────────────────────────────────
+router.get('/debug-otp', authMiddleware, async (req, res) => {
+  try {
+    // OTP ล่าสุดของ user นี้
+    const otpResult = await crmDB.query(`
+      SELECT token, is_used, expires_at, created_at,
+             NOW() AS db_now,
+             current_setting('TIMEZONE') AS db_tz,
+             (expires_at > NOW()) AS is_valid,
+             EXTRACT(EPOCH FROM (expires_at - NOW())) AS seconds_remaining
+      FROM crm_line_link_token
+      WHERE user_id = $1
+      ORDER BY created_at DESC
+      LIMIT 5
+    `, [req.user.id])
+
+    // Webhook log ล่าสุด
+    const webhookResult = await crmDB.query(`
+      SELECT event_type, line_user_id, raw_body, created_at
+      FROM crm_line_webhook_log
+      ORDER BY created_at DESC
+      LIMIT 5
+    `)
+
+    res.json({
+      js_now: new Date().toISOString(),
+      otp_tokens: otpResult.rows,
+      recent_webhooks: webhookResult.rows,
+      env_check: {
+        LINE_CHANNEL_SECRET: process.env.LINE_CHANNEL_SECRET ? '✅ set' : '❌ missing',
+        LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN ? '✅ set' : '❌ missing',
+        LINE_BOT_BASIC_ID: process.env.LINE_BOT_BASIC_ID || '❌ missing',
+        FRONTEND_URL: process.env.FRONTEND_URL || '❌ missing',
+      }
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
