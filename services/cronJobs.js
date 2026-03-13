@@ -10,11 +10,22 @@ const { notify, notifyMany } = require('./notifyService')
 function start() {
   console.log('⏰ Cron Jobs started')
 
-  // ── 1. Daily Summary: ทุกวัน ตรวจทุก 1 นาที ว่าถึงเวลาส่งไหม ──
+  // ── Timezone config ──────────────────────────────────────────
+  // Render/Cloud ใช้ UTC — ต้องบอก node-cron ให้ใช้เวลาไทย
+  const TZ = 'Asia/Bangkok'
+  const cronOpts = { timezone: TZ }
+
+  // Helper: ดึงเวลาไทย HH:MM (ไม่พึ่ง system timezone)
+  function bangkokHHMM() {
+    const now = new Date()
+    const bkk = new Date(now.toLocaleString('en-US', { timeZone: TZ }))
+    return `${String(bkk.getHours()).padStart(2, '0')}:${String(bkk.getMinutes()).padStart(2, '0')}`
+  }
+
+  // ── 1. Daily Summary: ทุกนาที ตรวจว่าถึงเวลาส่งไหม ──
   cron.schedule('* * * * *', async () => {
     try {
-      const now = new Date()
-      const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+      const hhmm = bangkokHHMM()
 
       // ส่งเฉพาะ user ที่ตั้ง notify_time ตรงกับเวลาตอนนี้
       const result = await crmDB.query(`
@@ -37,7 +48,7 @@ function start() {
     }
   })
 
-  // ── 2. Task Overdue Alert: ทุก 8:00 น. ──
+  // ── 2. Task Overdue Alert: ทุก 8:00 น. (เวลาไทย) ──
   // ใช้ crm_activity_owners เพื่อแจ้งทุก owner ที่ยังไม่ได้ปิดงาน
   cron.schedule('0 8 * * *', async () => {
     try {
@@ -77,16 +88,12 @@ function start() {
     } catch (err) {
       console.error('[Cron Overdue Error]', err.message)
     }
-  })
+  }, cronOpts)
 
   // ── 3. Task Due Tomorrow: ทุก 17:00 น. ──
   // ใช้ crm_activity_owners เพื่อแจ้งทุก owner ที่ยังไม่ได้ปิดงาน
   cron.schedule('0 17 * * *', async () => {
     try {
-      const tomorrow = new Date()
-      tomorrow.setDate(tomorrow.getDate() + 1)
-      const tomorrowDate = tomorrow.toISOString().split('T')[0]
-
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.due_date, a.start_datetime, a.priority, a.ar_code,
                u.id AS user_id, u.line_user_id, u.line_notify_enabled
@@ -94,9 +101,10 @@ function start() {
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
         WHERE ao.status NOT IN ('done','cancelled')
-          AND COALESCE(a.due_date, DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok')) = $1
+          AND COALESCE(a.due_date, DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok'))
+              = (CURRENT_DATE + INTERVAL '1 day')
           AND u.is_active = TRUE
-      `, [tomorrowDate])
+      `)
 
       for (const task of result.rows) {
         const typeLabel2 = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
@@ -120,15 +128,12 @@ function start() {
     } catch (err) {
       console.error('[Cron DueTomorrow Error]', err.message)
     }
-  })
+  }, cronOpts)
 
   // ── 4. Meeting Reminder: ทุก 15 นาที ──
   // ใช้ crm_activity_owners เพื่อแจ้งทุก owner/participant ที่ยังไม่ได้ปิด
   cron.schedule('*/15 * * * *', async () => {
     try {
-      const now = new Date()
-      const in30min = new Date(now.getTime() + 30 * 60 * 1000)
-
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.start_datetime, a.location, a.meeting_url, a.ar_code,
                u.id AS user_id, u.line_user_id, u.name AS user_name, u.line_notify_enabled
@@ -137,12 +142,12 @@ function start() {
         JOIN crm_users u ON u.id = ao.user_id
         WHERE a.activity_type = 'meeting'
           AND ao.status NOT IN ('done','cancelled')
-          AND a.start_datetime BETWEEN $1 AND $2
+          AND a.start_datetime BETWEEN NOW() AND NOW() + INTERVAL '30 minutes'
           AND u.is_active = TRUE
-      `, [now, in30min])
+      `)
 
       for (const meeting of result.rows) {
-        const startText = new Date(meeting.start_datetime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+        const startText = new Date(meeting.start_datetime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: TZ })
 
         await notify({
           userId: meeting.user_id,
@@ -175,7 +180,7 @@ function start() {
     } catch (err) {
       console.error('[Cron Meeting Error]', err.message)
     }
-  })
+  }, cronOpts)
 
   // ── 5. No-Contact Alert: ทุกวันจันทร์ 9:00 น. ──
   cron.schedule('0 9 * * 1', async () => {
@@ -225,7 +230,7 @@ function start() {
     } catch (err) {
       console.error('[Cron NoContact Error]', err.message)
     }
-  })
+  }, cronOpts)
 
   // ── 6. Cleanup: ทุกคืน 2:00 น. ──
   cron.schedule('0 2 * * *', async () => {
@@ -242,7 +247,7 @@ function start() {
     } catch (err) {
       console.error('[Cron Cleanup Error]', err.message)
     }
-  })
+  }, cronOpts)
 }
 
 module.exports = { start }
