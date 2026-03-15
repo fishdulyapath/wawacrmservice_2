@@ -9,6 +9,10 @@ const { posDB, crmDB } = require('./db')
 const app  = express()
 const PORT = process.env.PORT || 3000
 
+// ── Trust proxy (Nginx/Cloudflare อยู่หน้า Express) ──
+// ทำให้ rate-limit ใช้ X-Forwarded-For ได้ถูกต้อง
+app.set('trust proxy', 1)
+
 // ── Security headers ────────────────────
 // Dev: ปิด CSP เพื่อให้ LIFF SDK ทำงานได้ (inline scripts, LINE CDN)
 // Production: ควรตั้ง CSP ที่เหมาะสม
@@ -41,7 +45,7 @@ app.use('/api/auth/login', authLimiter)
 // CORS: รองรับหลาย origin (production + ngrok + dev)
 const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
-  .map(s => s.trim())
+  .map(s => s.trim().replace(/\/+$/, ''))   // ลบ trailing slash
   .filter(Boolean)
 
 app.use(cors({
@@ -49,17 +53,22 @@ app.use(cors({
     ? (origin, cb) => {
         // อนุญาต requests ที่ไม่มี origin (mobile apps, curl, etc.)
         if (!origin) return cb(null, true)
-        // ตรวจว่า origin ตรงกับ allowed list หรือเป็น ngrok
+        // ลบ trailing slash จาก origin ที่เข้ามาด้วย
+        const cleanOrigin = origin.replace(/\/+$/, '')
+        // ตรวจว่า origin ตรงกับ allowed list หรือเป็น trusted domain
         if (
-          allowedOrigins.includes(origin) ||
-          origin.endsWith('.ngrok-free.app') ||
-          origin.endsWith('.ngrok.io') ||
-          origin.endsWith('.web.app') ||
-          origin.endsWith('.firebaseapp.com') ||
-          origin.startsWith('http://localhost')
+          allowedOrigins.includes(cleanOrigin) ||
+          cleanOrigin.endsWith('.iszai.com') ||
+          cleanOrigin.endsWith('.wawashop.com') ||
+          cleanOrigin.endsWith('.ngrok-free.app') ||
+          cleanOrigin.endsWith('.ngrok.io') ||
+          cleanOrigin.endsWith('.web.app') ||
+          cleanOrigin.endsWith('.firebaseapp.com') ||
+          cleanOrigin.startsWith('http://localhost')
         ) {
           return cb(null, true)
         }
+        console.warn(`[CORS] Blocked origin: ${origin}`)
         cb(new Error('Not allowed by CORS'))
       }
     : '*',

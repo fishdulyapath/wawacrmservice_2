@@ -390,47 +390,4 @@ router.post('/log-call', authMiddleware, async (req, res) => {
   }
 })
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/line/debug-otp  — Debug: ตรวจสอบ OTP ล่าสุดและ timezone
-// ⚠️ ลบออกหลัง debug เสร็จ
-// ─────────────────────────────────────────────────────────────
-router.get('/debug-otp', authMiddleware, async (req, res) => {
-  try {
-    // OTP ล่าสุดของ user นี้
-    const otpResult = await crmDB.query(`
-      SELECT token, is_used, expires_at, created_at,
-             NOW() AS db_now,
-             current_setting('TIMEZONE') AS db_tz,
-             (expires_at > NOW()) AS is_valid,
-             EXTRACT(EPOCH FROM (expires_at - NOW())) AS seconds_remaining
-      FROM crm_line_link_token
-      WHERE user_id = $1
-      ORDER BY created_at DESC
-      LIMIT 5
-    `, [req.user.id])
-
-    // Webhook log ล่าสุด
-    const webhookResult = await crmDB.query(`
-      SELECT event_type, line_user_id, raw_body, created_at
-      FROM crm_line_webhook_log
-      ORDER BY created_at DESC
-      LIMIT 5
-    `)
-
-    res.json({
-      js_now: new Date().toISOString(),
-      otp_tokens: otpResult.rows,
-      recent_webhooks: webhookResult.rows,
-      env_check: {
-        LINE_CHANNEL_SECRET: process.env.LINE_CHANNEL_SECRET ? '✅ set' : '❌ missing',
-        LINE_CHANNEL_ACCESS_TOKEN: process.env.LINE_CHANNEL_ACCESS_TOKEN ? '✅ set' : '❌ missing',
-        LINE_BOT_BASIC_ID: process.env.LINE_BOT_BASIC_ID || '❌ missing',
-        FRONTEND_URL: process.env.FRONTEND_URL || '❌ missing',
-      }
-    })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
-})
-
 module.exports = router

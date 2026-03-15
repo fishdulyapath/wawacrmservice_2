@@ -273,12 +273,21 @@ router.post('/quick-activity', async (req, res) => {
       call_phone || null, duration_sec || null
     ])
 
+    const activityId = result.rows[0].id
+
+    // insert owner row — ถ้าไม่มีจะทำให้ tasks query ไม่เจองานนี้
+    await crmDB.query(`
+      INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
+      VALUES ($1, $2, TRUE, $3, $2)
+      ON CONFLICT (activity_id, user_id) DO NOTHING
+    `, [activityId, userId, status])
+
     await logAudit({
-      tableName: 'crm_activities', recordId: result.rows[0].id,
+      tableName: 'crm_activities', recordId: activityId,
       arCode: ar_code, action: 'INSERT', newData: req.body
     }, req)
 
-    res.status(201).json({ success: true, id: result.rows[0].id })
+    res.status(201).json({ success: true, id: activityId })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
