@@ -22,18 +22,44 @@ function start() {
     return `${String(bkk.getHours()).padStart(2, '0')}:${String(bkk.getMinutes()).padStart(2, '0')}`
   }
 
+  // Helper: ดึงวันที่ไทย YYYY-MM-DD (ป้องกัน timezone ต่าง)
+  function bangkokDate() {
+    const now = new Date()
+    const bkk = new Date(now.toLocaleString('en-US', { timeZone: TZ }))
+    return `${bkk.getFullYear()}-${String(bkk.getMonth() + 1).padStart(2, '0')}-${String(bkk.getDate()).padStart(2, '0')}`
+  }
+
+  // ── Dedup guard: เก็บ HH:MM ล่าสุดที่ส่ง Daily Summary ──
+  // ป้องกัน cron 2 tick ภายใน 1 นาทีเดียวกัน
+  let lastDailySentMinute = ''
+
   // ── 1. Daily Summary: ทุกนาที ตรวจว่าถึงเวลาส่งไหม ──
   cron.schedule('* * * * *', async () => {
     try {
       const hhmm = bangkokHHMM()
 
+      // ── In-memory dedup: ถ้านาทีนี้ส่งไปแล้ว ข้าม ──
+      if (lastDailySentMinute === hhmm) return
+      lastDailySentMinute = hhmm
+
+      const todayStr = bangkokDate()
+
       // ส่งเฉพาะ user ที่ตั้ง notify_time ตรงกับเวลาตอนนี้
+      // + ยังไม่เคยส่งวันนี้ (ตรวจจาก crm_line_message_log)
       const result = await crmDB.query(`
-        SELECT * FROM v_daily_summary_per_user
-        WHERE line_notify_enabled = TRUE
-          AND line_user_id IS NOT NULL
-          AND to_char(line_notify_time, 'HH24:MI') = $1
-      `, [hhmm])
+        SELECT v.* FROM v_daily_summary_per_user v
+        WHERE v.line_notify_enabled = TRUE
+          AND v.line_user_id IS NOT NULL
+          AND to_char(v.line_notify_time, 'HH24:MI') = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_line_message_log lg
+            WHERE lg.user_id = v.user_id
+              AND lg.message_type = 'daily_summary'
+              AND lg.success = TRUE
+              AND lg.sent_at >= $2::date
+              AND lg.sent_at <  ($2::date + INTERVAL '1 day')
+          )
+      `, [hhmm, todayStr])
 
       for (const user of result.rows) {
         await lineService.sendDailySummary(user)

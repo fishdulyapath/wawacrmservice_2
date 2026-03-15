@@ -4,6 +4,28 @@ const LINE_API = 'https://api.line.me/v2/bot/message'
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN
 
 // ─────────────────────────────────────────────────────────────
+// Helper: สร้าง LIFF URL สำหรับเปิดหน้าเว็บผ่าน LINE in-app browser
+// เปิดผ่าน https://liff.line.me/{LIFF_ID}/path เพื่อให้ LIFF SDK
+// ทำ auto-login ได้ — ถ้าเปิดตรง FRONTEND_URL จะ 400 Bad Request
+// ─────────────────────────────────────────────────────────────
+function liffUrl(path) {
+  const liffId = process.env.LIFF_ID || ''
+  if (liffId) {
+    // LIFF Endpoint URL = https://wawaapp.iszai.com/line
+    // path ที่ส่งมาจะเป็น /line/tasks → ต้องตัด /line prefix ออก
+    // เพราะ LIFF จะ append path หลัง LIFF ID ต่อจาก Endpoint URL
+    // เช่น liff.line.me/{id}/tasks → wawaapp.iszai.com/line/tasks ✅
+    const liffPath = path.startsWith('/line') ? path.slice(5) : path
+    // ถ้า liffPath ว่าง (path เป็น "/line") ให้ใช้ "/" 
+    const finalPath = liffPath || '/'
+    return `https://liff.line.me/${liffId}${finalPath}`
+  }
+  // fallback: ถ้าไม่มี LIFF_ID ใช้ FRONTEND_URL ตรง (จะมีปัญหา auth)
+  const base = (process.env.FRONTEND_URL || '').replace(/\/+$/, '')
+  return `${base}${path}`
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helper: ส่ง LINE Message ไปหา userId (Push API — มีโควตา)
 // ใช้สำหรับ: cron jobs, notifications ที่ไม่ได้เกิดจาก webhook
 // ─────────────────────────────────────────────────────────────
@@ -161,7 +183,7 @@ async function sendDailySummary(user, replyToken = null) {
       contents: [
         {
           type: 'button', style: 'primary', color: '#2563eb',
-          action: { type: 'uri', label: '📋 ดูงานทั้งหมด', uri: `${process.env.FRONTEND_URL}/line/tasks` }
+          action: { type: 'uri', label: '📋 ดูงานทั้งหมด', uri: liffUrl('/line/tasks') }
         }
       ]
     }
@@ -225,7 +247,7 @@ function buildCustomerCard(customer, contactors = []) {
           type: 'button', style: 'secondary', height: 'sm',
           action: {
             type: 'uri', label: '📝 บันทึกการติดต่อ',
-            uri: `${process.env.FRONTEND_URL}/line/log-call?ar_code=${customer.code}`
+            uri: liffUrl(`/line/log-call?ar_code=${customer.code}`)
           }
         }
       ]
@@ -272,7 +294,7 @@ async function sendTaskReminder(lineUserId, userId, activity) {
           type: 'button', style: 'primary', color: headerColor,
           action: {
             type: 'uri', label: '📋 ดูรายละเอียด',
-            uri: `${process.env.FRONTEND_URL}/line/tasks`
+            uri: liffUrl('/line/tasks')
           }
         }
       ]
@@ -314,7 +336,7 @@ async function sendNewAssignment(lineUserId, userId, customer) {
         type: 'box', layout: 'vertical', paddingAll: '15px',
         contents: [{
           type: 'button', style: 'primary', color: '#059669',
-          action: { type: 'uri', label: '👤 ดูข้อมูลลูกค้า', uri: `${process.env.FRONTEND_URL}/line/customers/${customer.code}` }
+          action: { type: 'uri', label: '👤 ดูข้อมูลลูกค้า', uri: liffUrl(`/line/customers/${customer.code}`) }
         }]
       }
     }

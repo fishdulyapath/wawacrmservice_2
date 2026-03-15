@@ -7,6 +7,19 @@ const lineService = require('../services/lineService')
 
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET
 
+// Helper: สร้าง LIFF URL (เหมือนใน lineService.js)
+function _liffUrl(path) {
+  const liffId = process.env.LIFF_ID || ''
+  if (liffId) {
+    // LIFF Endpoint URL = https://wawaapp.iszai.com/line
+    // ต้องตัด /line prefix ออกจาก path เพราะ Endpoint มี /line อยู่แล้ว
+    const liffPath = path.startsWith('/line') ? path.slice(5) : path
+    const finalPath = liffPath || '/'
+    return `https://liff.line.me/${liffId}${finalPath}`
+  }
+  return (process.env.FRONTEND_URL || '').replace(/\/+$/, '') + path
+}
+
 // ─────────────────────────────────────────────────────────────
 // Middleware: ตรวจ LINE Signature
 // ─────────────────────────────────────────────────────────────
@@ -110,7 +123,7 @@ async function handleMessage(event, replyToken) {
     text: `คำสั่งที่ใช้ได้:\n` +
           `• ส่ง OTP เพื่อผูก account\n` +
           `• "งานวันนี้" — ดูสรุปงาน\n\n` +
-          `📱 เข้าดูงานได้ที่: ${process.env.FRONTEND_URL}/line`
+          `📱 เข้าดูงานได้ที่: ${_liffUrl('/line')}`
   }])
 }
 
@@ -216,7 +229,7 @@ async function handleLinkByOTP(lineUserId, token, replyToken) {
         type: 'box', layout: 'vertical', paddingAll: '15px',
         contents: [{
           type: 'button', style: 'primary', color: '#2563eb',
-          action: { type: 'uri', label: '📋 ดูงานของฉัน', uri: `${process.env.FRONTEND_URL}/line/tasks` }
+          action: { type: 'uri', label: '📋 ดูงานของฉัน', uri: _liffUrl('/line/tasks') }
         }]
       }
     }
