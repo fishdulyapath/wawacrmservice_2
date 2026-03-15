@@ -81,6 +81,333 @@ router.get('/stats', async (req, res) => {
 })
 
 // ─────────────────────────────────────────────────────────────
+// GET /api/activities/groups — Grouped activity list for managers
+// แสดง 1 แถว per group_id (หรือ 1 แถว per activity ถ้าไม่มี group)
+// ─────────────────────────────────────────────────────────────
+router.get('/groups', async (req, res) => {
+  if (!canViewAll(req.user) && !isSA(req.user)) {
+    return res.status(403).json({ error: 'ไม่มีสิทธิ์เข้าถึง' })
+  }
+
+  try {
+    const { type, status, search, date_from, date_to, page = 1, limit = 20 } = req.query
+    const offset = (parseInt(page) - 1) * parseInt(limit)
+    const params = []
+    const conditions = [`a.status != 'deleted'`]
+
+    if (type)      { params.push(type);      conditions.push(`a.activity_type = $${params.length}`) }
+    if (date_from) { params.push(date_from); conditions.push(`COALESCE(a.start_datetime::date, a.due_date) >= $${params.length}::date`) }
+    if (date_to)   { params.push(date_to);   conditions.push(`COALESCE(a.start_datetime::date, a.due_date) <= $${params.length}::date`) }
+    if (search)    { params.push(`%${search}%`); conditions.push(`(a.subject ILIKE $${params.length} OR a.ar_code ILIKE $${params.length})`) }
+
+    // status filter applies to derived group status
+    let havingClause = ''
+    if (status === 'done') {
+      havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'done' AND ao_s.removed_at IS NULL) = COUNT(*) FILTER (WHERE ao_s.removed_at IS NULL)`
+    } else if (status === 'open') {
+      havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0`
+    } else if (status === 'overdue') {
+      conditions.push(`(
+        (a.activity_type = 'task' AND a.due_date < CURRENT_DATE)
+        OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
+      )`)
+      havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0`
+    }
+
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''
+
+    // Count total groups
+    const countSql = `
+      SELECT COUNT(*) FROM (
+        SELECT COALESCE(a.group_id::text, a.id::text) AS gkey
+        FROM crm_activities a
+        LEFT JOIN crm_activity_owners ao_s ON ao_s.activity_id = a.id
+        ${where}
+        GROUP BY gkey, a.activity_type
+        ${havingClause}
+      ) sub
+    `
+    const countResult = await crmDB.query(countSql, params)
+    const total = parseInt(countResult.rows[0].count)
+
+    // Fetch grouped data
+    params.push(parseInt(limit), offset)
+    const dataSql = `
+      SELECT
+        COALESCE(a.group_id::text, a.id::text) AS group_key,
+        MAX(a.group_id::text) AS group_id,
+        MIN(a.id) AS first_activity_id,
+        MAX(a.subject) AS subject,
+        MAX(a.activity_type) AS activity_type,
+        MAX(a.priority) AS priority,
+        MAX(a.start_datetime) AS start_datetime,
+        MAX(a.due_date) AS due_date,
+        MAX(a.created_by) AS created_by,
+        MAX(a.created_at) AS created_at,
+        COUNT(DISTINCT a.id) AS member_count,
+        COUNT(DISTINCT a.id) FILTER (
+          WHERE NOT EXISTS (
+            SELECT 1 FROM crm_activity_owners ax
+            WHERE ax.activity_id = a.id AND ax.removed_at IS NULL AND ax.status = 'open'
+          )
+          AND EXISTS (
+            SELECT 1 FROM crm_activity_owners ax
+            WHERE ax.activity_id = a.id AND ax.removed_at IS NULL AND ax.status = 'done'
+          )
+        ) AS done_count,
+        -- creator name
+        (SELECT u.name FROM crm_users u WHERE u.id = MAX(a.created_by) LIMIT 1) AS creator_name,
+        -- collect ar_codes for POS lookup
+        ARRAY_AGG(DISTINCT a.ar_code) FILTER (WHERE a.ar_code IS NOT NULL) AS ar_codes,
+        -- group status: all done → done, any open → open, else cancelled
+        CASE
+          WHEN COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0 THEN 'open'
+          WHEN COUNT(*) FILTER (WHERE ao_s.status = 'done' AND ao_s.removed_at IS NULL) > 0 THEN 'done'
+          ELSE 'cancelled'
+        END AS group_status
+      FROM crm_activities a
+      LEFT JOIN crm_activity_owners ao_s ON ao_s.activity_id = a.id
+      ${where}
+      GROUP BY COALESCE(a.group_id::text, a.id::text), a.activity_type
+      ${havingClause}
+      ORDER BY
+        CASE
+          WHEN COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0 THEN 0
+          ELSE 1
+        END,
+        MAX(COALESCE(a.start_datetime, a.due_date::timestamp)) DESC NULLS LAST,
+        MAX(a.created_at) DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `
+    const dataResult = await crmDB.query(dataSql, params)
+
+    // Fetch customer names from POS
+    const allArCodes = [...new Set(dataResult.rows.flatMap(r => r.ar_codes || []))]
+    let customerMap = {}
+    if (allArCodes.length > 0) {
+      const ph = allArCodes.map((_, i) => `$${i + 1}`).join(',')
+      try {
+        const posRes = await posDB.query(`SELECT code, name_1 FROM ar_customer WHERE code IN (${ph})`, allArCodes)
+        posRes.rows.forEach(r => { customerMap[r.code] = r.name_1 })
+      } catch {}
+    }
+
+    const pageInt  = parseInt(page)
+    const limitInt = parseInt(limit)
+    res.json({
+      data: dataResult.rows.map(r => ({
+        group_key:         r.group_key,
+        group_id:          r.group_id,
+        first_activity_id: r.first_activity_id,
+        subject:           r.subject,
+        activity_type:     r.activity_type,
+        priority:          r.priority,
+        start_datetime:    r.start_datetime,
+        due_date:          r.due_date,
+        created_at:        r.created_at,
+        creator_name:      r.creator_name,
+        member_count:      parseInt(r.member_count),
+        done_count:        parseInt(r.done_count),
+        group_status:      r.group_status,
+        ar_codes:          r.ar_codes || [],
+        customer_names:    (r.ar_codes || []).map(c => customerMap[c] || c),
+      })),
+      pagination: {
+        total,
+        page:  pageInt,
+        limit: limitInt,
+        pages: Math.ceil(total / limitInt),
+      },
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/activities/groups/:groupKey — รายละเอียดกลุ่มกิจกรรม
+// groupKey = group_id (UUID) หรือ activity_id (สำหรับกิจกรรมเดี่ยว)
+// ─────────────────────────────────────────────────────────────
+router.get('/groups/:groupKey', async (req, res) => {
+  if (!canViewAll(req.user) && !isSA(req.user)) {
+    return res.status(403).json({ error: 'ไม่มีสิทธิ์เข้าถึง' })
+  }
+
+  try {
+    const { groupKey } = req.params
+
+    // Try as UUID (group_id) first, fallback to single activity id
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(groupKey)
+
+    let activitiesResult
+    if (isUUID) {
+      activitiesResult = await crmDB.query(
+        `SELECT a.* FROM crm_activities a WHERE a.group_id = $1 AND a.status != 'deleted' ORDER BY a.created_at ASC`,
+        [groupKey]
+      )
+    } else {
+      activitiesResult = await crmDB.query(
+        `SELECT a.* FROM crm_activities a WHERE a.id = $1 AND a.status != 'deleted'`,
+        [parseInt(groupKey)]
+      )
+    }
+
+    if (!activitiesResult.rows.length) {
+      return res.status(404).json({ error: 'ไม่พบกลุ่มกิจกรรม' })
+    }
+
+    const activities = activitiesResult.rows
+    const first = activities[0]
+
+    // Fetch owners for all activities in one query
+    const actIds = activities.map(a => a.id)
+    const ownersResult = await crmDB.query(`
+      SELECT ao.activity_id, ao.user_id, ao.is_primary, ao.status, ao.assigned_at,
+             u.name, u.code
+      FROM crm_activity_owners ao
+      JOIN crm_users u ON u.id = ao.user_id
+      WHERE ao.activity_id = ANY($1) AND ao.removed_at IS NULL
+      ORDER BY ao.is_primary DESC, ao.assigned_at ASC
+    `, [actIds])
+
+    const ownersByAct = {}
+    for (const o of ownersResult.rows) {
+      if (!ownersByAct[o.activity_id]) ownersByAct[o.activity_id] = []
+      ownersByAct[o.activity_id].push(o)
+    }
+
+    // Fetch customer names from POS
+    const arCodes = [...new Set(activities.map(a => a.ar_code).filter(Boolean))]
+    let customerMap = {}
+    if (arCodes.length > 0) {
+      const ph = arCodes.map((_, i) => `$${i + 1}`).join(',')
+      try {
+        const posRes = await posDB.query(`SELECT code, name_1 FROM ar_customer WHERE code IN (${ph})`, arCodes)
+        posRes.rows.forEach(r => { customerMap[r.code] = r.name_1 })
+      } catch {}
+    }
+
+    // Derive group summary
+    const allOwners = ownersResult.rows
+    const totalOwners = allOwners.length
+    const doneOwners = allOwners.filter(o => o.status === 'done').length
+    const groupStatus = allOwners.some(o => o.status === 'open') ? 'open'
+                      : allOwners.every(o => o.status === 'done') ? 'done'
+                      : 'cancelled'
+
+    // Creator name
+    let creatorName = null
+    if (first.created_by) {
+      const cRes = await crmDB.query('SELECT name FROM crm_users WHERE id=$1', [first.created_by])
+      creatorName = cRes.rows[0]?.name || null
+    }
+
+    res.json({
+      group_info: {
+        group_key:      isUUID ? groupKey : String(first.id),
+        group_id:       isUUID ? groupKey : null,
+        subject:        first.subject,
+        activity_type:  first.activity_type,
+        priority:       first.priority,
+        start_datetime: first.start_datetime,
+        due_date:       first.due_date,
+        description:    first.description,
+        location:       first.location,
+        meeting_url:    first.meeting_url,
+        created_by:     first.created_by,
+        creator_name:   creatorName,
+        created_at:     first.created_at,
+        member_count:   activities.length,
+        done_count:     activities.filter(a => {
+          const owners = ownersByAct[a.id] || []
+          return owners.length > 0 && owners.every(o => o.status === 'done')
+        }).length,
+        group_status:   groupStatus,
+      },
+      activities: activities.map(a => {
+        const owners = ownersByAct[a.id] || []
+        const actDone = owners.length > 0 && owners.every(o => o.status === 'done')
+        const actStatus = owners.some(o => o.status === 'open') ? 'open'
+                        : actDone ? 'done' : 'cancelled'
+        return {
+          id:             a.id,
+          ar_code:        a.ar_code,
+          customer_name:  customerMap[a.ar_code] || null,
+          status:         actStatus,
+          outcome:        a.outcome,
+          call_result:    a.call_result,
+          call_phone:     a.call_phone,
+          duration_sec:   a.duration_sec,
+          meeting_result: a.meeting_result,
+          created_at:     a.created_at,
+          updated_at:     a.updated_at,
+          owners:         owners.map(o => ({
+            user_id:    o.user_id,
+            name:       o.name,
+            code:       o.code,
+            is_primary: o.is_primary,
+            status:     o.status,
+          })),
+        }
+      }),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// PATCH /api/activities/groups/:groupKey/bulk-close — ปิดงานทั้งกลุ่ม
+// ─────────────────────────────────────────────────────────────
+router.patch('/groups/:groupKey/bulk-close', async (req, res) => {
+  if (!canCreate(req.user)) {
+    return res.status(403).json({ error: 'ไม่มีสิทธิ์' })
+  }
+
+  try {
+    const { groupKey } = req.params
+    const { outcome } = req.body
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(groupKey)
+
+    let actIds
+    if (isUUID) {
+      const r = await crmDB.query(
+        `SELECT id FROM crm_activities WHERE group_id = $1 AND status != 'deleted'`, [groupKey]
+      )
+      actIds = r.rows.map(r => r.id)
+    } else {
+      actIds = [parseInt(groupKey)]
+    }
+
+    if (!actIds.length) return res.status(404).json({ error: 'ไม่พบกิจกรรม' })
+
+    // Update outcome on all activities
+    if (outcome) {
+      await crmDB.query(
+        `UPDATE crm_activities SET outcome = COALESCE($2, outcome), updated_at = NOW() WHERE id = ANY($1)`,
+        [actIds, outcome]
+      )
+    }
+
+    // Close all owners
+    await crmDB.query(
+      `UPDATE crm_activity_owners SET status = 'done' WHERE activity_id = ANY($1) AND removed_at IS NULL AND status != 'done'`,
+      [actIds]
+    )
+
+    // Sync activity-level status
+    await crmDB.query(
+      `UPDATE crm_activities SET status = 'done', updated_at = NOW() WHERE id = ANY($1) AND status != 'deleted'`,
+      [actIds]
+    )
+
+    res.json({ success: true, closed_count: actIds.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
 // GET /api/activities
 // ─────────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
