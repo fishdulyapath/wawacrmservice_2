@@ -72,6 +72,7 @@ router.get('/stats', async (req, res) => {
         COUNT(*) FILTER (WHERE ${openSub}) AS open,
         COUNT(*) FILTER (WHERE a.activity_type = 'meeting' AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE AT TIME ZONE 'Asia/Bangkok' AND ${openSub}) AS meetings_today
       FROM crm_activities a
+      WHERE a.status != 'deleted'
     `, params)
     res.json(r.rows[0])
   } catch (err) {
@@ -87,7 +88,7 @@ router.get('/', async (req, res) => {
     const { type, status, ar_code, owner_id, due, search, page = 1, limit = 20 } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
-    const conditions = []
+    const conditions = [`a.status != 'deleted'`]
 
     if (type)    { params.push(type);    conditions.push(`a.activity_type = $${params.length}`) }
     if (ar_code) { params.push(ar_code); conditions.push(`a.ar_code = $${params.length}`) }
@@ -138,7 +139,10 @@ router.get('/', async (req, res) => {
 
     if (search) {
       params.push(`%${search}%`)
+      // Use ILIKE with % prefix to leverage gin_trgm_ops index on subject
       conditions.push(`(a.subject ILIKE $${params.length} OR a.ar_code ILIKE $${params.length})`)
+      // Exclude soft-deleted activities from search results
+      conditions.push(`a.status != 'deleted'`)
     }
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''
@@ -215,7 +219,7 @@ router.get('/', async (req, res) => {
 router.get('/:id', async (req, res) => {
   try {
     const result = await crmDB.query(
-      `SELECT a.* FROM crm_activities a WHERE a.id = $1`, [req.params.id]
+      `SELECT a.* FROM crm_activities a WHERE a.id = $1 AND a.status != 'deleted'`, [req.params.id]
     )
     if (!result.rows.length) return res.status(404).json({ error: 'ไม่พบ Activity' })
     const activity = result.rows[0]
@@ -614,7 +618,7 @@ router.put('/:id', async (req, res) => {
         }
       }
 
-      // 4. อัปเดต owners ทุก activity ในกลุ่ม (ถ้าระบุมา)
+      // 4. อัปเดต owners ทุก activity ในกลุ่ม (ถ้าระบุมา) — BATCH approach
       if (Array.isArray(grpOwners)) {
         const grpOwnerList = [...new Set(grpOwners.map(Number))]
         const grpPrimaryId = grpPrimary ? Number(grpPrimary) : grpOwnerList[0]
@@ -623,35 +627,58 @@ router.put('/:id', async (req, res) => {
           `SELECT id FROM crm_activities WHERE group_id=$1 AND id != $2`,
           [old.group_id, req.params.id]
         )
-        for (const row of allInGroup.rows) {
-          const actId = row.id
-          const curOwners = await client.query(
-            `SELECT user_id FROM crm_activity_owners WHERE activity_id=$1 AND removed_at IS NULL`, [actId]
-          )
-          const curIds = curOwners.rows.map(r => r.user_id)
-          const toAdd    = grpOwnerList.filter(uid => !curIds.includes(uid))
-          const toRemove = curIds.filter(uid => !grpOwnerList.includes(uid))
+        const groupActIds = allInGroup.rows.map(r => r.id)
 
-          for (const uid of toAdd) {
+        if (groupActIds.length) {
+          // Batch fetch all current owners for all group activities
+          const curOwnersRes = await client.query(
+            `SELECT activity_id, user_id FROM crm_activity_owners WHERE activity_id = ANY($1) AND removed_at IS NULL`,
+            [groupActIds]
+          )
+          const ownersByAct = {}
+          for (const r of curOwnersRes.rows) {
+            if (!ownersByAct[r.activity_id]) ownersByAct[r.activity_id] = []
+            ownersByAct[r.activity_id].push(r.user_id)
+          }
+
+          // Batch soft-remove owners not in new list
+          await client.query(
+            `UPDATE crm_activity_owners SET removed_at=NOW(), removed_by=$3
+             WHERE activity_id = ANY($1) AND user_id != ALL($2) AND removed_at IS NULL`,
+            [groupActIds, grpOwnerList, req.user.id]
+          )
+
+          // Batch upsert new owners for all group activities
+          const upsertValues = []
+          const upsertParams = []
+          let pIdx = 0
+          for (const actId of groupActIds) {
+            const curIds = ownersByAct[actId] || []
+            for (const uid of grpOwnerList) {
+              if (!curIds.includes(uid)) {
+                const b = pIdx * 4
+                upsertValues.push(`($${b+1},$${b+2},$${b+3},'open',$${b+4})`)
+                upsertParams.push(actId, uid, uid === grpPrimaryId, req.user.id)
+                pIdx++
+              }
+            }
+          }
+          if (upsertValues.length) {
             await client.query(`
               INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
-              VALUES ($1,$2,$3,'open',$4)
+              VALUES ${upsertValues.join(',')}
               ON CONFLICT (activity_id, user_id) DO UPDATE
-              SET removed_at=NULL, removed_by=NULL, assigned_by=$4, status='open'
-            `, [actId, uid, uid === grpPrimaryId, req.user.id])
+              SET removed_at=NULL, removed_by=NULL, assigned_by=EXCLUDED.assigned_by, status='open'
+            `, upsertParams)
           }
-          for (const uid of toRemove) {
-            await client.query(
-              `UPDATE crm_activity_owners SET removed_at=NOW(), removed_by=$3 WHERE activity_id=$1 AND user_id=$2`,
-              [actId, uid, req.user.id]
-            )
-          }
+
+          // Batch update primary flag
           if (grpPrimaryId) {
             await client.query(
-              `UPDATE crm_activity_owners SET is_primary=(user_id=$2) WHERE activity_id=$1 AND removed_at IS NULL`,
-              [actId, grpPrimaryId]
+              `UPDATE crm_activity_owners SET is_primary=(user_id=$2) WHERE activity_id = ANY($1) AND removed_at IS NULL`,
+              [groupActIds, grpPrimaryId]
             )
-            await client.query(`UPDATE crm_activities SET owner_id=$2 WHERE id=$1`, [actId, grpPrimaryId])
+            await client.query(`UPDATE crm_activities SET owner_id=$2 WHERE id = ANY($1)`, [groupActIds, grpPrimaryId])
           }
         }
       }
@@ -752,7 +779,12 @@ router.patch('/:id/status', async (req, res) => {
       WHERE activity_id = $1 AND user_id = $2 AND removed_at IS NULL
     `, [req.params.id, req.user.id, status])
 
-    res.json({ success: true, status })
+    // ── Sync crm_activities.status from owners ──
+    const owners = await getOwners(req.params.id)
+    const derivedStatus = deriveActivityStatus(owners)
+    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [req.params.id, derivedStatus])
+
+    res.json({ success: true, status, activity_status: derivedStatus })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -811,12 +843,21 @@ router.patch('/:id/snooze', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.patch('/:id/done', async (req, res) => {
   try {
-    const existing = await crmDB.query('SELECT id FROM crm_activities WHERE id=$1', [req.params.id])
+    const existing = await crmDB.query('SELECT * FROM crm_activities WHERE id=$1', [req.params.id])
     if (!existing.rows.length) return res.status(404).json({ error: 'ไม่พบ Activity' })
 
     if (!canCreate(req.user)) {
       const ok = await isActiveOwner(req.params.id, req.user.id)
       if (!ok) return res.status(403).json({ error: 'ไม่มีสิทธิ์' })
+    }
+
+    // ── Idempotency guard: check if already done ──
+    const ownerCheck = await crmDB.query(
+      `SELECT status FROM crm_activity_owners WHERE activity_id=$1 AND user_id=$2 AND removed_at IS NULL`,
+      [req.params.id, req.user.id]
+    )
+    if (ownerCheck.rows.length && ownerCheck.rows[0].status === 'done') {
+      return res.json({ ...existing.rows[0], _already_done: true })
     }
 
     const { outcome, call_phone, call_result, call_direction, duration_sec,
@@ -863,7 +904,12 @@ router.patch('/:id/done', async (req, res) => {
       }
     }
 
-    res.json(result.rows[0])
+    // ── Sync crm_activities.status from owners ──
+    const owners = await getOwners(req.params.id)
+    const derivedStatus = deriveActivityStatus(owners)
+    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [req.params.id, derivedStatus])
+
+    res.json({ ...result.rows[0], status: derivedStatus })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -892,9 +938,15 @@ router.delete('/:id', requireRole('admin', 'manager'), async (req, res) => {
       })
     }
 
-    await crmDB.query('DELETE FROM crm_activity_owners WHERE activity_id=$1', [req.params.id])
-    await crmDB.query('DELETE FROM crm_activity_invitees WHERE activity_id=$1', [req.params.id])
-    await crmDB.query('DELETE FROM crm_activities WHERE id=$1', [req.params.id])
+    // Soft-delete: set status to 'deleted' + mark all owners as cancelled
+    await crmDB.query(
+      `UPDATE crm_activity_owners SET status='cancelled', removed_at=NOW(), removed_by=$2 WHERE activity_id=$1 AND removed_at IS NULL`,
+      [req.params.id, req.user.id]
+    )
+    await crmDB.query(
+      `UPDATE crm_activities SET status='deleted', updated_at=NOW() WHERE id=$1`,
+      [req.params.id]
+    )
 
     await logAudit({
       tableName: 'crm_activities', recordId: old.id, arCode: old.ar_code,

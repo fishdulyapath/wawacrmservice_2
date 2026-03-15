@@ -28,7 +28,7 @@ router.get('/tasks', async (req, res) => {
          WHERE o2.activity_id = a.id AND o2.removed_at IS NULL) AS owners_names
       FROM crm_activities a
       JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.user_id = $1 AND ao.removed_at IS NULL
-      WHERE ao.status NOT IN ('done','cancelled')
+      WHERE ao.status NOT IN ('done','cancelled') AND a.status != 'deleted'
       ORDER BY
         CASE WHEN a.due_date < CURRENT_DATE THEN 0 ELSE 1 END,
         CASE WHEN DATE(a.due_date) = CURRENT_DATE THEN 0 ELSE 1 END,
@@ -98,14 +98,17 @@ router.patch('/tasks/:id/done', async (req, res) => {
 
     // ตรวจว่าเป็น active owner ของงานนี้
     const check = await crmDB.query(
-      `SELECT a.id, a.activity_type FROM crm_activities a
-       WHERE a.id=$1 AND EXISTS (
-         SELECT 1 FROM crm_activity_owners ao
-         WHERE ao.activity_id = a.id AND ao.user_id = $2 AND ao.removed_at IS NULL
-       )`, [id, userId]
+      `SELECT a.id, a.activity_type, ao.status AS owner_status FROM crm_activities a
+       JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.user_id = $2 AND ao.removed_at IS NULL
+       WHERE a.id=$1`, [id, userId]
     )
     if (check.rows.length === 0)
       return res.status(403).json({ error: 'ไม่พบงานนี้' })
+
+    // ── Idempotency guard: check if already done ──
+    if (check.rows[0].owner_status === 'done') {
+      return res.json({ success: true, _already_done: true })
+    }
 
     // อัปเดต owner status → done
     await crmDB.query(
@@ -132,6 +135,19 @@ router.patch('/tasks/:id/done', async (req, res) => {
         duration_sec != null ? parseInt(duration_sec) : null
       ]
     )
+
+    // ── Sync crm_activities.status from owners ──
+    const ownersRes = await crmDB.query(
+      `SELECT user_id, status, removed_at FROM crm_activity_owners WHERE activity_id=$1`, [id]
+    )
+    const active = ownersRes.rows.filter(o => !o.removed_at)
+    let derivedStatus = 'open'
+    if (active.length) {
+      if (active.every(o => o.status === 'done')) derivedStatus = 'done'
+      else if (active.every(o => o.status === 'cancelled')) derivedStatus = 'cancelled'
+    }
+    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [id, derivedStatus])
+
     await logAudit({ tableName: 'crm_activities', recordId: id, action: 'UPDATE',
       newData: { status: 'done', outcome, call_phone, call_result, call_direction, duration_sec } }, req)
 
