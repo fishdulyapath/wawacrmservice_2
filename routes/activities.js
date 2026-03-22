@@ -81,6 +81,102 @@ router.get('/stats', async (req, res) => {
 })
 
 // ─────────────────────────────────────────────────────────────
+// GET /api/activities/by-customer/:arCode — ประวัติกิจกรรมของลูกค้า
+// ใช้ใน CustomerForm.vue Tab "กิจกรรม"
+// ─────────────────────────────────────────────────────────────
+router.get('/by-customer/:arCode', async (req, res) => {
+  try {
+    const { arCode } = req.params
+    const { status, search, limit = 20, offset = 0 } = req.query
+
+    const conditions = [`a.ar_code = $1`]
+    const params = [arCode]
+
+    // status filter
+    if (status === 'open') {
+      conditions.push(`a.status IN ('open','in_progress')`)
+    } else if (status === 'done') {
+      conditions.push(`a.status = 'done'`)
+    } else if (status === 'deleted') {
+      conditions.push(`a.status = 'deleted'`)
+    } else {
+      // 'all' → แสดงทุกสถานะรวม deleted
+    }
+
+    if (search) {
+      params.push(`%${search}%`)
+      conditions.push(`a.subject ILIKE $${params.length}`)
+    }
+
+    const where = 'WHERE ' + conditions.join(' AND ')
+
+    // Total count
+    const countRes = await crmDB.query(
+      `SELECT COUNT(*) FROM crm_activities a ${where}`, params
+    )
+    const total = parseInt(countRes.rows[0].count)
+
+    // Fetch activities + owners in one query
+    const lim = Math.min(parseInt(limit) || 20, 100)
+    const off = parseInt(offset) || 0
+    params.push(lim, off)
+
+    const dataRes = await crmDB.query(`
+      SELECT a.id, a.activity_type, a.subject, a.status, a.priority,
+             a.due_date, a.start_datetime, a.end_datetime,
+             a.description, a.outcome, a.group_id,
+             a.created_at, a.created_by,
+             cu.name AS created_by_name
+      FROM crm_activities a
+      LEFT JOIN crm_users cu ON cu.id = a.created_by
+      ${where}
+      ORDER BY COALESCE(a.start_datetime, a.due_date::timestamp, a.created_at) DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params)
+
+    // Fetch owners for these activities in batch
+    const actIds = dataRes.rows.map(r => r.id)
+    let ownersMap = {}
+    if (actIds.length > 0) {
+      const owRes = await crmDB.query(`
+        SELECT ao.activity_id, ao.user_id, ao.is_primary, ao.status,
+               ao.removed_at,
+               u.name, u.code
+        FROM crm_activity_owners ao
+        JOIN crm_users u ON u.id = ao.user_id
+        WHERE ao.activity_id = ANY($1)
+        ORDER BY ao.is_primary DESC, ao.assigned_at ASC
+      `, [actIds])
+
+      for (const ow of owRes.rows) {
+        if (!ownersMap[ow.activity_id]) ownersMap[ow.activity_id] = []
+        ownersMap[ow.activity_id].push(ow)
+      }
+
+      // สำหรับ activity ที่ done: ดึง close_note จาก owner ที่ done
+      // close_note เก็บใน crm_activity_owners ไม่มี → ใช้ a.outcome แทน
+    }
+
+    const activities = dataRes.rows.map(a => ({
+      ...a,
+      owners: (ownersMap[a.id] || []).map(o => ({
+        user_id: o.user_id,
+        name: o.name,
+        code: o.code,
+        is_primary: o.is_primary,
+        status: o.status,
+        removed_at: o.removed_at
+      }))
+    }))
+
+    res.json({ activities, total })
+  } catch (err) {
+    console.error('[GET /activities/by-customer]', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
 // GET /api/activities/groups — Grouped activity list for managers
 // แสดง 1 แถว per group_id (หรือ 1 แถว per activity ถ้าไม่มี group)
 // ─────────────────────────────────────────────────────────────
