@@ -101,6 +101,7 @@ app.use('/api/reports',        require('./routes/reports'))         // Manager+ 
 app.use('/api/sales',          require('./routes/sales'))            // Sales reports (Manager+)
 app.use('/api/cdr',           require('./routes/cdr'))             // CDR proxy
 app.use('/api/notes',          require('./routes/notes'))          // Auth required
+app.use('/api/webboard',       require('./routes/webboard'))       // Auth required
 app.use('/api/activities/:id/attachments', require('./routes/attachments'))
 
 // Static: serve uploaded files
