@@ -98,6 +98,7 @@ app.use('/api/employees',      require('./routes/employees'))      // Auth requi
 app.use('/api/activities',     require('./routes/activities'))     // Auth required
 app.use('/api/notifications',  require('./routes/notifications'))  // Auth required
 app.use('/api/reports',        require('./routes/reports'))         // Manager+ only
+app.use('/api/sales',          require('./routes/sales'))            // Sales reports (Manager+)
 app.use('/api/cdr',           require('./routes/cdr'))             // CDR proxy
 app.use('/api/notes',          require('./routes/notes'))          // Auth required
 app.use('/api/activities/:id/attachments', require('./routes/attachments'))
