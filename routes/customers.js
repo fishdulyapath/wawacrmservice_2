@@ -7,23 +7,69 @@ const { logAudit } = require('../middleware/audit')
 // ทุก endpoint ต้อง Login ก่อน
 router.use(authMiddleware)
 
+const canManageFollowup = u => u?.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u?.role)
+
+function normalizeCustomerOwners(crm = {}) {
+  const source = Array.isArray(crm.owners)
+    ? crm.owners
+    : (crm.owner_user_id ? [{ user_id: crm.owner_user_id, is_primary: true }] : [])
+
+  const seen = new Set()
+  const owners = []
+  for (const item of source) {
+    const rawId = typeof item === 'object' ? item.user_id : item
+    const userId = Number(rawId)
+    if (!userId || seen.has(userId)) continue
+    seen.add(userId)
+    owners.push({
+      user_id: userId,
+      is_primary: typeof item === 'object' ? !!item.is_primary : false,
+    })
+  }
+
+  if (owners.length && !owners.some(o => o.is_primary)) owners[0].is_primary = true
+  if (owners.filter(o => o.is_primary).length > 1) {
+    let primaryUsed = false
+    owners.forEach(o => {
+      if (o.is_primary && !primaryUsed) primaryUsed = true
+      else o.is_primary = false
+    })
+  }
+
+  return owners
+}
+
+async function replaceCustomerOwners(client, arCode, owners, assignedBy) {
+  await client.query(`DELETE FROM crm_customer_owner WHERE ar_code = $1`, [arCode])
+  for (const owner of owners) {
+    await client.query(`
+      INSERT INTO crm_customer_owner (ar_code, user_id, is_primary, assigned_by)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (ar_code, user_id) DO UPDATE SET
+        is_primary = EXCLUDED.is_primary,
+        assigned_by = EXCLUDED.assigned_by,
+        assigned_at = NOW()
+    `, [arCode, owner.user_id, owner.is_primary, assignedBy || null])
+  }
+}
+
 // ─────────────────────────────────────────────
 // GET /api/customers  — List ลูกค้าทั้งหมด
 // ─────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 20, status, owner } = req.query
+    const { search = '', page = 1, limit = 20, status, owner, crm_only } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
 
     // ── 1. สร้าง ar_code whitelist จาก filter ──────────────
-    // filter by owner: รวม CRM owner_code + POS sale_code
+    // filter by owner: CRM owner ทุกคน + POS sale_code อ้างอิงเดิม
     let ownerArCodes = null
     if (owner) {
       const [crmOwnerRes, salePosRes] = await Promise.all([
         crmDB.query(
           `SELECT o.ar_code FROM crm_customer_owner o
            JOIN crm_users u ON u.id = o.user_id
-           WHERE u.code = $1 AND o.is_primary = TRUE`, [owner]
+           WHERE u.code = $1`, [owner]
         ),
         posDB.query(
           `SELECT ar_code FROM ar_customer_detail WHERE sale_code = $1`, [owner]
@@ -51,6 +97,16 @@ router.get('/', async (req, res) => {
       }
     }
 
+    // ใช้ในหน้า ActivityForm: ค้นหาได้เฉพาะลูกค้าที่ถูกบันทึกเข้า CRM แล้ว
+    let crmOnlyArCodes = null
+    if (String(crm_only).toLowerCase() === 'true') {
+      const crmOnlyRes = await crmDB.query(`SELECT ar_code FROM crm_customer_profile`)
+      crmOnlyArCodes = crmOnlyRes.rows.map(r => r.ar_code)
+      if (crmOnlyArCodes.length === 0) {
+        return res.json({ data: [], total: 0, page: parseInt(page), limit: parseInt(limit) })
+      }
+    }
+
     // ── 2. Build WHERE สำหรับ POS query ───────────────────
     let where = ['1=1']
     let params = []
@@ -65,6 +121,10 @@ router.get('/', async (req, res) => {
     }
     if (statusArCodes) {
       params.push(statusArCodes)
+      where.push(`c.code = ANY($${params.length})`)
+    }
+    if (crmOnlyArCodes) {
+      params.push(crmOnlyArCodes)
       where.push(`c.code = ANY($${params.length})`)
     }
 
@@ -107,28 +167,23 @@ router.get('/', async (req, res) => {
         WHERE p.ar_code = ANY($1)
       `, [codes])
       crmResult.rows.forEach(r => { crmMap[r.ar_code] = r })
-    }
 
-    // ── Fallback: ลูกค้าที่ไม่มี crm owner ให้ดึงจาก sale_code ──
-    const noOwnerSaleCodes = posResult.rows
-      .filter(c => !crmMap[c.code]?.owner_user_id && c.sale_code)
-      .map(c => c.sale_code)
-    const uniqueSaleCodes = [...new Set(noOwnerSaleCodes)]
-    const saleUserMap = {}
-    if (uniqueSaleCodes.length > 0) {
-      const saleUsers = await crmDB.query(
-        `SELECT id, code, name FROM crm_users WHERE code = ANY($1) AND is_active = TRUE`,
-        [uniqueSaleCodes]
-      )
-      saleUsers.rows.forEach(u => { saleUserMap[u.code] = u })
+      const ownersResult = await crmDB.query(`
+        SELECT o.ar_code, o.user_id, o.is_primary, u.code, u.name
+        FROM crm_customer_owner o
+        JOIN crm_users u ON u.id = o.user_id
+        WHERE o.ar_code = ANY($1)
+        ORDER BY o.ar_code, o.is_primary DESC, o.assigned_at ASC
+      `, [codes])
+      ownersResult.rows.forEach(o => {
+        if (!crmMap[o.ar_code]) return
+        if (!crmMap[o.ar_code].owners) crmMap[o.ar_code].owners = []
+        crmMap[o.ar_code].owners.push(o)
+      })
     }
 
     const data = posResult.rows.map(c => {
-      let crm = crmMap[c.code] || null
-      if (crm && !crm.owner_user_id && c.sale_code && saleUserMap[c.sale_code]) {
-        const su = saleUserMap[c.sale_code]
-        crm = { ...crm, owner_user_id: su.id, owner_code: su.code, owner_name: su.name, owner_from_sale_code: true }
-      }
+      const crm = crmMap[c.code] || null
       return { ...c, crm }
     })
 
@@ -225,19 +280,66 @@ router.get('/:code', async (req, res) => {
 
     let crm = crmResult.rows[0] || null
 
-    // ── Fallback: ถ้าไม่มี crm owner ให้ดึงจาก sale_code ใน POS ──
-    if (crm && !crm.owner_user_id) {
-      const saleCode = detailResult.rows[0]?.sale_code || cusResult.rows[0]?.sale_code
-      if (saleCode) {
-        const fallback = await crmDB.query(
-          `SELECT id, code, name FROM crm_users WHERE code = $1 AND is_active = TRUE LIMIT 1`,
-          [saleCode]
-        )
-        if (fallback.rows.length) {
-          crm = { ...crm, owner_user_id: fallback.rows[0].id, owner_code: fallback.rows[0].code, owner_name: fallback.rows[0].name, owner_from_sale_code: true }
-        }
-      }
+    if (crm) {
+      const ownersResult = await crmDB.query(`
+        SELECT o.user_id, o.is_primary, u.code, u.name
+        FROM crm_customer_owner o
+        JOIN crm_users u ON u.id = o.user_id
+        WHERE o.ar_code = $1
+        ORDER BY o.is_primary DESC, o.assigned_at ASC
+      `, [code])
+      crm.owners = ownersResult.rows
     }
+
+    const followupSummaryRes = await crmDB.query(`
+      SELECT
+        (SELECT COUNT(*)::int
+         FROM crm_activities a
+         WHERE a.ar_code = $1
+           AND a.followup_type IN ('scheduled','no_answer_retry')
+           AND a.status NOT IN ('done','cancelled','deleted')
+           AND (
+             a.requires_owner_assignment = TRUE
+             OR EXISTS (
+               SELECT 1 FROM crm_activity_owners ao
+               WHERE ao.activity_id = a.id
+                 AND ao.removed_at IS NULL
+                 AND ao.status NOT IN ('done','cancelled')
+             )
+           )) AS open_followup_count,
+        (SELECT COUNT(*)::int
+         FROM crm_activities a
+         WHERE a.ar_code = $1
+           AND a.activity_type = 'call'
+           AND a.call_result = 'no_answer'
+           AND DATE(a.updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')) AS no_answer_attempts_today,
+        (SELECT json_build_object(
+           'id', a.id,
+           'subject', a.subject,
+           'followup_type', a.followup_type,
+           'due_date', a.due_date,
+           'start_datetime', a.start_datetime,
+           'retry_due_at', a.retry_due_at,
+           'attempt_no', a.attempt_no,
+           'requires_owner_assignment', a.requires_owner_assignment
+         )
+         FROM crm_activities a
+         WHERE a.ar_code = $1
+           AND a.followup_type IN ('scheduled','no_answer_retry')
+           AND a.status NOT IN ('done','cancelled','deleted')
+         ORDER BY COALESCE(a.retry_due_at, a.start_datetime, a.due_date::timestamptz, a.created_at) ASC
+         LIMIT 1) AS next_open_followup,
+        (SELECT json_build_object(
+           'enabled', s.enabled,
+           'auto_create_enabled', s.auto_create_enabled,
+           'default_call_interval_days', s.default_call_interval_days,
+           'no_answer_max_attempts_per_day', s.no_answer_max_attempts_per_day,
+           'no_answer_retry_minutes', s.no_answer_retry_minutes,
+           'business_start_time', to_char(s.business_start_time, 'HH24:MI'),
+           'business_end_time', to_char(s.business_end_time, 'HH24:MI')
+         )
+         FROM crm_followup_settings s WHERE s.id = 1) AS policy
+    `, [code])
 
     // แปลง website "lat,lng" → latitude, longitude
     const cus = { ...cusResult.rows[0] }
@@ -257,9 +359,62 @@ router.get('/:code', async (req, res) => {
       detail: detailResult.rows[0] || null,
       transport_labels: transportResult.rows,
       crm,
+      followup_summary: followupSummaryRes.rows[0] || null,
     })
   } catch (err) {
     console.error(err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────
+// PATCH /api/customers/:code/followup — override follow-up รายลูกค้า
+// ─────────────────────────────────────────────
+router.patch('/:code/followup', async (req, res) => {
+  if (!canManageFollowup(req.user)) {
+    return res.status(403).json({ error: 'ไม่มีสิทธิ์ปรับการติดตามลูกค้า' })
+  }
+
+  const { code } = req.params
+  const {
+    followup_enabled,
+    followup_pause_until,
+    followup_pause_reason,
+    next_followup,
+  } = req.body
+
+  try {
+    const hasFollowupEnabled = Object.prototype.hasOwnProperty.call(req.body, 'followup_enabled')
+    const hasPauseUntil = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_until')
+    const hasPauseReason = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_reason')
+    const hasNextFollowup = Object.prototype.hasOwnProperty.call(req.body, 'next_followup')
+
+    const result = await crmDB.query(`
+      UPDATE crm_customer_profile SET
+        followup_enabled = CASE WHEN $2::boolean THEN $3::boolean ELSE followup_enabled END,
+        followup_pause_until = CASE WHEN $4::boolean THEN $5::date ELSE followup_pause_until END,
+        followup_pause_reason = CASE WHEN $6::boolean THEN $7::text ELSE followup_pause_reason END,
+        next_followup = CASE WHEN $8::boolean THEN $9::date ELSE next_followup END,
+        updated_at = NOW()
+      WHERE ar_code = $1
+      RETURNING ar_code, followup_enabled, followup_pause_until, followup_pause_reason, next_followup
+    `, [
+      code,
+      hasFollowupEnabled,
+      typeof followup_enabled === 'boolean' ? followup_enabled : null,
+      hasPauseUntil,
+      followup_pause_until || null,
+      hasPauseReason,
+      followup_pause_reason || null,
+      hasNextFollowup,
+      next_followup || null,
+    ])
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'ไม่พบข้อมูล CRM ของลูกค้านี้' })
+    }
+    res.json(result.rows[0])
+  } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
@@ -335,14 +490,8 @@ router.post('/', async (req, res) => {
       crm.crm_remark || null
     ])
 
-    // Assign owner ใน CRM ถ้ามี
-    if (crm.owner_user_id) {
-      await crmClient.query(`
-        INSERT INTO crm_customer_owner (ar_code, user_id, is_primary)
-        VALUES ($1,$2,TRUE)
-        ON CONFLICT (ar_code, user_id) DO NOTHING
-      `, [code, crm.owner_user_id])
-    }
+    // Assign CRM owners (1 primary + co-owners)
+    await replaceCustomerOwners(crmClient, code, normalizeCustomerOwners(crm), req.user?.id)
 
     await posClient.query('COMMIT')
     await crmClient.query('COMMIT')
@@ -442,17 +591,8 @@ router.put('/:code', async (req, res) => {
       crm.next_followup || null
     ])
 
-    // Update owner
-    if (crm.owner_user_id) {
-      await crmClient.query(`
-        DELETE FROM crm_customer_owner WHERE ar_code = $1 AND is_primary = TRUE
-      `, [code])
-      await crmClient.query(`
-        INSERT INTO crm_customer_owner (ar_code, user_id, is_primary)
-        VALUES ($1,$2,TRUE)
-        ON CONFLICT (ar_code, user_id) DO NOTHING
-      `, [code, crm.owner_user_id])
-    }
+    // Update CRM owners (clear + replace เพื่อให้ลบ/เพิ่ม co-owner ได้ตรง UI)
+    await replaceCustomerOwners(crmClient, code, normalizeCustomerOwners(crm), req.user?.id)
 
     await posClient.query('COMMIT')
     await crmClient.query('COMMIT')

@@ -25,7 +25,7 @@ app.use(helmet({
 // ── Rate limiting ───────────────────────
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,  // 15 นาที
-  max: 300,                    // จำกัด 300 requests ต่อ IP ต่อ 15 นาที
+  max: 10000,                   // จำกัด 10000 requests ต่อ IP ต่อ 15 นาที
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' }
@@ -96,6 +96,7 @@ app.use('/api/auth',            require('./routes/auth'))          // Public
 app.use('/api/customers', require('./routes/customers'))     // Auth required
 app.use('/api/employees',      require('./routes/employees'))      // Auth required
 app.use('/api/activities',     require('./routes/activities'))     // Auth required
+app.use('/api/followup-settings', require('./routes/followupSettings')) // Follow-up policy
 app.use('/api/notifications',  require('./routes/notifications'))  // Auth required
 app.use('/api/reports',        require('./routes/reports'))         // Manager+ only
 app.use('/api/sales',          require('./routes/sales'))            // Sales reports (Manager+)
@@ -103,6 +104,7 @@ app.use('/api/cdr',           require('./routes/cdr'))             // CDR proxy
 app.use('/api/notes',          require('./routes/notes'))          // Auth required
 app.use('/api/webboard',       require('./routes/webboard'))       // Auth required
 app.use('/api/activities/:id/attachments', require('./routes/attachments'))
+app.use('/api/fleet',          require('./routes/fleet'))           // Fleet Delivery Dashboard (Manager+)
 
 // Static: serve uploaded files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')))

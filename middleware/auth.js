@@ -82,6 +82,9 @@ function requireRole(...roles) {
     if (!req.user) {
       return res.status(401).json({ error: 'ไม่ได้รับอนุญาต' })
     }
+    if (req.user.code?.toUpperCase() === 'SUPERADMIN') {
+      return next()
+    }
     if (!roles.includes(req.user.role)) {
       return res.status(403).json({
         error: `ไม่มีสิทธิ์ ต้องการสิทธิ์: ${roles.join(' หรือ ')}`

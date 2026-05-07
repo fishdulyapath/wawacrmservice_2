@@ -2,6 +2,7 @@ const cron = require('node-cron')
 const { crmDB } = require('../db')
 const lineService = require('./lineService')
 const { notify, notifyMany } = require('./notifyService')
+const { syncAllFleetSheets } = require('./fleetSync')
 
 /**
  * เริ่ม Cron Jobs ทั้งหมดของระบบ LINE
@@ -15,34 +16,36 @@ function start() {
   const TZ = 'Asia/Bangkok'
   const cronOpts = { timezone: TZ }
 
-  // Helper: ดึงเวลาไทย HH:MM (ไม่พึ่ง system timezone)
+  // Helper: ดึงเวลาไทย HH:MM (ใช้ Intl เพื่อความแม่นยำ ไม่พึ่ง system TZ)
   function bangkokHHMM() {
-    const now = new Date()
-    const bkk = new Date(now.toLocaleString('en-US', { timeZone: TZ }))
-    return `${String(bkk.getHours()).padStart(2, '0')}:${String(bkk.getMinutes()).padStart(2, '0')}`
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(new Date()).reduce((a, p) => (a[p.type] = p.value, a), {})
+    return `${parts.hour}:${parts.minute}`
   }
 
-  // Helper: ดึงวันที่ไทย YYYY-MM-DD (ป้องกัน timezone ต่าง)
+  // Helper: ดึงวันที่ไทย YYYY-MM-DD (ใช้ Intl เพื่อความแม่นยำ)
   function bangkokDate() {
-    const now = new Date()
-    const bkk = new Date(now.toLocaleString('en-US', { timeZone: TZ }))
-    return `${bkk.getFullYear()}-${String(bkk.getMonth() + 1).padStart(2, '0')}-${String(bkk.getDate()).padStart(2, '0')}`
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date())
   }
 
   // ── Dedup guard: เก็บ HH:MM ล่าสุดที่ส่ง Daily Summary ──
   // ป้องกัน cron 2 tick ภายใน 1 นาทีเดียวกัน
-  let lastDailySentMinute = ''
+  let lastDailySentRunKey = ''
+  let lastAutoFollowupRunKey = ''
 
   // ── 1. Daily Summary: ทุกนาที ตรวจว่าถึงเวลาส่งไหม ──
   cron.schedule('* * * * *', async () => {
     try {
       const hhmm = bangkokHHMM()
+      const todayStr = bangkokDate()
+      const runKey = `${todayStr} ${hhmm}`
 
       // ── In-memory dedup: ถ้านาทีนี้ส่งไปแล้ว ข้าม ──
-      if (lastDailySentMinute === hhmm) return
-      lastDailySentMinute = hhmm
-
-      const todayStr = bangkokDate()
+      if (lastDailySentRunKey === runKey) return
+      lastDailySentRunKey = runKey
 
       // ส่งเฉพาะ user ที่ตั้ง notify_time ตรงกับเวลาตอนนี้
       // + ยังไม่เคยส่งวันนี้ (ตรวจจาก crm_line_message_log)
@@ -72,12 +75,276 @@ function start() {
     } catch (err) {
       console.error('[Cron Daily Error]', err.message)
     }
-  })
+  }, cronOpts)
 
-  // ── 2. Task Overdue Alert: ทุก 8:00 น. (เวลาไทย) ──
-  // ใช้ crm_activity_owners เพื่อแจ้งทุก owner ที่ยังไม่ได้ปิดงาน
-  cron.schedule('0 8 * * *', async () => {
+  // ── 1.5 Auto Follow-up: สร้างงานโทรติดตามจาก Follow-up Policy ──
+  cron.schedule('* * * * *', async () => {
     try {
+      const hhmm = bangkokHHMM()
+      const todayStr = bangkokDate()
+      const runKey = `${todayStr} ${hhmm}`
+
+      if (lastAutoFollowupRunKey === runKey) return
+
+      const settingsRes = await crmDB.query(`
+        SELECT * FROM crm_followup_settings
+        WHERE id = 1
+          AND enabled = TRUE
+          AND auto_create_enabled = TRUE
+          AND to_char(auto_create_time, 'HH24:MI') = $1
+      `, [hhmm])
+      if (!settingsRes.rows.length) return
+
+      lastAutoFollowupRunKey = runKey
+      const settings = settingsRes.rows[0]
+
+      const fallbackUserRes = await crmDB.query(`
+        SELECT id FROM crm_users
+        WHERE is_active = TRUE
+          AND (UPPER(code) = 'SUPERADMIN' OR role IN ('admin','manager'))
+        ORDER BY CASE WHEN UPPER(code) = 'SUPERADMIN' THEN 0 WHEN role = 'admin' THEN 1 ELSE 2 END, id
+        LIMIT 1
+      `)
+      const fallbackUserId = fallbackUserRes.rows[0]?.id
+      if (!fallbackUserId) {
+        console.error('[Cron AutoFollowup] No admin/manager fallback user found')
+        await crmDB.query(`
+          UPDATE crm_followup_settings
+          SET last_auto_create_checked_at = NOW(),
+              last_auto_create_created_count = 0,
+              last_auto_create_unassigned_count = 0,
+              last_auto_create_error = $1
+          WHERE id = 1
+        `, ['No admin/manager fallback user found'])
+        return
+      }
+
+      const customersRes = await crmDB.query(`
+        SELECT p.ar_code, p.next_followup, p.next_followup::text AS next_followup_text
+        FROM crm_customer_profile p
+        WHERE p.status = 'active'
+          AND p.followup_enabled = TRUE
+          AND (p.followup_pause_until IS NULL OR p.followup_pause_until < $1::date)
+          AND p.next_followup IS NOT NULL
+          AND p.next_followup <= $1::date
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_activities a
+            WHERE a.followup_key = ('auto-followup:' || p.ar_code || ':' || p.next_followup::text)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_activities a
+            WHERE a.ar_code = p.ar_code
+              AND a.followup_type = 'scheduled'
+              AND a.status NOT IN ('done','cancelled','deleted')
+              AND (
+                a.requires_owner_assignment = TRUE
+                OR EXISTS (
+                  SELECT 1 FROM crm_activity_owners ao
+                  WHERE ao.activity_id = a.id
+                    AND ao.removed_at IS NULL
+                    AND ao.status NOT IN ('done','cancelled')
+                )
+              )
+          )
+        ORDER BY p.next_followup ASC, p.ar_code ASC
+        LIMIT 100
+      `, [todayStr])
+
+      const adminNotifyRes = await crmDB.query(`
+        SELECT id FROM crm_users
+        WHERE is_active = TRUE
+          AND (UPPER(code) = 'SUPERADMIN' OR role IN ('admin','manager','supervisor'))
+      `)
+      const adminNotifyIds = adminNotifyRes.rows.map(r => r.id)
+
+      let createdCount = 0
+      let unassignedCount = 0
+      let firstError = null
+
+      for (const customer of customersRes.rows) {
+        const client = await crmDB.connect()
+        try {
+          await client.query('BEGIN')
+
+          const ownerRes = await client.query(`
+            SELECT o.user_id, o.is_primary
+            FROM crm_customer_owner o
+            JOIN crm_users u ON u.id = o.user_id
+            WHERE o.ar_code = $1
+              AND u.is_active = TRUE
+            ORDER BY o.is_primary DESC, o.assigned_at ASC
+          `, [customer.ar_code])
+
+          const allOwnerIds = [...new Set(ownerRes.rows.map(r => Number(r.user_id)).filter(Boolean))]
+          const selectedOwnerIds = settings.assignment_mode === 'all'
+            ? allOwnerIds
+            : (allOwnerIds.length ? [allOwnerIds[0]] : [])
+          const primaryOwnerId = selectedOwnerIds[0] || fallbackUserId
+          const requiresOwnerAssignment = selectedOwnerIds.length === 0
+          const followupDateText = customer.next_followup_text || String(customer.next_followup).slice(0, 10)
+          const followupKey = `auto-followup:${customer.ar_code}:${followupDateText}`
+          const subject = `โทรติดตามลูกค้า ${customer.ar_code}`
+          const description = [
+            'สร้างโดยระบบจาก Follow-up Policy',
+            `ครบกำหนดติดตามวันที่ ${followupDateText}`,
+            requiresOwnerAssignment ? 'ลูกค้ายังไม่มีทีมผู้ดูแล CRM กรุณาระบุผู้รับผิดชอบ' : ''
+          ].filter(Boolean).join('\n')
+
+          const insertRes = await client.query(`
+            INSERT INTO crm_activities (
+              ar_code, owner_id, created_by, activity_type, subject, description,
+              status, priority, due_date, start_datetime, call_direction, system_created,
+              followup_type, followup_policy_id, followup_key,
+              requires_owner_assignment, owner_assignment_note
+            )
+            VALUES ($1,$2,$3,'call',$4,$5,'open','normal',$6,($6::date + $10::time),'outbound',TRUE,
+                    'scheduled',1,$7,$8,$9)
+            ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
+            RETURNING *
+          `, [
+            customer.ar_code,
+            primaryOwnerId,
+            fallbackUserId,
+            subject,
+            description,
+            customer.next_followup,
+            followupKey,
+            requiresOwnerAssignment,
+            requiresOwnerAssignment ? 'ไม่มี CRM owner ตอนระบบสร้างงาน' : null,
+            settings.auto_create_time,
+          ])
+
+          if (!insertRes.rows.length) {
+            await client.query('ROLLBACK')
+            continue
+          }
+
+          const activity = insertRes.rows[0]
+          for (const uid of selectedOwnerIds) {
+            await client.query(`
+              INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
+              VALUES ($1,$2,$3,'open',$4)
+              ON CONFLICT (activity_id, user_id) DO NOTHING
+            `, [activity.id, uid, uid === primaryOwnerId, fallbackUserId])
+          }
+
+          await client.query(`
+            UPDATE crm_customer_profile
+            SET next_followup = (GREATEST(next_followup, $2::date) + ($3 || ' days')::INTERVAL)::date
+            WHERE ar_code = $1
+          `, [customer.ar_code, todayStr, settings.default_call_interval_days])
+
+          await client.query('COMMIT')
+          createdCount++
+
+          if (requiresOwnerAssignment) {
+            unassignedCount++
+            if (adminNotifyIds.length) {
+              await notifyMany(adminNotifyIds, {
+                notiType: 'activity_update',
+                title: 'มีงานติดตามที่ยังไม่มีผู้รับผิดชอบ',
+                message: subject,
+                refType: 'activity',
+                refId: activity.id,
+                arCode: customer.ar_code,
+              })
+            }
+          } else {
+            await notifyMany(selectedOwnerIds, {
+              notiType: 'assigned',
+              title: 'ถึงเวลาติดตามลูกค้า',
+              message: subject,
+              refType: 'activity',
+              refId: activity.id,
+              arCode: customer.ar_code,
+            })
+          }
+        } catch (err) {
+          await client.query('ROLLBACK')
+          if (!firstError) firstError = `${customer.ar_code}: ${err.message}`
+          console.error(`[Cron AutoFollowup] ${customer.ar_code}`, err.message)
+        } finally {
+          client.release()
+        }
+      }
+
+      await crmDB.query(`
+        UPDATE crm_followup_settings
+        SET last_auto_create_checked_at = NOW(),
+            last_auto_create_created_count = $1,
+            last_auto_create_unassigned_count = $2,
+            last_auto_create_error = $3
+        WHERE id = 1
+      `, [createdCount, unassignedCount, firstError])
+
+      if (createdCount > 0) {
+        console.log(`[Cron AutoFollowup] created ${createdCount} activities, unassigned ${unassignedCount} (${hhmm})`)
+      }
+    } catch (err) {
+      console.error('[Cron AutoFollowup Error]', err.message)
+    }
+  }, cronOpts)
+
+  // ── 1.6 No-answer Retry Due Alert: แจ้งเมื่อถึงเวลาโทรซ้ำ ──
+  cron.schedule('* * * * *', async () => {
+    try {
+      const todayStr = bangkokDate()
+      const result = await crmDB.query(`
+        SELECT a.id, a.subject, a.activity_type, a.start_datetime, a.retry_due_at, a.priority, a.ar_code,
+               a.attempt_no,
+               u.id AS user_id, u.line_user_id, u.line_notify_enabled
+        FROM crm_activities a
+        JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
+        JOIN crm_users u ON u.id = ao.user_id
+        WHERE a.followup_type = 'no_answer_retry'
+          AND COALESCE(a.retry_due_at, a.start_datetime) <= NOW()
+          AND COALESCE(a.start_datetime, a.retry_due_at) <= NOW()
+          AND a.status NOT IN ('done','cancelled','deleted')
+          AND ao.status NOT IN ('done','cancelled')
+          AND u.is_active = TRUE
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_notifications n
+            WHERE n.user_id = u.id
+              AND n.ref_type = 'activity'
+              AND n.ref_id = a.id
+              AND n.noti_type = 'task_due'
+              AND n.created_at >= $1::date
+              AND n.created_at < ($1::date + INTERVAL '1 day')
+          )
+      `, [todayStr])
+
+      for (const task of result.rows) {
+        await notify({
+          userId: task.user_id,
+          notiType: 'task_due',
+          title: `ถึงเวลาโทรซ้ำ${task.attempt_no ? ` ครั้งที่ ${task.attempt_no}` : ''}`,
+          message: task.subject,
+          refType: 'activity',
+          refId: task.id,
+          arCode: task.ar_code,
+        })
+
+        if (task.line_user_id && task.line_notify_enabled) {
+          await lineService.sendTaskReminder(task.line_user_id, task.user_id, task)
+            .catch(e => console.error(`[Cron RetryDue] task ${task.id}`, e.message))
+        }
+      }
+
+      if (result.rows.length > 0) {
+        console.log(`[Cron RetryDue] แจ้งเตือนโทรซ้ำ ${result.rows.length} owner-task`)
+      }
+    } catch (err) {
+      console.error('[Cron RetryDue Error]', err.message)
+    }
+  }, cronOpts)
+
+  // ── 2. Task Overdue Alert: ทุกนาที เช็คเวลาที่ user ตั้งไว้ ──
+  // ใช้ crm_activity_owners เพื่อแจ้งทุก owner ที่ยังไม่ได้ปิดงาน
+  cron.schedule('* * * * *', async () => {
+    try {
+      const hhmm = bangkokHHMM()
+      const todayStr = bangkokDate()
+
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.due_date, a.start_datetime, a.priority, a.ar_code,
                u.id AS user_id, u.line_user_id, u.line_notify_enabled,
@@ -86,9 +353,20 @@ function start() {
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
         WHERE ao.status NOT IN ('done','cancelled')
+          AND a.status NOT IN ('done','cancelled','deleted')
           AND COALESCE(a.due_date, DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok')) < CURRENT_DATE
           AND u.is_active = TRUE
-      `)
+          AND to_char(COALESCE(u.overdue_notify_time, TIME '08:00'), 'HH24:MI') = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_notifications n
+            WHERE n.user_id = u.id
+              AND n.ref_type = 'activity'
+              AND n.ref_id = a.id
+              AND n.noti_type = 'task_overdue'
+              AND n.created_at >= $2::date
+              AND n.created_at <  ($2::date + INTERVAL '1 day')
+          )
+      `, [hhmm, todayStr])
 
       for (const task of result.rows) {
         const dueDate = task.due_date || task.start_datetime
@@ -110,16 +388,21 @@ function start() {
         }
       }
 
-      console.log(`[Cron Overdue] แจ้งเตือน ${result.rows.length} owner-task`)
+      if (result.rows.length > 0) {
+        console.log(`[Cron Overdue] แจ้งเตือน ${result.rows.length} owner-task (${hhmm})`)
+      }
     } catch (err) {
       console.error('[Cron Overdue Error]', err.message)
     }
   }, cronOpts)
 
-  // ── 3. Task Due Tomorrow: ทุก 17:00 น. ──
+  // ── 3. Task Due Tomorrow: ทุกนาที เช็คเวลาที่ user ตั้งไว้ ──
   // ใช้ crm_activity_owners เพื่อแจ้งทุก owner ที่ยังไม่ได้ปิดงาน
-  cron.schedule('0 17 * * *', async () => {
+  cron.schedule('* * * * *', async () => {
     try {
+      const hhmm = bangkokHHMM()
+      const todayStr = bangkokDate()
+
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.due_date, a.start_datetime, a.priority, a.ar_code,
                u.id AS user_id, u.line_user_id, u.line_notify_enabled
@@ -127,10 +410,21 @@ function start() {
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
         WHERE ao.status NOT IN ('done','cancelled')
+          AND a.status NOT IN ('done','cancelled','deleted')
           AND COALESCE(a.due_date, DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok'))
               = (CURRENT_DATE + INTERVAL '1 day')
           AND u.is_active = TRUE
-      `)
+          AND to_char(COALESCE(u.due_tomorrow_notify_time, TIME '17:00'), 'HH24:MI') = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_notifications n
+            WHERE n.user_id = u.id
+              AND n.ref_type = 'activity'
+              AND n.ref_id = a.id
+              AND n.noti_type = 'task_due'
+              AND n.created_at >= $2::date
+              AND n.created_at <  ($2::date + INTERVAL '1 day')
+          )
+      `, [hhmm, todayStr])
 
       for (const task of result.rows) {
         const typeLabel2 = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
@@ -150,7 +444,9 @@ function start() {
         }
       }
 
-      console.log(`[Cron DueTomorrow] แจ้งเตือน ${result.rows.length} owner-task`)
+      if (result.rows.length > 0) {
+        console.log(`[Cron DueTomorrow] แจ้งเตือน ${result.rows.length} owner-task (${hhmm})`)
+      }
     } catch (err) {
       console.error('[Cron DueTomorrow Error]', err.message)
     }
@@ -170,6 +466,15 @@ function start() {
           AND ao.status NOT IN ('done','cancelled')
           AND a.start_datetime BETWEEN NOW() AND NOW() + INTERVAL '30 minutes'
           AND u.is_active = TRUE
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_notifications n
+            WHERE n.user_id = u.id
+              AND n.ref_type = 'activity'
+              AND n.ref_id = a.id
+              AND n.noti_type = 'meeting_remind'
+              AND n.created_at >= (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
+              AND n.created_at <  ((CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') + INTERVAL '1 day')
+          )
       `)
 
       for (const meeting of result.rows) {
@@ -273,6 +578,11 @@ function start() {
     } catch (err) {
       console.error('[Cron Cleanup Error]', err.message)
     }
+  }, cronOpts)
+
+  // ── Fleet Delivery: sync จาก Google Sheets ทุก 10 นาที ──────
+  cron.schedule('*/10 * * * *', async () => {
+    await syncAllFleetSheets().catch(e => console.error('[Cron FleetSync]', e.message))
   }, cronOpts)
 }
 

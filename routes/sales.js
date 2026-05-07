@@ -10,7 +10,7 @@ router.use(authMiddleware)
 // KPI ภาพรวมยอดขาย + top 5 ลูกค้า + top 5 พนักงาน
 // query: date_from, date_to, sale_code, cust_code
 // ─────────────────────────────────────────────────────────────
-router.get('/summary', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/summary', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, sale_code, cust_code } = req.query
     const params = []
@@ -90,7 +90,7 @@ router.get('/summary', requireRole('admin', 'manager', 'supervisor'), async (req
 // แนวโน้มยอดขายรายวัน/รายสัปดาห์/รายเดือน
 // query: date_from, date_to, period (day|week|month), sale_code, cust_code
 // ─────────────────────────────────────────────────────────────
-router.get('/trend', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/trend', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, period = 'day', sale_code, cust_code } = req.query
     const params = []
@@ -130,7 +130,7 @@ router.get('/trend', requireRole('admin', 'manager', 'supervisor'), async (req, 
 // ยอดขายแยกตามลูกค้า
 // query: date_from, date_to, sale_code
 // ─────────────────────────────────────────────────────────────
-router.get('/by-customer', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/by-customer', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, sale_code } = req.query
     const params = []
@@ -172,7 +172,7 @@ router.get('/by-customer', requireRole('admin', 'manager', 'supervisor'), async 
 // ยอดขายแยกตามพนักงาน
 // query: date_from, date_to, cust_code
 // ─────────────────────────────────────────────────────────────
-router.get('/by-salesperson', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/by-salesperson', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, cust_code } = req.query
     const params = []
@@ -214,7 +214,7 @@ router.get('/by-salesperson', requireRole('admin', 'manager', 'supervisor'), asy
 // รายการขาย พร้อม pagination และ filter แบบ ILIKE
 // query: date_from, date_to, doc_no, sale_code, cust_code (ILIKE), page, limit
 // ─────────────────────────────────────────────────────────────
-router.get('/transactions', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/transactions', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, doc_no, sale_code, cust_code, page = 1, limit = 20 } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
@@ -274,7 +274,7 @@ router.get('/transactions', requireRole('admin', 'manager', 'supervisor'), async
 // GET /api/sales/transactions/:doc_no
 // รายละเอียดเอกสาร + รายการสินค้า
 // ─────────────────────────────────────────────────────────────
-router.get('/transactions/:doc_no', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/transactions/:doc_no', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { doc_no } = req.params
 
@@ -338,7 +338,7 @@ router.get('/transactions/:doc_no', requireRole('admin', 'manager', 'supervisor'
 // ประวัติการซื้อของลูกค้า (paginated)
 // query: date_from, date_to, doc_no (ILIKE), sale_code (ILIKE), page, limit
 // ─────────────────────────────────────────────────────────────
-router.get('/customer/:cust_code', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { cust_code } = req.params
     const { date_from, date_to, doc_no, sale_code, page = 1, limit = 10 } = req.query
@@ -398,7 +398,7 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager', 'supervisor')
 // TOP N สินค้าขายดี จาก ic_trans_detail
 // query: date_from, date_to, sale_code, cust_code, limit (default 5)
 // ─────────────────────────────────────────────────────────────
-router.get('/top-products', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/top-products', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, sale_code, cust_code, limit: lim = 5 } = req.query
     const params = []
@@ -443,7 +443,7 @@ router.get('/top-products', requireRole('admin', 'manager', 'supervisor'), async
 // TOP N ทีมขาย
 // query: date_from, date_to, cust_code, limit (default 5)
 // ─────────────────────────────────────────────────────────────
-router.get('/top-salespeople', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/top-salespeople', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, cust_code, limit: lim = 5 } = req.query
     const params = []
@@ -486,7 +486,7 @@ router.get('/top-salespeople', requireRole('admin', 'manager', 'supervisor'), as
 // GET /api/sales/salespeople
 // รายชื่อพนักงานขายจาก POS DB (erp_user)
 // ─────────────────────────────────────────────────────────────
-router.get('/salespeople', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/salespeople', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const result = await posDB.query(`
       SELECT code, name_1
@@ -505,7 +505,7 @@ router.get('/salespeople', requireRole('admin', 'manager', 'supervisor'), async 
 // ยอดขายรายลูกค้าพร้อมพิกัดจาก ap_ar_transport_label
 // Params: date_from, date_to, sale_code
 // ─────────────────────────────────────────────────────────────
-router.get('/map', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/map', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, sale_code } = req.query
     const conds  = ['t.trans_flag = 44', 't.last_status = 0',
@@ -541,20 +541,24 @@ router.get('/map', requireRole('admin', 'manager', 'supervisor'), async (req, re
       ORDER BY total_amount DESC
     `, params)
 
-    // province summary (ใช้ชื่อจังหวัดจาก erp_province แล้ว)
-    const provMap = {}
+    // district summary (อำเภอ + จังหวัด)
+    const districtMap = {}
     for (const r of result.rows) {
-      const prov = r.province || 'ไม่ระบุ'
-      if (!provMap[prov]) provMap[prov] = { province: prov, total_amount: 0, total_orders: 0, cust_count: 0 }
-      provMap[prov].total_amount  += parseFloat(r.total_amount || 0)
-      provMap[prov].total_orders  += parseInt(r.total_orders  || 0)
-      provMap[prov].cust_count    += 1
+      const province = r.province || 'ไม่ระบุจังหวัด'
+      const district = r.amper || 'ไม่ระบุอำเภอ'
+      const key = `${province}::${district}`
+      if (!districtMap[key]) {
+        districtMap[key] = { province, district, total_amount: 0, total_orders: 0, cust_count: 0 }
+      }
+      districtMap[key].total_amount += parseFloat(r.total_amount || 0)
+      districtMap[key].total_orders += parseInt(r.total_orders || 0)
+      districtMap[key].cust_count += 1
     }
-    const provinces = Object.values(provMap)
+    const districts = Object.values(districtMap)
       .sort((a, b) => b.total_amount - a.total_amount)
       .map(p => ({ ...p, total_amount: Math.round(p.total_amount * 100) / 100 }))
 
-    res.json({ markers: result.rows, provinces })
+    res.json({ markers: result.rows, districts, provinces: districts })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

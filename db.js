@@ -29,6 +29,9 @@ const crmDB = new Pool({
 crmDB.on('connect', client => {
   client.query("SET timezone = 'Asia/Bangkok'")
 })
+posDB.on('connect', client => {
+  client.query("SET timezone = 'Asia/Bangkok'")
+})
 
 posDB.on('error', (err) => console.error('[POS DB] Unexpected error:', err))
 crmDB.on('error', (err) => console.error('[CRM DB] Unexpected error:', err))

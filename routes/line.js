@@ -6,6 +6,13 @@ const { authMiddleware } = require('../middleware/auth')
 const lineService = require('../services/lineService')
 
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET
+const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/
+
+function normalizeHHMM(value, fallback) {
+  if (!value) return fallback
+  const text = String(value).slice(0, 5)
+  return HHMM_RE.test(text) ? text : null
+}
 
 // Helper: สร้าง LIFF URL (เหมือนใน lineService.js)
 function _liffUrl(path) {
@@ -84,7 +91,7 @@ router.post('/webhook', verifyLineSignature, async (req, res) => {
 async function handleFollow(event, replyToken) {
   await lineService.replyMessage(replyToken, [{
     type: 'text',
-    text: `👋 ยินดีต้อนรับสู่ระบบ WAWA CRM!\n\n` +
+    text: `👋 ยินดีต้อนรับสู่ระบบ Cus Management!\n\n` +
           `เพื่อเริ่มใช้งาน กรุณาเข้าสู่ระบบ CRM และทำการ **เชื่อมต่อ LINE** ในหน้าโปรไฟล์ของคุณ\n\n` +
           `หรือส่งรหัสยืนยัน (OTP) ที่ได้รับจากระบบ CRM มาที่นี่`
   }])
@@ -304,7 +311,8 @@ router.get('/status', authMiddleware, async (req, res) => {
   try {
     const result = await crmDB.query(`
       SELECT line_user_id, line_display_name, line_picture_url,
-             line_linked_at, line_notify_enabled, line_notify_time
+             line_linked_at, line_notify_enabled, line_notify_time,
+             overdue_notify_time, due_tomorrow_notify_time
       FROM crm_users WHERE id=$1
     `, [req.user.id])
     const u = result.rows[0]
@@ -314,7 +322,9 @@ router.get('/status', authMiddleware, async (req, res) => {
       line_picture_url:  u.line_picture_url,
       line_linked_at:    u.line_linked_at,
       notify_enabled:    u.line_notify_enabled,
-      notify_time:       u.line_notify_time
+      notify_time:       u.line_notify_time,
+      overdue_notify_time:      u.overdue_notify_time,
+      due_tomorrow_notify_time: u.due_tomorrow_notify_time
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -325,13 +335,23 @@ router.get('/status', authMiddleware, async (req, res) => {
 // PUT /api/line/settings  — ตั้งค่า Notification
 // ─────────────────────────────────────────────────────────────
 router.put('/settings', authMiddleware, async (req, res) => {
-  const { notify_enabled, notify_time } = req.body
+  const { notify_enabled, notify_time, overdue_notify_time, due_tomorrow_notify_time } = req.body
+  const dailyTime = normalizeHHMM(notify_time, '08:00')
+  const overdueTime = normalizeHHMM(overdue_notify_time, '08:00')
+  const dueTomorrowTime = normalizeHHMM(due_tomorrow_notify_time, '17:00')
+  if (!dailyTime || !overdueTime || !dueTomorrowTime) {
+    return res.status(400).json({ error: 'เวลาแจ้งเตือนไม่ถูกต้อง' })
+  }
+
   try {
     await crmDB.query(`
       UPDATE crm_users
-      SET line_notify_enabled=$1, line_notify_time=$2
-      WHERE id=$3
-    `, [notify_enabled, notify_time || '08:00', req.user.id])
+      SET line_notify_enabled=$1,
+          line_notify_time=$2,
+          overdue_notify_time=$3,
+          due_tomorrow_notify_time=$4
+      WHERE id=$5
+    `, [notify_enabled, dailyTime, overdueTime, dueTomorrowTime, req.user.id])
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })

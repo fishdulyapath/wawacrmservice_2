@@ -10,7 +10,7 @@ router.use(authMiddleware)
 // ── Helper: สิทธิ์สูงกว่า sales_rep ──────────────────────────
 const isSA       = u => u.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u.role)
 const canCreate  = u => isSA(u)   // supervisor ขึ้นไป
-const canViewAll = u => ['admin','manager'].includes(u.role) || u.code?.toUpperCase() === 'SUPERADMIN'
+const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.code?.toUpperCase() === 'SUPERADMIN'
 
 // ── Helper: ดึง owners ของ activity ──────────────────────────
 async function getOwners(activityId, client) {
@@ -24,6 +24,16 @@ async function getOwners(activityId, client) {
     ORDER BY ao.is_primary DESC, ao.assigned_at ASC
   `, [activityId])
   return res.rows
+}
+
+async function getFollowupQueueNotifyIds(client) {
+  const db = client || crmDB
+  const res = await db.query(`
+    SELECT id FROM crm_users
+    WHERE is_active = TRUE
+      AND (UPPER(code) = 'SUPERADMIN' OR role IN ('admin','manager','supervisor'))
+  `)
+  return res.rows.map(r => r.id)
 }
 
 // ── Helper: ตรวจสิทธิ์ — เป็น active owner หรือ superadmin ──
@@ -47,6 +57,199 @@ function deriveActivityStatus(owners) {
   return 'open'
 }
 
+async function adjustedRetryDueAt(minutes, businessStart, businessEnd) {
+  const result = await crmDB.query(`
+    WITH raw AS (
+      SELECT NOW() + ($1::int || ' minutes')::interval AS candidate
+    ), local AS (
+      SELECT candidate, candidate AT TIME ZONE 'Asia/Bangkok' AS local_candidate
+      FROM raw
+    )
+    SELECT CASE
+      WHEN local_candidate::time < $2::time
+        THEN (local_candidate::date + $2::time) AT TIME ZONE 'Asia/Bangkok'
+      WHEN local_candidate::time > $3::time
+        THEN ((local_candidate::date + INTERVAL '1 day')::date + $2::time) AT TIME ZONE 'Asia/Bangkok'
+      ELSE candidate
+    END AS due_at
+    FROM local
+  `, [minutes, businessStart, businessEnd])
+  return result.rows[0].due_at
+}
+
+async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
+  if (actRow.activity_type !== 'call' || actRow.call_result !== 'no_answer' || !actRow.ar_code) {
+    return null
+  }
+  if (options.skipRetryToday) {
+    return { skipped: true, reason: 'skip_today' }
+  }
+
+  const settingsRes = await crmDB.query(`
+    SELECT * FROM crm_followup_settings
+    WHERE id = 1 AND enabled = TRUE
+  `)
+  const settings = settingsRes.rows[0]
+  if (!settings) return null
+
+  const customerPolicyRes = await crmDB.query(`
+    SELECT followup_enabled, followup_pause_until
+    FROM crm_customer_profile
+    WHERE ar_code = $1
+  `, [actRow.ar_code])
+  const customerPolicy = customerPolicyRes.rows[0]
+  if (customerPolicy) {
+    if (customerPolicy.followup_enabled === false) {
+      return { skipped: true, reason: 'customer_disabled' }
+    }
+    if (customerPolicy.followup_pause_until) {
+      const pauseRes = await crmDB.query(
+        `SELECT ($1::date >= (NOW() AT TIME ZONE 'Asia/Bangkok')::date) AS active`,
+        [customerPolicy.followup_pause_until]
+      )
+      if (pauseRes.rows[0]?.active) {
+        return { skipped: true, reason: 'customer_paused', pause_until: customerPolicy.followup_pause_until }
+      }
+    }
+  }
+
+  const countRes = await crmDB.query(`
+    SELECT COUNT(*)::int AS attempts
+    FROM crm_activities
+    WHERE ar_code = $1
+      AND activity_type = 'call'
+      AND call_result = 'no_answer'
+      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
+  `, [actRow.ar_code])
+  const attemptsToday = Number(countRes.rows[0]?.attempts || 0)
+  const maxAttempts = Number(settings.no_answer_max_attempts_per_day || 3)
+  if (attemptsToday >= maxAttempts) {
+    return { skipped: true, reason: 'max_attempts', attempts_today: attemptsToday, max_attempts: maxAttempts }
+  }
+
+  const groupKeyRes = await crmDB.query(
+    `SELECT 'no-answer:' || $1::text || ':' || to_char(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS retry_group_key`,
+    [actRow.ar_code]
+  )
+  const retryGroupKey = actRow.retry_group_key || groupKeyRes.rows[0].retry_group_key
+
+  const ownersRes = await crmDB.query(`
+    SELECT user_id, is_primary
+    FROM crm_activity_owners
+    WHERE activity_id = $1 AND removed_at IS NULL
+    ORDER BY is_primary DESC, assigned_at ASC
+  `, [actRow.id])
+  const ownerIds = ownersRes.rows.map(r => Number(r.user_id)).filter(Boolean)
+  const primaryOwnerId = ownerIds[0] || actRow.owner_id || reqUserId
+  const nextAttemptNo = attemptsToday + 1
+  const retryDueAt = await adjustedRetryDueAt(
+    Number(settings.no_answer_retry_minutes || 30),
+    String(settings.business_start_time || '08:30').slice(0, 5),
+    String(settings.business_end_time || '17:30').slice(0, 5),
+  )
+  const followupKey = `no-answer-retry:${actRow.id}:${nextAttemptNo}`
+
+  const client = await crmDB.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [retryGroupKey])
+
+    const duplicateRes = await client.query(`
+      SELECT id FROM crm_activities
+      WHERE (
+          retry_of_activity_id = $1
+          OR retry_group_key = $2
+        )
+        AND status NOT IN ('done','cancelled','deleted')
+      LIMIT 1
+    `, [actRow.id, retryGroupKey])
+    if (duplicateRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists', activity_id: duplicateRes.rows[0].id }
+    }
+
+    const insertRes = await client.query(`
+      INSERT INTO crm_activities (
+        ar_code, owner_id, created_by, activity_type, subject, description,
+        status, priority, due_date, start_datetime, call_direction, system_created,
+        followup_type, followup_policy_id, followup_key,
+        retry_of_activity_id, attempt_no, retry_due_at, retry_group_key,
+        requires_owner_assignment, owner_assignment_note
+      )
+      VALUES ($1,$2,$3,'call',$4,$5,'open',$6,$7::timestamptz::date,$7,'outbound',TRUE,
+              'no_answer_retry',1,$8,$9,$10,$7,$11,$12,$13)
+      ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
+      RETURNING *
+    `, [
+      actRow.ar_code,
+      primaryOwnerId,
+      reqUserId,
+      `โทรซ้ำลูกค้า ${actRow.ar_code} ครั้งที่ ${nextAttemptNo}/${maxAttempts}`,
+      `สร้างโดยระบบหลังบันทึกผลว่าไม่รับสาย\nอ้างอิงงานเดิม #${actRow.id}`,
+      actRow.priority || 'normal',
+      retryDueAt,
+      followupKey,
+      actRow.id,
+      nextAttemptNo,
+      retryGroupKey,
+      ownerIds.length === 0,
+      ownerIds.length === 0 ? 'งานโทรซ้ำนี้ไม่มี owner จากงานเดิม' : null,
+    ])
+    if (!insertRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists' }
+    }
+
+    const retry = insertRes.rows[0]
+    for (const uid of ownerIds) {
+      await client.query(`
+        INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
+        VALUES ($1,$2,$3,'open',$4)
+        ON CONFLICT (activity_id, user_id) DO NOTHING
+      `, [retry.id, uid, uid === primaryOwnerId, reqUserId])
+    }
+
+    await client.query('COMMIT')
+
+    if (ownerIds.length) {
+      const dueText = new Date(retryDueAt).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' })
+      await notifyMany(ownerIds, {
+        notiType: 'activity_update',
+        title: `ตั้งงานโทรซ้ำ ${nextAttemptNo}/${maxAttempts}`,
+        message: `${retry.subject} เวลา ${dueText} น.`,
+        refType: 'activity',
+        refId: retry.id,
+        arCode: retry.ar_code,
+      })
+    } else {
+      const queueNotifyIds = await getFollowupQueueNotifyIds()
+      if (queueNotifyIds.length) {
+        await notifyMany(queueNotifyIds, {
+          notiType: 'activity_update',
+          title: 'มีงานโทรซ้ำที่ยังไม่มีผู้รับผิดชอบ',
+          message: retry.subject,
+          refType: 'activity',
+          refId: retry.id,
+          arCode: retry.ar_code,
+        })
+      }
+    }
+
+    return {
+      created: true,
+      activity_id: retry.id,
+      retry_due_at: retry.retry_due_at,
+      attempt_no: retry.attempt_no,
+      max_attempts: maxAttempts,
+    }
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // GET /api/activities/stats — KPI สรุปตัวเลข (รองรับ multi-owner)
 // ─────────────────────────────────────────────────────────────
@@ -57,7 +260,7 @@ router.get('/stats', async (req, res) => {
     // openCond: นับเฉพาะ activity ที่ยังเปิดอยู่ (มี owner status=open)
     const openSub  = isMine
       ? `EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.user_id=$1 AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`
-      : `EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`
+      : `(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`
 
     const r = await crmDB.query(`
       SELECT
@@ -125,6 +328,9 @@ router.get('/by-customer/:arCode', async (req, res) => {
       SELECT a.id, a.activity_type, a.subject, a.status, a.priority,
              a.due_date, a.start_datetime, a.end_datetime,
              a.description, a.outcome, a.group_id,
+             a.call_direction, a.call_result,
+             a.system_created, a.followup_type, a.requires_owner_assignment,
+             a.retry_due_at, a.attempt_no, a.retry_of_activity_id,
              a.created_at, a.created_by,
              cu.name AS created_by_name
       FROM crm_activities a
@@ -508,13 +714,22 @@ router.patch('/groups/:groupKey/bulk-close', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { type, status, ar_code, owner_id, due, search, page = 1, limit = 20 } = req.query
+    const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, page = 1, limit = 20 } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
     const conditions = [`a.status != 'deleted'`]
 
     if (type)    { params.push(type);    conditions.push(`a.activity_type = $${params.length}`) }
     if (ar_code) { params.push(ar_code); conditions.push(`a.ar_code = $${params.length}`) }
+    if (date_from) { params.push(date_from); conditions.push(`a.created_at >= $${params.length}::date`) }
+    if (date_to)   { params.push(date_to);   conditions.push(`a.created_at <  ($${params.length}::date + INTERVAL '1 day')`) }
+    if (call_result) {
+      params.push(call_result)
+      conditions.push(`a.activity_type = 'call' AND a.call_result = $${params.length}`)
+    }
+    if (unassigned === 'true') {
+      conditions.push(`a.requires_owner_assignment = TRUE`)
+    }
 
     // filter by owner — ใช้ owners table
     const filterUser = owner_id ? parseInt(owner_id) : (!canViewAll(req.user) ? req.user.id : null)
@@ -531,19 +746,19 @@ router.get('/', async (req, res) => {
         (a.activity_type = 'task' AND a.due_date < CURRENT_DATE)
         OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
       )`)
-      conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`)
+      conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'today') {
       conditions.push(`(
         (a.activity_type = 'task' AND DATE(a.due_date) = CURRENT_DATE)
         OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok'))
       )`)
-      conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`)
+      conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'week') {
       conditions.push(`(
         (a.activity_type = 'task' AND a.due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
         OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') BETWEEN (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') AND (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') + INTERVAL '7 days')
       )`)
-      conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`)
+      conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (status) {
       // กรองตาม my_status ของ user ที่ login (ถ้าเป็น sales_rep หรือส่ง owner_id มา)
       // admin/manager ที่ไม่ได้กรอง owner → ใช้ derived status
@@ -552,7 +767,7 @@ router.get('/', async (req, res) => {
         params.push(statusUser); params.push(status)
         conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.user_id=$${params.length-1} AND ax.removed_at IS NULL AND ax.status=$${params.length})`)
       } else if (status === 'open') {
-        conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open')`)
+        conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open'))`)
       } else {
         params.push(status)
         conditions.push(`NOT EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open')
@@ -589,6 +804,7 @@ router.get('/', async (req, res) => {
          WHERE ao.activity_id = a.id AND ao.removed_at IS NULL) AS owners,
         -- derived status (open หากมีคนใดยัง open)
         CASE
+          WHEN a.requires_owner_assignment = TRUE THEN 'open'
           WHEN EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open') THEN 'open'
           WHEN EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='done') THEN 'done'
           ELSE 'cancelled'
@@ -598,7 +814,7 @@ router.get('/', async (req, res) => {
       FROM crm_activities a
       ${where}
       ORDER BY
-        CASE WHEN EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open') THEN 0 ELSE 1 END,
+        CASE WHEN a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open') THEN 0 ELSE 1 END,
         a.due_date ASC NULLS LAST,
         a.start_datetime ASC NULLS LAST,
         a.created_at DESC
@@ -674,11 +890,19 @@ router.get('/:id', async (req, res) => {
 
     // external invitees (ลูกค้า/contact)
     if (activity.activity_type === 'meeting') {
+      const intRes = await crmDB.query(
+        `SELECT ai.user_id AS id, u.name, u.code, ai.response_status
+         FROM crm_activity_invitees ai
+         JOIN crm_users u ON u.id = ai.user_id
+         WHERE ai.activity_id = $1 AND ai.is_external = FALSE
+         ORDER BY u.name`, [activity.id]
+      )
       const extRes = await crmDB.query(
         `SELECT ar_code, contact_name, response_status
          FROM crm_activity_invitees
          WHERE activity_id = $1 AND is_external = TRUE`, [activity.id]
       )
+      activity.invitees = intRes.rows
       activity.external_invitees = extRes.rows
     }
 
@@ -731,7 +955,7 @@ router.post('/', async (req, res) => {
     ar_code, activity_type, subject, description, status = 'open', priority = 'normal',
     due_date, start_datetime, end_datetime, location,
     call_direction, call_result, call_phone, duration_sec,
-    owners = [], primary_owner_id,
+    owners = [], primary_owner_id, invitees = [],
     meeting_url, outcome, all_day = false,
     external_invitees = [],
     group_id,
@@ -781,6 +1005,16 @@ router.post('/', async (req, res) => {
         VALUES ($1,$2,$3,'open',$4)
         ON CONFLICT (activity_id, user_id) DO NOTHING
       `, [activity.id, uid, uid === primaryId, req.user.id])
+    }
+
+    if (activity_type === 'meeting' && Array.isArray(invitees)) {
+      for (const uid of [...new Set(invitees.map(Number).filter(Boolean))]) {
+        await client.query(`
+          INSERT INTO crm_activity_invitees (activity_id, user_id, is_external)
+          VALUES ($1,$2,FALSE)
+          ON CONFLICT DO NOTHING
+        `, [activity.id, uid])
+      }
     }
 
     // external invitees (ลูกค้า/contact)
@@ -909,7 +1143,6 @@ router.put('/:id', async (req, res) => {
     // ── manage owners ──
     // normalize: ถ้าส่ง invitees (backward compat) ให้แปลงเป็น owners
     let newOwnerList = owners
-    if (!newOwnerList && invitees)  newOwnerList = invitees
     if (!newOwnerList && owner_id)  newOwnerList = [Number(owner_id)]
 
     let addedOwners = [], removedOwners = []
@@ -958,6 +1191,26 @@ router.put('/:id', async (req, res) => {
       const primaryRow = newPrimaryId || newOwnerList[0]
       if (primaryRow) {
         await client.query(`UPDATE crm_activities SET owner_id=$2 WHERE id=$1`, [req.params.id, primaryRow])
+      }
+      if (newOwnerList.length) {
+        await client.query(`
+          UPDATE crm_activities
+          SET requires_owner_assignment = FALSE,
+              owner_assignment_note = NULL,
+              updated_at = NOW()
+          WHERE id = $1 AND requires_owner_assignment = TRUE
+        `, [req.params.id])
+      }
+    }
+
+    if (Array.isArray(invitees)) {
+      await client.query(`DELETE FROM crm_activity_invitees WHERE activity_id=$1 AND is_external=FALSE`, [req.params.id])
+      for (const uid of [...new Set(invitees.map(Number).filter(Boolean))]) {
+        await client.query(`
+          INSERT INTO crm_activity_invitees (activity_id, user_id, is_external)
+          VALUES ($1,$2,FALSE)
+          ON CONFLICT DO NOTHING
+        `, [req.params.id, uid])
       }
     }
 
@@ -1039,6 +1292,14 @@ router.put('/:id', async (req, res) => {
             VALUES ($1,$2,$3,'open',$4) ON CONFLICT DO NOTHING
           `, [newActId, uid, uid === resolvedPrimary, req.user.id])
         }
+        if (resolvedOwners.length) {
+          await client.query(`
+            UPDATE crm_activities
+            SET requires_owner_assignment = FALSE,
+                owner_assignment_note = NULL
+            WHERE id = $1
+          `, [newActId])
+        }
       }
 
       // 4. อัปเดต owners ทุก activity ในกลุ่ม (ถ้าระบุมา) — BATCH approach
@@ -1093,15 +1354,22 @@ router.put('/:id', async (req, res) => {
               ON CONFLICT (activity_id, user_id) DO UPDATE
               SET removed_at=NULL, removed_by=NULL, assigned_by=EXCLUDED.assigned_by, status='open'
             `, upsertParams)
-          }
+        }
 
-          // Batch update primary flag
-          if (grpPrimaryId) {
+        // Batch update primary flag
+        if (grpPrimaryId) {
             await client.query(
               `UPDATE crm_activity_owners SET is_primary=(user_id=$2) WHERE activity_id = ANY($1) AND removed_at IS NULL`,
               [groupActIds, grpPrimaryId]
             )
-            await client.query(`UPDATE crm_activities SET owner_id=$2 WHERE id = ANY($1)`, [groupActIds, grpPrimaryId])
+            await client.query(`
+              UPDATE crm_activities
+              SET owner_id = $2,
+                  requires_owner_assignment = FALSE,
+                  owner_assignment_note = NULL,
+                  updated_at = NOW()
+              WHERE id = ANY($1)
+            `, [groupActIds, grpPrimaryId])
           }
         }
       }
@@ -1186,7 +1454,7 @@ router.put('/:id', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.patch('/:id/status', async (req, res) => {
   try {
-    const { status } = req.body
+    const { status, outcome } = req.body
     if (!['open','done','cancelled'].includes(status)) {
       return res.status(400).json({ error: 'status ไม่ถูกต้อง' })
     }
@@ -1197,15 +1465,30 @@ router.patch('/:id/status', async (req, res) => {
       return res.status(403).json({ error: 'ไม่มีสิทธิ์' })
     }
 
-    await crmDB.query(`
-      UPDATE crm_activity_owners SET status = $3
-      WHERE activity_id = $1 AND user_id = $2 AND removed_at IS NULL
-    `, [req.params.id, req.user.id, status])
+    let updateResult
+    if (canCreate(req.user)) {
+      updateResult = await crmDB.query(`
+        UPDATE crm_activity_owners SET status = $2
+        WHERE activity_id = $1 AND removed_at IS NULL
+      `, [req.params.id, status])
+    } else {
+      updateResult = await crmDB.query(`
+        UPDATE crm_activity_owners SET status = $3
+        WHERE activity_id = $1 AND user_id = $2 AND removed_at IS NULL
+      `, [req.params.id, req.user.id, status])
+    }
+
+    if (updateResult.rowCount === 0) {
+      return res.status(409).json({ error: 'ไม่พบ owner ที่สามารถเปลี่ยนสถานะได้' })
+    }
 
     // ── Sync crm_activities.status from owners ──
     const owners = await getOwners(req.params.id)
     const derivedStatus = deriveActivityStatus(owners)
-    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [req.params.id, derivedStatus])
+    await crmDB.query(
+      `UPDATE crm_activities SET status=$2, outcome=COALESCE($3, outcome), updated_at=NOW() WHERE id=$1`,
+      [req.params.id, derivedStatus, outcome || null]
+    )
 
     res.json({ success: true, status, activity_status: derivedStatus })
   } catch (err) {
@@ -1228,34 +1511,66 @@ router.patch('/:id/snooze', async (req, res) => {
     }
 
     const { days, date } = req.body
+    const hasTimedStart = old.activity_type !== 'task' && old.start_datetime
     let result
     if (date) {
-      if (old.activity_type === 'meeting' && old.start_datetime) {
+      if (hasTimedStart) {
         result = await crmDB.query(
-          `UPDATE crm_activities SET start_datetime=$2::timestamptz, updated_at=NOW() WHERE id=$1 RETURNING *`,
+          `UPDATE crm_activities
+           SET start_datetime = (($2::date + (start_datetime AT TIME ZONE 'Asia/Bangkok')::time) AT TIME ZONE 'Asia/Bangkok'),
+               end_datetime = CASE
+                 WHEN end_datetime IS NULL THEN NULL
+                 ELSE (($2::date + (end_datetime AT TIME ZONE 'Asia/Bangkok')::time) AT TIME ZONE 'Asia/Bangkok')
+               END,
+               retry_due_at = CASE
+                 WHEN retry_due_at IS NULL THEN NULL
+                 ELSE (($2::date + (retry_due_at AT TIME ZONE 'Asia/Bangkok')::time) AT TIME ZONE 'Asia/Bangkok')
+               END,
+               updated_at = NOW()
+           WHERE id=$1
+           RETURNING *`,
           [req.params.id, date]
         )
       } else {
         result = await crmDB.query(
-          `UPDATE crm_activities SET due_date=$2::date, updated_at=NOW() WHERE id=$1 RETURNING *`,
+          `UPDATE crm_activities
+           SET due_date=$2::date,
+               retry_due_at = CASE
+                 WHEN retry_due_at IS NULL THEN NULL
+                 ELSE (($2::date + (retry_due_at AT TIME ZONE 'Asia/Bangkok')::time) AT TIME ZONE 'Asia/Bangkok')
+               END,
+               updated_at=NOW()
+           WHERE id=$1
+           RETURNING *`,
           [req.params.id, date]
         )
       }
     } else {
       const d = parseInt(days) || 1
-      if (old.activity_type === 'meeting' && old.start_datetime) {
+      if (hasTimedStart) {
         result = await crmDB.query(
-          `UPDATE crm_activities SET start_datetime=start_datetime + ($2 || ' days')::INTERVAL, updated_at=NOW() WHERE id=$1 RETURNING *`,
+          `UPDATE crm_activities
+           SET start_datetime=start_datetime + ($2 || ' days')::INTERVAL,
+               end_datetime = CASE WHEN end_datetime IS NULL THEN NULL ELSE end_datetime + ($2 || ' days')::INTERVAL END,
+               retry_due_at = CASE WHEN retry_due_at IS NULL THEN NULL ELSE retry_due_at + ($2 || ' days')::INTERVAL END,
+               updated_at=NOW()
+           WHERE id=$1
+           RETURNING *`,
           [req.params.id, String(d)]
         )
       } else {
         result = await crmDB.query(
-          `UPDATE crm_activities SET due_date=COALESCE(due_date,CURRENT_DATE) + ($2 || ' days')::INTERVAL, updated_at=NOW() WHERE id=$1 RETURNING *`,
+          `UPDATE crm_activities
+           SET due_date=COALESCE(due_date,CURRENT_DATE) + ($2 || ' days')::INTERVAL,
+               retry_due_at = CASE WHEN retry_due_at IS NULL THEN NULL ELSE retry_due_at + ($2 || ' days')::INTERVAL END,
+               updated_at=NOW()
+           WHERE id=$1
+           RETURNING *`,
           [req.params.id, String(d)]
         )
       }
     }
-    res.json(result.rows[0])
+    res.json({ ...result.rows[0], affected_ids: [Number(req.params.id)] })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1267,6 +1582,7 @@ router.patch('/:id/snooze', async (req, res) => {
 router.patch('/:id/done', async (req, res) => {
   try {
     const existing = await crmDB.query('SELECT * FROM crm_activities WHERE id=$1', [req.params.id])
+    const oldActivity = existing.rows[0]
     if (!existing.rows.length) return res.status(404).json({ error: 'ไม่พบ Activity' })
 
     if (!canCreate(req.user)) {
@@ -1275,6 +1591,15 @@ router.patch('/:id/done', async (req, res) => {
     }
 
     // ── Idempotency guard: check if already done ──
+    const activeOwnersBefore = await getOwners(req.params.id)
+    const activeOwnerCount = activeOwnersBefore.filter(o => !o.removed_at).length
+    if (oldActivity.requires_owner_assignment || activeOwnerCount === 0) {
+      return res.status(409).json({
+        error: 'กรุณาระบุผู้รับผิดชอบก่อนปิดงาน',
+        code: 'OWNER_ASSIGNMENT_REQUIRED',
+      })
+    }
+
     const ownerCheck = await crmDB.query(
       `SELECT status FROM crm_activity_owners WHERE activity_id=$1 AND user_id=$2 AND removed_at IS NULL`,
       [req.params.id, req.user.id]
@@ -1284,7 +1609,8 @@ router.patch('/:id/done', async (req, res) => {
     }
 
     const { outcome, call_phone, call_result, call_direction, duration_sec,
-            cdr_uuid, cdr_recording_url, cdr_start_stamp, cdr_end_stamp } = req.body
+            cdr_uuid, cdr_recording_url, cdr_start_stamp, cdr_end_stamp,
+            skip_retry_today } = req.body
 
     // update shared outcome/call fields บน activity row
     const result = await crmDB.query(`
@@ -1332,7 +1658,26 @@ router.patch('/:id/done', async (req, res) => {
     const derivedStatus = deriveActivityStatus(owners)
     await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [req.params.id, derivedStatus])
 
-    res.json({ ...result.rows[0], status: derivedStatus })
+    let retry = null
+    const latestAct = { ...result.rows[0], status: derivedStatus }
+    if (latestAct.activity_type === 'call' && latestAct.call_result === 'no_answer') {
+      retry = await createNoAnswerRetryActivity(latestAct, req.user.id, {
+        skipRetryToday: !!skip_retry_today,
+      })
+    } else if (latestAct.activity_type === 'call' && latestAct.call_result === 'answered' && latestAct.ar_code) {
+      await crmDB.query(`
+        UPDATE crm_customer_profile p
+        SET last_contacted = NOW(),
+            next_followup = CASE
+              WHEN s.enabled = TRUE THEN (CURRENT_DATE + (s.default_call_interval_days * INTERVAL '1 day'))::date
+              ELSE p.next_followup
+            END
+        FROM crm_followup_settings s
+        WHERE p.ar_code = $1 AND s.id = 1
+      `, [latestAct.ar_code])
+    }
+
+    res.json({ ...latestAct, status: derivedStatus, retry })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

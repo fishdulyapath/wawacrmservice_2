@@ -11,7 +11,7 @@ router.use(authMiddleware)
 // query: date_from, date_to, owner_id
 // NOTE: status ใช้ derived status (open ถ้ายังมี owner เปิดอยู่, done ถ้าทุกคน done)
 // ─────────────────────────────────────────────────────────────
-router.get('/summary', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/summary', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, owner_id } = req.query
     const params = []
@@ -87,16 +87,19 @@ router.get('/summary', requireRole('admin', 'manager', 'supervisor'), async (req
 // สรุปงานแยกตามพนักงาน (multi-owner: นับทุก activity ที่ user เป็น owner)
 // KPI: total, open, done, cancelled, calls, meetings, tasks, avg_call_sec, done_rate
 // ─────────────────────────────────────────────────────────────
-router.get('/by-owner', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/by-owner', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { date_from, date_to } = req.query
+    const { date_from, date_to, owner_id } = req.query
     const params = []
     const conds  = []
+    const userConds = ['u.is_active = TRUE']
 
     if (date_from) { params.push(date_from); conds.push(`a.created_at >= $${params.length}::date`) }
     if (date_to)   { params.push(date_to);   conds.push(`a.created_at <  ($${params.length}::date + INTERVAL '1 day')`) }
+    if (owner_id)  { params.push(parseInt(owner_id)); userConds.push(`u.id = $${params.length}`) }
 
     const where = conds.length ? 'AND ' + conds.join(' AND ') : ''
+    const userWhere = userConds.join(' AND ')
 
     // Join via crm_activity_owners for multi-owner support
     // ao.status = สถานะของ user นั้นๆ ต่อ activity นั้น (per-user KPI)
@@ -119,7 +122,7 @@ router.get('/by-owner', requireRole('admin', 'manager', 'supervisor'), async (re
         ON ao.user_id = u.id AND ao.removed_at IS NULL
       LEFT JOIN crm_activities a
         ON a.id = ao.activity_id ${where}
-      WHERE u.is_active = TRUE
+      WHERE ${userWhere}
       GROUP BY u.id, u.name, u.code, u.role
       ORDER BY total DESC
     `, params)
@@ -151,7 +154,7 @@ router.get('/by-owner', requireRole('admin', 'manager', 'supervisor'), async (re
 // แนวโน้มกิจกรรมรายวัน/รายสัปดาห์ 30 วันย้อนหลัง
 // query: period = day | week | month
 // ─────────────────────────────────────────────────────────────
-router.get('/trend', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/trend', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { period = 'day', date_from, date_to, owner_id } = req.query
     const params = []
@@ -206,15 +209,16 @@ router.get('/trend', requireRole('admin', 'manager', 'supervisor'), async (req, 
 // GET /api/reports/audit
 // ประวัติการแก้ไข (audit log) พร้อม pagination
 // ─────────────────────────────────────────────────────────────
-router.get('/audit', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/audit', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { page = 1, limit = 30, table_name, action, user_code, date_from, date_to } = req.query
+    const { page = 1, limit = 30, table_name, action, user_code, owner_id, date_from, date_to } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
     const conds  = []
 
     if (table_name) { params.push(table_name); conds.push(`l.table_name = $${params.length}`) }
     if (action)     { params.push(action);      conds.push(`l.action = $${params.length}`) }
+    if (owner_id)   { params.push(parseInt(owner_id)); conds.push(`l.user_id = $${params.length}`) }
     if (user_code)  { params.push(`%${user_code}%`); conds.push(`l.user_code ILIKE $${params.length}`) }
     if (date_from)  { params.push(date_from);   conds.push(`l.created_at >= $${params.length}::date`) }
     if (date_to)    { params.push(date_to);     conds.push(`l.created_at <  ($${params.length}::date + INTERVAL '1 day')`) }
@@ -253,7 +257,7 @@ router.get('/audit', requireRole('admin', 'manager', 'supervisor'), async (req, 
 // KPI รายบุคคล: done_rate, avg_close_days, overdue_rate, call_count
 // query: date_from, date_to, user_id
 // ─────────────────────────────────────────────────────────────
-router.get('/kpi', requireRole('admin', 'manager', 'supervisor'), async (req, res) => {
+router.get('/kpi', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, user_id } = req.query
     const params = []
