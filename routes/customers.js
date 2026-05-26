@@ -3,6 +3,7 @@ const router = express.Router()
 const { posDB, crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 const { logAudit } = require('../middleware/audit')
+const { ensureCustomerFollowupPolicy, normalizeFollowupInterval } = require('../services/followupPolicy')
 
 // ทุก endpoint ต้อง Login ก่อน
 router.use(authMiddleware)
@@ -270,6 +271,8 @@ router.get('/:code', async (req, res) => {
       SELECT
         p.*,
         p.status AS crm_status,
+        p.next_followup::text AS next_followup,
+        p.followup_pause_until::text AS followup_pause_until,
         o.user_id AS owner_user_id,
         u.code    AS owner_code,
         u.name    AS owner_name
@@ -382,13 +385,19 @@ router.patch('/:code/followup', async (req, res) => {
     followup_pause_until,
     followup_pause_reason,
     next_followup,
+    followup_interval_days,
   } = req.body
 
   try {
+    await ensureCustomerFollowupPolicy()
     const hasFollowupEnabled = Object.prototype.hasOwnProperty.call(req.body, 'followup_enabled')
     const hasPauseUntil = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_until')
     const hasPauseReason = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_reason')
     const hasNextFollowup = Object.prototype.hasOwnProperty.call(req.body, 'next_followup')
+    const hasFollowupInterval = Object.prototype.hasOwnProperty.call(req.body, 'followup_interval_days')
+    const normalizedInterval = hasFollowupInterval
+      ? normalizeFollowupInterval(followup_interval_days)
+      : null
 
     const result = await crmDB.query(`
       UPDATE crm_customer_profile SET
@@ -396,9 +405,16 @@ router.patch('/:code/followup', async (req, res) => {
         followup_pause_until = CASE WHEN $4::boolean THEN $5::date ELSE followup_pause_until END,
         followup_pause_reason = CASE WHEN $6::boolean THEN $7::text ELSE followup_pause_reason END,
         next_followup = CASE WHEN $8::boolean THEN $9::date ELSE next_followup END,
+        followup_interval_days = CASE WHEN $10::boolean THEN $11::integer ELSE followup_interval_days END,
+        followup_interval_updated_by = CASE WHEN $10::boolean THEN $12::integer ELSE followup_interval_updated_by END,
+        followup_interval_updated_at = CASE WHEN $10::boolean THEN NOW() ELSE followup_interval_updated_at END,
         updated_at = NOW()
       WHERE ar_code = $1
-      RETURNING ar_code, followup_enabled, followup_pause_until, followup_pause_reason, next_followup
+      RETURNING ar_code, followup_enabled,
+                followup_pause_until::text AS followup_pause_until,
+                followup_pause_reason,
+                next_followup::text AS next_followup,
+                followup_interval_days, followup_interval_updated_by, followup_interval_updated_at
     `, [
       code,
       hasFollowupEnabled,
@@ -409,6 +425,9 @@ router.patch('/:code/followup', async (req, res) => {
       followup_pause_reason || null,
       hasNextFollowup,
       next_followup || null,
+      hasFollowupInterval,
+      normalizedInterval,
+      req.user.id,
     ])
 
     if (!result.rows.length) {
@@ -416,7 +435,7 @@ router.patch('/:code/followup', async (req, res) => {
     }
     res.json(result.rows[0])
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
 })
 
@@ -479,8 +498,8 @@ router.post('/', async (req, res) => {
 
     // Insert CRM profile
     await crmClient.query(`
-      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, followup_enabled)
+      VALUES ($1,$2,$3,$4,$5,$6,FALSE)
       ON CONFLICT (ar_code) DO NOTHING
     `, [
       code,
@@ -572,8 +591,8 @@ router.put('/:code', async (req, res) => {
 
     // Upsert CRM profile
     await crmClient.query(`
-      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, next_followup)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, next_followup, followup_enabled)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
       ON CONFLICT (ar_code) DO UPDATE SET
         customer_type = EXCLUDED.customer_type,
         status        = EXCLUDED.status,
