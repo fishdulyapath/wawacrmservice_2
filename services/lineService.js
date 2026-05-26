@@ -1,35 +1,16 @@
 const { crmDB } = require('../db')
+const { liffUrl } = require('../utils/lineLinks')
 
 const LINE_API = 'https://api.line.me/v2/bot/message'
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN
-
-// ─────────────────────────────────────────────────────────────
-// Helper: สร้าง LIFF URL สำหรับเปิดหน้าเว็บผ่าน LINE in-app browser
-// เปิดผ่าน https://liff.line.me/{LIFF_ID}/path เพื่อให้ LIFF SDK
-// ทำ auto-login ได้ — ถ้าเปิดตรง FRONTEND_URL จะ 400 Bad Request
-// ─────────────────────────────────────────────────────────────
-function liffUrl(path) {
-  const liffId = process.env.LIFF_ID || ''
-  if (liffId) {
-    // LIFF Endpoint URL = https://wawaapp.iszai.com/line
-    // path ที่ส่งมาจะเป็น /line/tasks → ต้องตัด /line prefix ออก
-    // เพราะ LIFF จะ append path หลัง LIFF ID ต่อจาก Endpoint URL
-    // เช่น liff.line.me/{id}/tasks → wawaapp.iszai.com/line/tasks ✅
-    const liffPath = path.startsWith('/line') ? path.slice(5) : path
-    // ถ้า liffPath ว่าง (path เป็น "/line") ให้ใช้ "/" 
-    const finalPath = liffPath || '/'
-    return `https://liff.line.me/${liffId}${finalPath}`
-  }
-  // fallback: ถ้าไม่มี LIFF_ID ใช้ FRONTEND_URL ตรง (จะมีปัญหา auth)
-  const base = (process.env.FRONTEND_URL || '').replace(/\/+$/, '')
-  return `${base}${path}`
-}
 
 // ─────────────────────────────────────────────────────────────
 // Helper: ส่ง LINE Message ไปหา userId (Push API — มีโควตา)
 // ใช้สำหรับ: cron jobs, notifications ที่ไม่ได้เกิดจาก webhook
 // ─────────────────────────────────────────────────────────────
 async function sendMessage(lineUserId, messages) {
+  if (!CHANNEL_ACCESS_TOKEN) throw new Error('LINE_CHANNEL_ACCESS_TOKEN is not configured')
+  if (!lineUserId) throw new Error('LINE userId is required')
   const res = await fetch(`${LINE_API}/push`, {
     method: 'POST',
     headers: {
@@ -51,6 +32,7 @@ async function sendMessage(lineUserId, messages) {
 // ⚠️ replyToken ใช้ได้ครั้งเดียว และหมดอายุ ~1 นาทีหลังรับ event
 // ─────────────────────────────────────────────────────────────
 async function replyMessage(replyToken, messages) {
+  if (!CHANNEL_ACCESS_TOKEN) throw new Error('LINE_CHANNEL_ACCESS_TOKEN is not configured')
   if (!replyToken) {
     console.warn('[LINE replyMessage] ไม่มี replyToken — ข้ามการตอบกลับ')
     return null
@@ -201,6 +183,7 @@ async function sendDailySummary(user, replyToken = null) {
     await logMessage({ userId: user_id, lineUserId: line_user_id, messageType: 'daily_summary', payload: messages, success: true })
   } catch (e) {
     await logMessage({ userId: user_id, lineUserId: line_user_id, messageType: 'daily_summary', payload: messages, success: false, errorMessage: e.message })
+    throw e
   }
 }
 
@@ -308,6 +291,7 @@ async function sendTaskReminder(lineUserId, userId, activity) {
     await logMessage({ userId, lineUserId, messageType: isOverdue ? 'task_overdue' : 'task_reminder', refType: 'activity', refId: activity.id, arCode: activity.ar_code, payload: messages, success: true })
   } catch (e) {
     await logMessage({ userId, lineUserId, messageType: 'task_reminder', payload: messages, success: false, errorMessage: e.message })
+    throw e
   }
 }
 
@@ -347,6 +331,7 @@ async function sendNewAssignment(lineUserId, userId, customer) {
     await logMessage({ userId, lineUserId, messageType: 'new_assignment', arCode: customer.code, payload: messages, success: true })
   } catch (e) {
     await logMessage({ userId, lineUserId, messageType: 'new_assignment', payload: messages, success: false, errorMessage: e.message })
+    throw e
   }
 }
 

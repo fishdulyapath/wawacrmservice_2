@@ -392,7 +392,7 @@ router.get('/groups', async (req, res) => {
   }
 
   try {
-    const { type, status, search, date_from, date_to, page = 1, limit = 20 } = req.query
+    const { type, status, search, owner_id, date_from, date_to, page = 1, limit = 20 } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
     const conditions = [`a.status != 'deleted'`]
@@ -400,7 +400,22 @@ router.get('/groups', async (req, res) => {
     if (type)      { params.push(type);      conditions.push(`a.activity_type = $${params.length}`) }
     if (date_from) { params.push(date_from); conditions.push(`COALESCE(a.start_datetime::date, a.due_date) >= $${params.length}::date`) }
     if (date_to)   { params.push(date_to);   conditions.push(`COALESCE(a.start_datetime::date, a.due_date) <= $${params.length}::date`) }
-    if (search)    { params.push(`%${search}%`); conditions.push(`(a.subject ILIKE $${params.length} OR a.ar_code ILIKE $${params.length})`) }
+    if (search)    {
+      params.push(`%${search}%`)
+      conditions.push(`(
+        a.subject ILIKE $${params.length}
+        OR a.ar_code ILIKE $${params.length}
+        OR EXISTS (
+          SELECT 1
+          FROM crm_activity_owners ao_q
+          JOIN crm_users u_q ON u_q.id = ao_q.user_id
+          WHERE ao_q.activity_id = a.id
+            AND ao_q.removed_at IS NULL
+            AND (u_q.name ILIKE $${params.length} OR u_q.code ILIKE $${params.length})
+        )
+      )`)
+    }
+    if (owner_id)  { params.push(parseInt(owner_id)); conditions.push(`EXISTS (SELECT 1 FROM crm_activity_owners ao_f WHERE ao_f.activity_id = a.id AND ao_f.user_id = $${params.length} AND ao_f.removed_at IS NULL)`) }
 
     // status filter applies to derived group status
     let havingClause = ''
@@ -778,7 +793,18 @@ router.get('/', async (req, res) => {
     if (search) {
       params.push(`%${search}%`)
       // Use ILIKE with % prefix to leverage gin_trgm_ops index on subject
-      conditions.push(`(a.subject ILIKE $${params.length} OR a.ar_code ILIKE $${params.length})`)
+      conditions.push(`(
+        a.subject ILIKE $${params.length}
+        OR a.ar_code ILIKE $${params.length}
+        OR EXISTS (
+          SELECT 1
+          FROM crm_activity_owners ao_q
+          JOIN crm_users u_q ON u_q.id = ao_q.user_id
+          WHERE ao_q.activity_id = a.id
+            AND ao_q.removed_at IS NULL
+            AND (u_q.name ILIKE $${params.length} OR u_q.code ILIKE $${params.length})
+        )
+      )`)
       // Exclude soft-deleted activities from search results
       conditions.push(`a.status != 'deleted'`)
     }

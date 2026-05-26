@@ -130,6 +130,96 @@ const imagePathInFolder = (value, targetFolder) => {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
+async function markMissingRows(tableName, idColumn, activeIds) {
+  const ids = [...new Set(activeIds.filter(Boolean))]
+  if (!ids.length) return
+  const allowed = new Set([
+    'fleet_payments:payment_id',
+    'fleet_visits:visit_id',
+    'fleet_return_products:return_product_id',
+    'fleet_return_documents:return_document_id',
+  ])
+  if (!allowed.has(`${tableName}:${idColumn}`)) throw new Error(`Unsafe sync table: ${tableName}.${idColumn}`)
+  await crmDB.query(
+    `UPDATE ${tableName}
+     SET deleted_at = NOW(), synced_at = NOW()
+     WHERE deleted_at IS NULL AND NOT (${idColumn} = ANY($1))`,
+    [ids]
+  )
+}
+
+let problemImagesTableReady = false
+
+async function ensureProblemImagesTable() {
+  if (problemImagesTableReady) return
+  await crmDB.query(`
+    CREATE TABLE IF NOT EXISTS fleet_problem_images (
+      image_problem_id TEXT PRIMARY KEY,
+      problem_id       TEXT NOT NULL,
+      image_path       TEXT,
+      note             TEXT,
+      created_at       TIMESTAMPTZ,
+      synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at       TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_problem_id ON fleet_problem_images(problem_id);
+    CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_created_at ON fleet_problem_images(created_at);
+  `)
+  problemImagesTableReady = true
+}
+
+let storeReportTablesReady = false
+
+async function ensureStoreReportTables() {
+  if (storeReportTablesReady) return
+  await crmDB.query(`
+    CREATE TABLE IF NOT EXISTS fleet_payments (
+      payment_id   TEXT PRIMARY KEY,
+      payment_name TEXT,
+      created_at   TIMESTAMPTZ,
+      synced_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at   TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_payments_name ON fleet_payments(payment_name);
+
+    CREATE TABLE IF NOT EXISTS fleet_visits (
+      visit_id   TEXT PRIMARY KEY,
+      visit_name TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ,
+      synced_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_visits_name ON fleet_visits(visit_name);
+
+    CREATE TABLE IF NOT EXISTS fleet_return_products (
+      return_product_id TEXT PRIMARY KEY,
+      check_out_id      TEXT NOT NULL,
+      no                INTEGER,
+      product_name      TEXT,
+      quantity          NUMERIC,
+      total             NUMERIC,
+      synced_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at        TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_return_products_check_out_id ON fleet_return_products(check_out_id);
+    CREATE INDEX IF NOT EXISTS idx_fleet_return_products_check_out_total ON fleet_return_products(check_out_id, total) WHERE deleted_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS fleet_return_documents (
+      return_document_id TEXT PRIMARY KEY,
+      car_release_id     TEXT NOT NULL,
+      image_path         TEXT,
+      created_by         TEXT,
+      created_at         TIMESTAMPTZ,
+      synced_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at         TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_fleet_return_documents_car_release_id ON fleet_return_documents(car_release_id);
+    CREATE INDEX IF NOT EXISTS idx_fleet_return_documents_created_at ON fleet_return_documents(created_at);
+  `)
+  storeReportTablesReady = true
+}
+
 // ---------------------------------------------------------------------------
 // Sync log helpers
 // ---------------------------------------------------------------------------
@@ -427,7 +517,8 @@ async function syncCheckOuts() {
            visit_note=EXCLUDED.visit_note,
            created_at=EXCLUDED.created_at, synced_at=NOW(), deleted_at=NULL`,
         [id, toText(r['list_id']), toTs(r['date_time_check_out']),
-         toText(r['check_out_image'] ?? r['image_bill']), toText(r['payment_id']),
+         imagePathInFolder(r['image_check_out'] ?? r['check_out_image'] ?? r['image_bill'], 'check_out_image'),
+         toText(r['payment_id']),
          toNum(r['cash']), toNum(r['transfer']), toNum(r['amount']),
          toNum(r['transfer_according']), toText(r['visit_customer']),
          toText(r['visit']), toText(r['visit_note']),
@@ -435,6 +526,61 @@ async function syncCheckOuts() {
       )
       synced++
     } catch (err) { failed++; console.error(`[syncCheckOuts] row ${id}:`, err.message) }
+  }
+  return { synced, failed }
+}
+
+async function syncCheckOutImages() {
+  const rows = await getSheet('image_check_out')
+  let synced = 0, failed = 0
+  const records = []
+  for (const r of rows) {
+    const checkOutId = toText(r['check_out_id'])
+    const imagePath = imagePathInFolder(
+      r['image_check_out'] ?? r['check_out_image'] ?? r['image_path'] ?? r['image'] ?? r['image_bill'],
+      'check_out_image'
+    )
+    const id = toText(
+      r['image_check_out_id'] ?? r['check_out_image_id'] ?? r['id'] ?? r['_RowNumber']
+    ) || (checkOutId && imagePath ? `${checkOutId}:${imagePath}` : null)
+    if (!id || !checkOutId || !imagePath) continue
+    records.push([
+      id,
+      checkOutId,
+      imagePath,
+      toText(r['note'] ?? r['remark'] ?? r['description']),
+      toTs(r['created_at']),
+    ])
+  }
+
+  const batchSize = 500
+  for (let offset = 0; offset < records.length; offset += batchSize) {
+    const chunk = records.slice(offset, offset + batchSize)
+    const params = []
+    const values = chunk.map((record, i) => {
+      const base = i * 5
+      params.push(...record)
+      return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},NOW())`
+    }).join(',')
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_check_out_images
+           (image_check_out_id, check_out_id, image_path, note, created_at, synced_at)
+         VALUES ${values}
+         ON CONFLICT (image_check_out_id) DO UPDATE SET
+           check_out_id=EXCLUDED.check_out_id,
+           image_path=EXCLUDED.image_path,
+           note=EXCLUDED.note,
+           created_at=EXCLUDED.created_at,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        params
+      )
+      synced += chunk.length
+    } catch (err) {
+      failed += chunk.length
+      console.error(`[syncCheckOutImages] batch ${offset}-${offset + chunk.length}:`, err.message)
+    }
   }
   return { synced, failed }
 }
@@ -465,7 +611,7 @@ async function syncProblems() {
            overstock=EXCLUDED.overstock, overstock_note=EXCLUDED.overstock_note,
            created_at=EXCLUDED.created_at, synced_at=NOW(), deleted_at=NULL`,
         [id, toText(r['list_id']), toText(r['problem_name'] ?? r['problem_type']),
-         toText(r['description']), toText(r['problem_image'] ?? r['image_problem']),
+         toText(r['description']), imagePathInFolder(r['problem_image'] ?? r['image_problem'], 'problem_image'),
          toBool(r['is_resolved'] ?? r['resolved']),
          toText(r['Normal_bill']), toText(r['Normal_bill_note']),
          toText(r['Edit_bill']), toText(r['Edit_bill_note']),
@@ -480,20 +626,201 @@ async function syncProblems() {
   return { synced, failed }
 }
 
+async function syncProblemImages() {
+  await ensureProblemImagesTable()
+  const rows = await getSheet('image_problem')
+  let synced = 0, failed = 0
+  const records = []
+  for (const r of rows) {
+    const problemId = toText(r['problem_id'])
+    const imagePath = imagePathInFolder(
+      r['image_problem'] ?? r['problem_image'] ?? r['image_path'] ?? r['image'],
+      'problem_image'
+    )
+    const id = toText(
+      r['image_problem_id'] ?? r['problem_image_id'] ?? r['id'] ?? r['_RowNumber']
+    ) || (problemId && imagePath ? `${problemId}:${imagePath}` : null)
+    if (!id || !problemId || !imagePath) continue
+    records.push([
+      id,
+      problemId,
+      imagePath,
+      toText(r['note'] ?? r['remark'] ?? r['description']),
+      toTs(r['created_at']),
+    ])
+  }
+
+  const batchSize = 500
+  for (let offset = 0; offset < records.length; offset += batchSize) {
+    const chunk = records.slice(offset, offset + batchSize)
+    const params = []
+    const values = chunk.map((record, i) => {
+      const base = i * 5
+      params.push(...record)
+      return `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},NOW())`
+    }).join(',')
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_problem_images
+           (image_problem_id, problem_id, image_path, note, created_at, synced_at)
+         VALUES ${values}
+         ON CONFLICT (image_problem_id) DO UPDATE SET
+           problem_id=EXCLUDED.problem_id,
+           image_path=EXCLUDED.image_path,
+           note=EXCLUDED.note,
+           created_at=EXCLUDED.created_at,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        params
+      )
+      synced += chunk.length
+    } catch (err) {
+      failed += chunk.length
+      console.error(`[syncProblemImages] batch ${offset}-${offset + chunk.length}:`, err.message)
+    }
+  }
+  return { synced, failed }
+}
+
 // ---------------------------------------------------------------------------
 // syncAllFleetSheets — orchestrator เรียกทุก sheet ตามลำดับ dependency
 // ---------------------------------------------------------------------------
+async function syncPayments() {
+  await ensureStoreReportTables()
+  const rows = await getSheet('payment')
+  let synced = 0, failed = 0
+  const activeIds = []
+  for (const r of rows) {
+    const id = toText(r['payment_id'])
+    if (!id) continue
+    activeIds.push(id)
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_payments (payment_id, payment_name, created_at, synced_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (payment_id) DO UPDATE SET
+           payment_name=EXCLUDED.payment_name,
+           created_at=EXCLUDED.created_at,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        [id, toText(r['payment_name']), toTs(r['created_at'])]
+      )
+      synced++
+    } catch (err) { failed++; console.error(`[syncPayments] row ${id}:`, err.message) }
+  }
+  await markMissingRows('fleet_payments', 'payment_id', activeIds)
+  return { synced, failed }
+}
+
+async function syncVisits() {
+  await ensureStoreReportTables()
+  const rows = await getSheet('visit')
+  let synced = 0, failed = 0
+  const activeIds = []
+  for (const r of rows) {
+    const id = toText(r['visit_id'])
+    if (!id) continue
+    activeIds.push(id)
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_visits (visit_id, visit_name, created_by, created_at, synced_at)
+         VALUES ($1,$2,$3,$4,NOW())
+         ON CONFLICT (visit_id) DO UPDATE SET
+           visit_name=EXCLUDED.visit_name,
+           created_by=EXCLUDED.created_by,
+           created_at=EXCLUDED.created_at,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        [id, toText(r['visit_name']), toText(r['created_by']), toTs(r['created_at'])]
+      )
+      synced++
+    } catch (err) { failed++; console.error(`[syncVisits] row ${id}:`, err.message) }
+  }
+  await markMissingRows('fleet_visits', 'visit_id', activeIds)
+  return { synced, failed }
+}
+
+async function syncReturnProducts() {
+  await ensureStoreReportTables()
+  const rows = await getSheet('return_product')
+  let synced = 0, failed = 0
+  const activeIds = []
+  for (const r of rows) {
+    const id = toText(r['return_product_id'])
+    const checkOutId = toText(r['check_out_id'])
+    if (!id || !checkOutId) continue
+    activeIds.push(id)
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_return_products
+           (return_product_id, check_out_id, no, product_name, quantity, total, synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW())
+         ON CONFLICT (return_product_id) DO UPDATE SET
+           check_out_id=EXCLUDED.check_out_id,
+           no=EXCLUDED.no,
+           product_name=EXCLUDED.product_name,
+           quantity=EXCLUDED.quantity,
+           total=EXCLUDED.total,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        [id, checkOutId, toInt(r['no']), toText(r['product_name']), toNum(r['quantity']), toNum(r['total'])]
+      )
+      synced++
+    } catch (err) { failed++; console.error(`[syncReturnProducts] row ${id}:`, err.message) }
+  }
+  await markMissingRows('fleet_return_products', 'return_product_id', activeIds)
+  return { synced, failed }
+}
+
+async function syncReturnDocuments() {
+  await ensureStoreReportTables()
+  const rows = await getSheet('return_document')
+  let synced = 0, failed = 0
+  const activeIds = []
+  for (const r of rows) {
+    const id = toText(r['return_document_id'])
+    const carReleaseId = toText(r['car_release_id'])
+    if (!id || !carReleaseId) continue
+    activeIds.push(id)
+    try {
+      await crmDB.query(
+        `INSERT INTO fleet_return_documents
+           (return_document_id, car_release_id, image_path, created_by, created_at, synced_at)
+         VALUES ($1,$2,$3,$4,$5,NOW())
+         ON CONFLICT (return_document_id) DO UPDATE SET
+           car_release_id=EXCLUDED.car_release_id,
+           image_path=EXCLUDED.image_path,
+           created_by=EXCLUDED.created_by,
+           created_at=EXCLUDED.created_at,
+           synced_at=NOW(),
+           deleted_at=NULL`,
+        [id, carReleaseId, imagePathInFolder(r['image'] ?? r['image_path'], 'return_document_Images'),
+         toText(r['created_by']), toTs(r['created_at'])]
+      )
+      synced++
+    } catch (err) { failed++; console.error(`[syncReturnDocuments] row ${id}:`, err.message) }
+  }
+  await markMissingRows('fleet_return_documents', 'return_document_id', activeIds)
+  return { synced, failed }
+}
+
 const SYNCS = [
   { name: 'user',             fn: syncUsers },
   { name: 'car',              fn: syncCars },
   { name: 'store',            fn: syncStores },
+  { name: 'payment',          fn: syncPayments },
+  { name: 'visit',            fn: syncVisits },
   { name: 'name_car_release', fn: syncGroupStores },
   { name: 'car_release',      fn: syncCarReleases },
   { name: 'car_return',       fn: syncCarReturns },
+  { name: 'return_document',  fn: syncReturnDocuments },
   { name: 'list_store',       fn: syncListStores },
   { name: 'check_in',         fn: syncCheckIns },
   { name: 'check_out',        fn: syncCheckOuts },
+  { name: 'image_check_out',  fn: syncCheckOutImages },
+  { name: 'return_product',   fn: syncReturnProducts },
   { name: 'problem',          fn: syncProblems },
+  { name: 'image_problem',    fn: syncProblemImages },
 ]
 
 let syncAllRunning = false

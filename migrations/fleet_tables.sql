@@ -159,6 +159,22 @@ CREATE INDEX IF NOT EXISTS idx_fleet_check_outs_list_id         ON fleet_check_o
 CREATE INDEX IF NOT EXISTS idx_fleet_check_outs_date_time       ON fleet_check_outs(date_time_check_out);
 
 -- ----------------------------------------------------------------
+-- fleet_check_out_images — จาก sheet "image_check_out" (หลายรูปต่อ check_out)
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_check_out_images (
+  image_check_out_id TEXT PRIMARY KEY,
+  check_out_id       TEXT NOT NULL,
+  image_path         TEXT,
+  note               TEXT,
+  created_at         TIMESTAMPTZ,
+  synced_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at         TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_check_out_images_check_out_id ON fleet_check_out_images(check_out_id);
+CREATE INDEX IF NOT EXISTS idx_fleet_check_out_images_created_at   ON fleet_check_out_images(created_at);
+
+-- ----------------------------------------------------------------
 -- fleet_problems — จาก sheet "problem"
 -- ----------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS fleet_problems (
@@ -175,6 +191,82 @@ CREATE TABLE IF NOT EXISTS fleet_problems (
 
 CREATE INDEX IF NOT EXISTS idx_fleet_problems_list_id    ON fleet_problems(list_id);
 CREATE INDEX IF NOT EXISTS idx_fleet_problems_created_at ON fleet_problems(created_at);
+
+-- ----------------------------------------------------------------
+-- fleet_problem_images — จาก sheet "image_problem" (หลายรูปต่อ problem)
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_problem_images (
+  image_problem_id TEXT PRIMARY KEY,
+  problem_id       TEXT NOT NULL,
+  image_path       TEXT,
+  note             TEXT,
+  created_at       TIMESTAMPTZ,
+  synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_problem_id ON fleet_problem_images(problem_id);
+CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_created_at ON fleet_problem_images(created_at);
+
+-- ----------------------------------------------------------------
+-- fleet_payments — from sheet "payment"
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_payments (
+  payment_id   TEXT PRIMARY KEY,
+  payment_name TEXT,
+  created_at   TIMESTAMPTZ,
+  synced_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_payments_name ON fleet_payments(payment_name);
+
+-- ----------------------------------------------------------------
+-- fleet_visits — from sheet "visit"
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_visits (
+  visit_id   TEXT PRIMARY KEY,
+  visit_name TEXT,
+  created_by TEXT,
+  created_at TIMESTAMPTZ,
+  synced_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_visits_name ON fleet_visits(visit_name);
+
+-- ----------------------------------------------------------------
+-- fleet_return_products — from sheet "return_product"
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_return_products (
+  return_product_id TEXT PRIMARY KEY,
+  check_out_id      TEXT NOT NULL,
+  no                INTEGER,
+  product_name      TEXT,
+  quantity          NUMERIC,
+  total             NUMERIC,
+  synced_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_return_products_check_out_id ON fleet_return_products(check_out_id);
+CREATE INDEX IF NOT EXISTS idx_fleet_return_products_check_out_total ON fleet_return_products(check_out_id, total) WHERE deleted_at IS NULL;
+
+-- ----------------------------------------------------------------
+-- fleet_return_documents — from sheet "return_document"
+-- ----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fleet_return_documents (
+  return_document_id TEXT PRIMARY KEY,
+  car_release_id     TEXT NOT NULL,
+  image_path         TEXT,
+  created_by         TEXT,
+  created_at         TIMESTAMPTZ,
+  synced_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at         TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_return_documents_car_release_id ON fleet_return_documents(car_release_id);
+CREATE INDEX IF NOT EXISTS idx_fleet_return_documents_created_at     ON fleet_return_documents(created_at);
 
 -- ----------------------------------------------------------------
 -- fleet_sync_logs — ติดตามสถานะการ sync ทุกครั้ง
@@ -245,3 +337,30 @@ ALTER TABLE fleet_problems ADD COLUMN IF NOT EXISTS out_of_stock TEXT;
 ALTER TABLE fleet_problems ADD COLUMN IF NOT EXISTS out_of_stock_note TEXT;
 ALTER TABLE fleet_problems ADD COLUMN IF NOT EXISTS overstock TEXT;
 ALTER TABLE fleet_problems ADD COLUMN IF NOT EXISTS overstock_note TEXT;
+
+-- fleet_problem_images: รูปปัญหาแยก sheet ที่ผูกด้วย problem_id
+CREATE TABLE IF NOT EXISTS fleet_problem_images (
+  image_problem_id TEXT PRIMARY KEY,
+  problem_id       TEXT NOT NULL,
+  image_path       TEXT,
+  note             TEXT,
+  created_at       TIMESTAMPTZ,
+  synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_problem_id ON fleet_problem_images(problem_id);
+CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_created_at ON fleet_problem_images(created_at);
+
+-- ----------------------------------------------------------------
+-- Store report performance indexes
+-- ----------------------------------------------------------------
+CREATE INDEX IF NOT EXISTS idx_fleet_list_stores_store_group ON fleet_list_stores(store_id, group_store_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_list_stores_store_created ON fleet_list_stores(store_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_list_stores_store_data_no ON fleet_list_stores(store_id, data_store_no) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_check_outs_list_date ON fleet_check_outs(list_id, date_time_check_out DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_check_ins_list_date ON fleet_check_ins(list_id, date_time_check_in DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_problems_list_created ON fleet_problems(list_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_check_out_images_check_out_created ON fleet_check_out_images(check_out_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_problem_images_problem_created ON fleet_problem_images(problem_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fleet_car_releases_group_date ON fleet_car_releases(group_store_id, trip_date DESC) WHERE deleted_at IS NULL;

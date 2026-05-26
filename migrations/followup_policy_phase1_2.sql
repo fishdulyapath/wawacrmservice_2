@@ -106,9 +106,12 @@ ALTER TABLE crm_activities
   ADD COLUMN IF NOT EXISTS retry_group_key TEXT;
 
 ALTER TABLE crm_customer_profile
-  ADD COLUMN IF NOT EXISTS followup_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS followup_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS followup_pause_until DATE,
   ADD COLUMN IF NOT EXISTS followup_pause_reason TEXT;
+
+ALTER TABLE crm_customer_profile
+  ALTER COLUMN followup_enabled SET DEFAULT FALSE;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_activities_followup_key
   ON crm_activities(followup_key)

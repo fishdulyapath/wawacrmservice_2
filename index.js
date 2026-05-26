@@ -5,6 +5,7 @@ const helmet    = require('helmet')
 const rateLimit = require('express-rate-limit')
 const path      = require('path')
 const { posDB, crmDB } = require('./db')
+const { allowedFrontendOrigins } = require('./utils/lineLinks')
 
 const app  = express()
 const PORT = process.env.PORT || 3000
@@ -43,10 +44,7 @@ app.use('/api/', apiLimiter)
 app.use('/api/auth/login', authLimiter)
 
 // CORS: รองรับหลาย origin (production + ngrok + dev)
-const allowedOrigins = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map(s => s.trim().replace(/\/+$/, ''))   // ลบ trailing slash
-  .filter(Boolean)
+const allowedOrigins = allowedFrontendOrigins()
 
 app.use(cors({
   origin: allowedOrigins.length > 0

@@ -269,6 +269,7 @@ router.get('/:code', async (req, res) => {
     const crmResult = await crmDB.query(`
       SELECT
         p.*,
+        p.status AS crm_status,
         o.user_id AS owner_user_id,
         u.code    AS owner_code,
         u.name    AS owner_name

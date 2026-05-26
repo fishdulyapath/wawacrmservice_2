@@ -2,6 +2,7 @@ const express = require('express')
 const router = express.Router()
 const { crmDB } = require('../db')
 const { authMiddleware, requireRole } = require('../middleware/auth')
+const { runDueFollowups, bangkokDate } = require('../services/followupRunner')
 
 router.use(authMiddleware)
 
@@ -207,6 +208,26 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
     res.json(await withAutomationMeta(normalizeSettings(result.rows[0])))
   } catch (err) {
     res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/run-now', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const settings = await ensureSettings()
+    const result = await runDueFollowups({
+      settings,
+      actorUserId: req.user.id,
+      todayStr: bangkokDate(),
+      source: 'manual',
+    })
+    const refreshed = await crmDB.query(`SELECT * FROM crm_followup_settings WHERE id = 1`)
+    res.json({
+      success: true,
+      ...result,
+      settings: await withAutomationMeta(normalizeSettings(refreshed.rows[0] || settings)),
+    })
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
 })
 

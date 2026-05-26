@@ -3,6 +3,7 @@ const { crmDB } = require('../db')
 const lineService = require('./lineService')
 const { notify, notifyMany } = require('./notifyService')
 const { syncAllFleetSheets } = require('./fleetSync')
+const { ensureCustomerFollowupPolicy } = require('./followupPolicy')
 
 /**
  * เริ่ม Cron Jobs ทั้งหมดของระบบ LINE
@@ -97,6 +98,7 @@ function start() {
 
       lastAutoFollowupRunKey = runKey
       const settings = settingsRes.rows[0]
+      await ensureCustomerFollowupPolicy()
 
       const fallbackUserRes = await crmDB.query(`
         SELECT id FROM crm_users
@@ -120,7 +122,11 @@ function start() {
       }
 
       const customersRes = await crmDB.query(`
-        SELECT p.ar_code, p.next_followup, p.next_followup::text AS next_followup_text
+        SELECT
+          p.ar_code,
+          p.next_followup,
+          p.next_followup::text AS next_followup_text,
+          COALESCE(p.followup_interval_days, $2::integer) AS effective_call_interval_days
         FROM crm_customer_profile p
         WHERE p.status = 'active'
           AND p.followup_enabled = TRUE
@@ -148,7 +154,7 @@ function start() {
           )
         ORDER BY p.next_followup ASC, p.ar_code ASC
         LIMIT 100
-      `, [todayStr])
+      `, [todayStr, settings.default_call_interval_days])
 
       const adminNotifyRes = await crmDB.query(`
         SELECT id FROM crm_users
@@ -232,7 +238,7 @@ function start() {
             UPDATE crm_customer_profile
             SET next_followup = (GREATEST(next_followup, $2::date) + ($3 || ' days')::INTERVAL)::date
             WHERE ar_code = $1
-          `, [customer.ar_code, todayStr, settings.default_call_interval_days])
+          `, [customer.ar_code, todayStr, customer.effective_call_interval_days])
 
           await client.query('COMMIT')
           createdCount++
@@ -314,17 +320,19 @@ function start() {
       `, [todayStr])
 
       for (const task of result.rows) {
-        await notify({
-          userId: task.user_id,
-          notiType: 'task_due',
+        if (!task.has_notification_today) {
+          await notify({
+            userId: task.user_id,
+            notiType: 'task_due',
           title: `ถึงเวลาโทรซ้ำ${task.attempt_no ? ` ครั้งที่ ${task.attempt_no}` : ''}`,
           message: task.subject,
           refType: 'activity',
           refId: task.id,
           arCode: task.ar_code,
-        })
+          })
+        }
 
-        if (task.line_user_id && task.line_notify_enabled) {
+        if (task.line_user_id && task.line_notify_enabled && !task.has_line_success_today) {
           await lineService.sendTaskReminder(task.line_user_id, task.user_id, task)
             .catch(e => console.error(`[Cron RetryDue] task ${task.id}`, e.message))
         }
@@ -348,7 +356,26 @@ function start() {
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.due_date, a.start_datetime, a.priority, a.ar_code,
                u.id AS user_id, u.line_user_id, u.line_notify_enabled,
-               ao.status AS owner_status
+               ao.status AS owner_status,
+               EXISTS (
+                 SELECT 1 FROM crm_notifications n
+                 WHERE n.user_id = u.id
+                   AND n.ref_type = 'activity'
+                   AND n.ref_id = a.id
+                   AND n.noti_type = 'task_overdue'
+                   AND n.created_at >= $2::date
+                   AND n.created_at <  ($2::date + INTERVAL '1 day')
+               ) AS has_notification_today,
+               EXISTS (
+                 SELECT 1 FROM crm_line_message_log lg
+                 WHERE lg.user_id = u.id
+                   AND lg.ref_type = 'activity'
+                   AND lg.ref_id = a.id
+                   AND lg.message_type = 'task_overdue'
+                   AND lg.success = TRUE
+                   AND lg.sent_at >= $2::date
+                   AND lg.sent_at <  ($2::date + INTERVAL '1 day')
+               ) AS has_line_success_today
         FROM crm_activities a
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
@@ -357,32 +384,25 @@ function start() {
           AND COALESCE(a.due_date, DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok')) < CURRENT_DATE
           AND u.is_active = TRUE
           AND to_char(COALESCE(u.overdue_notify_time, TIME '08:00'), 'HH24:MI') = $1
-          AND NOT EXISTS (
-            SELECT 1 FROM crm_notifications n
-            WHERE n.user_id = u.id
-              AND n.ref_type = 'activity'
-              AND n.ref_id = a.id
-              AND n.noti_type = 'task_overdue'
-              AND n.created_at >= $2::date
-              AND n.created_at <  ($2::date + INTERVAL '1 day')
-          )
       `, [hhmm, todayStr])
 
       for (const task of result.rows) {
         const dueDate = task.due_date || task.start_datetime
         const daysDiff = Math.floor((Date.now() - new Date(dueDate).getTime()) / 86400000)
         const typeLabel = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
-        await notify({
-          userId: task.user_id,
-          notiType: 'task_overdue',
+        if (!task.has_notification_today) {
+          await notify({
+            userId: task.user_id,
+            notiType: 'task_overdue',
           title: `${typeLabel}เลยกำหนด ${daysDiff} วัน`,
           message: task.subject,
           refType: 'activity',
           refId: task.id,
           arCode: task.ar_code,
-        })
+          })
+        }
 
-        if (task.line_user_id && task.line_notify_enabled) {
+        if (task.line_user_id && task.line_notify_enabled && !task.has_line_success_today) {
           await lineService.sendTaskReminder(task.line_user_id, task.user_id, task)
             .catch(e => console.error(`[Cron Overdue] task ${task.id}`, e.message))
         }
@@ -405,7 +425,26 @@ function start() {
 
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.due_date, a.start_datetime, a.priority, a.ar_code,
-               u.id AS user_id, u.line_user_id, u.line_notify_enabled
+               u.id AS user_id, u.line_user_id, u.line_notify_enabled,
+               EXISTS (
+                 SELECT 1 FROM crm_notifications n
+                 WHERE n.user_id = u.id
+                   AND n.ref_type = 'activity'
+                   AND n.ref_id = a.id
+                   AND n.noti_type = 'task_due'
+                   AND n.created_at >= $2::date
+                   AND n.created_at <  ($2::date + INTERVAL '1 day')
+               ) AS has_notification_today,
+               EXISTS (
+                 SELECT 1 FROM crm_line_message_log lg
+                 WHERE lg.user_id = u.id
+                   AND lg.ref_type = 'activity'
+                   AND lg.ref_id = a.id
+                   AND lg.message_type = 'task_reminder'
+                   AND lg.success = TRUE
+                   AND lg.sent_at >= $2::date
+                   AND lg.sent_at <  ($2::date + INTERVAL '1 day')
+               ) AS has_line_success_today
         FROM crm_activities a
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
@@ -415,30 +454,23 @@ function start() {
               = (CURRENT_DATE + INTERVAL '1 day')
           AND u.is_active = TRUE
           AND to_char(COALESCE(u.due_tomorrow_notify_time, TIME '17:00'), 'HH24:MI') = $1
-          AND NOT EXISTS (
-            SELECT 1 FROM crm_notifications n
-            WHERE n.user_id = u.id
-              AND n.ref_type = 'activity'
-              AND n.ref_id = a.id
-              AND n.noti_type = 'task_due'
-              AND n.created_at >= $2::date
-              AND n.created_at <  ($2::date + INTERVAL '1 day')
-          )
       `, [hhmm, todayStr])
 
       for (const task of result.rows) {
         const typeLabel2 = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
-        await notify({
-          userId: task.user_id,
-          notiType: 'task_due',
+        if (!task.has_notification_today) {
+          await notify({
+            userId: task.user_id,
+            notiType: 'task_due',
           title: `${typeLabel2}ครบกำหนดพรุ่งนี้`,
           message: task.subject,
           refType: 'activity',
           refId: task.id,
           arCode: task.ar_code,
-        })
+          })
+        }
 
-        if (task.line_user_id && task.line_notify_enabled) {
+        if (task.line_user_id && task.line_notify_enabled && !task.has_line_success_today) {
           await lineService.sendTaskReminder(task.line_user_id, task.user_id, task)
             .catch(e => console.error(`[Cron DueTomorrow] task ${task.id}`, e.message))
         }

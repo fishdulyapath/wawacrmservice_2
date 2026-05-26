@@ -4,6 +4,7 @@ const crypto    = require('crypto')
 const { crmDB, posDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 const lineService = require('../services/lineService')
+const { liffUrl } = require('../utils/lineLinks')
 
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/
@@ -12,19 +13,6 @@ function normalizeHHMM(value, fallback) {
   if (!value) return fallback
   const text = String(value).slice(0, 5)
   return HHMM_RE.test(text) ? text : null
-}
-
-// Helper: สร้าง LIFF URL (เหมือนใน lineService.js)
-function _liffUrl(path) {
-  const liffId = process.env.LIFF_ID || ''
-  if (liffId) {
-    // LIFF Endpoint URL = https://wawaapp.iszai.com/line
-    // ต้องตัด /line prefix ออกจาก path เพราะ Endpoint มี /line อยู่แล้ว
-    const liffPath = path.startsWith('/line') ? path.slice(5) : path
-    const finalPath = liffPath || '/'
-    return `https://liff.line.me/${liffId}${finalPath}`
-  }
-  return (process.env.FRONTEND_URL || '').replace(/\/+$/, '') + path
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -130,7 +118,7 @@ async function handleMessage(event, replyToken) {
     text: `คำสั่งที่ใช้ได้:\n` +
           `• ส่ง OTP เพื่อผูก account\n` +
           `• "งานวันนี้" — ดูสรุปงาน\n\n` +
-          `📱 เข้าดูงานได้ที่: ${_liffUrl('/line')}`
+          `📱 เข้าดูงานได้ที่: ${liffUrl('/line')}`
   }])
 }
 
@@ -236,7 +224,7 @@ async function handleLinkByOTP(lineUserId, token, replyToken) {
         type: 'box', layout: 'vertical', paddingAll: '15px',
         contents: [{
           type: 'button', style: 'primary', color: '#2563eb',
-          action: { type: 'uri', label: '📋 ดูงานของฉัน', uri: _liffUrl('/line/tasks') }
+          action: { type: 'uri', label: '📋 ดูงานของฉัน', uri: liffUrl('/line/tasks') }
         }]
       }
     }
@@ -379,7 +367,11 @@ router.post('/unlink', authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.post('/send-daily', authMiddleware, async (req, res) => {
   try {
-    const result = await crmDB.query(`SELECT * FROM v_daily_summary_per_user`)
+    const result = await crmDB.query(`
+      SELECT * FROM v_daily_summary_per_user
+      WHERE line_user_id IS NOT NULL
+        AND line_notify_enabled = TRUE
+    `)
     let sent = 0, failed = 0
 
     for (const user of result.rows) {
