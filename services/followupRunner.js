@@ -119,6 +119,41 @@ async function runDueFollowups({
     LIMIT $3
   `, [todayStr, settings.default_call_interval_days, limit])
 
+  // Case B: next_followup เลยกำหนดแต่มี open scheduled activity ค้างอยู่
+  // → อัปเดต next_followup ไปข้างหน้าเพื่อปลดล็อก ไม่ให้ติดซ้ำทุกวัน
+  const stuckRes = await crmDB.query(`
+    SELECT
+      p.ar_code,
+      COALESCE(p.followup_interval_days, $2::integer) AS effective_call_interval_days
+    FROM crm_customer_profile p
+    WHERE p.status = 'active'
+      AND p.followup_enabled = TRUE
+      AND (p.followup_pause_until IS NULL OR p.followup_pause_until < $1::date)
+      AND p.next_followup IS NOT NULL
+      AND p.next_followup <= $1::date
+      AND NOT EXISTS (
+        SELECT 1 FROM crm_activities a
+        WHERE a.followup_key = ('auto-followup:' || p.ar_code || ':' || p.next_followup::text)
+      )
+      AND EXISTS (
+        SELECT 1 FROM crm_activities a
+        WHERE a.ar_code = p.ar_code
+          AND a.followup_type = 'scheduled'
+          AND a.status NOT IN ('done','cancelled','deleted')
+          AND (
+            a.requires_owner_assignment = TRUE
+            OR EXISTS (
+              SELECT 1 FROM crm_activity_owners ao
+              WHERE ao.activity_id = a.id
+                AND ao.removed_at IS NULL
+                AND ao.status NOT IN ('done','cancelled')
+            )
+          )
+      )
+    ORDER BY p.next_followup ASC, p.ar_code ASC
+    LIMIT $3
+  `, [todayStr, settings.default_call_interval_days, limit])
+
   const adminNotifyIds = await loadAdminNotifyIds()
   let createdCount = 0
   let unassignedCount = 0
@@ -231,9 +266,23 @@ async function runDueFollowups({
     } catch (err) {
       await client.query('ROLLBACK')
       if (!firstError) firstError = `${customer.ar_code}: ${err.message}`
-      console.error(`[FollowupRunner] ${customer.ar_code}`, err.message)
+      console.error('[FollowupRunner]', customer.ar_code, err.message)
     } finally {
       client.release()
+    }
+  }
+
+  // อัปเดต next_followup สำหรับลูกค้าที่ติดค้าง (Case B)
+  for (const stuck of stuckRes.rows) {
+    try {
+      await crmDB.query(`
+        UPDATE crm_customer_profile
+        SET next_followup = ($2::date + ($3 || ' days')::INTERVAL)::date
+        WHERE ar_code = $1
+      `, [stuck.ar_code, todayStr, stuck.effective_call_interval_days])
+      console.log('[FollowupRunner] stuck advance:', stuck.ar_code, '→ today+', stuck.effective_call_interval_days, 'days')
+    } catch (err) {
+      console.error('[FollowupRunner] stuck update error:', stuck.ar_code, err.message)
     }
   }
 

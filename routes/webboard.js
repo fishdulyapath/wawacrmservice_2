@@ -321,7 +321,7 @@ router.post('/threads', upload.array('files', MAX_FILES), async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // PATCH /api/webboard/threads/:id
 // ─────────────────────────────────────────────────────────────
-router.patch('/threads/:id', async (req, res) => {
+router.patch('/threads/:id', upload.array('files', MAX_FILES), async (req, res) => {
   try {
     const existing = await crmDB.query(
       'SELECT * FROM crm_webboard_threads WHERE id=$1', [req.params.id]
@@ -333,24 +333,35 @@ router.patch('/threads/:id', async (req, res) => {
       return res.status(403).json({ error: 'ไม่มีสิทธิ์แก้ไขกระทู้นี้' })
     }
 
-    const { title, content, category_id } = req.body
+    const { title, content, category_id, is_announcement } = req.body
+    const announcementVal = canPin(req.user) && is_announcement !== undefined
+      ? (is_announcement === true || is_announcement === 'true')
+      : thread.is_announcement
     const r = await crmDB.query(`
       UPDATE crm_webboard_threads
-      SET title=$1, content=$2, category_id=$3, updated_at=NOW()
+      SET title=$1, content=$2, category_id=$3, is_announcement=$5, updated_at=NOW()
       WHERE id=$4 RETURNING *
     `, [
       title?.trim()   || thread.title,
       content?.trim() || thread.content,
       category_id     || thread.category_id,
-      req.params.id
+      req.params.id,
+      announcementVal,
     ])
+
+    // แนบไฟล์ใหม่ (ถ้ามี)
+    const newAtts = await saveWbFiles('threads', thread.id, req.files || [], req.user.id)
 
     await logAudit({
       tableName: 'crm_webboard_threads', recordId: thread.id,
       action: 'UPDATE', oldData: thread, newData: r.rows[0]
     }, req)
 
-    res.json(r.rows[0])
+    const allAtts = await crmDB.query(
+      'SELECT * FROM crm_webboard_thread_attachments WHERE thread_id=$1 ORDER BY created_at ASC',
+      [thread.id]
+    )
+    res.json({ ...r.rows[0], attachments: allAtts.rows })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
