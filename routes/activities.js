@@ -12,6 +12,23 @@ const isSA       = u => u.code?.toUpperCase() === 'SUPERADMIN' || ['admin','mana
 const canCreate  = u => isSA(u)   // supervisor ขึ้นไป
 const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.code?.toUpperCase() === 'SUPERADMIN'
 
+// ── Helper: สร้างรหัสกิจกรรม act_no ─────────────────────────
+// รูปแบบ: C-yyyymmdd-0001 (call), M-yyyymmdd-0001 (meeting), W-yyyymmdd-0001 (task)
+// running number แยกต่อวัน + แยกตาม prefix
+const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W' }
+async function generateActNo(activityType, client) {
+  const db = client || crmDB
+  const prefix = ACT_PREFIX[activityType] || 'W'
+  const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
+  const dateStr = `${bkkNow.getFullYear()}${String(bkkNow.getMonth() + 1).padStart(2, '0')}${String(bkkNow.getDate()).padStart(2, '0')}`
+  const res = await db.query(
+    `SELECT COUNT(*) AS cnt FROM crm_activities WHERE act_no LIKE $1`,
+    [`${prefix}-${dateStr}-%`]
+  )
+  const next = parseInt(res.rows[0].cnt) + 1
+  return `${prefix}-${dateStr}-${String(next).padStart(4, '0')}`
+}
+
 // ── Helper: ดึง owners ของ activity ──────────────────────────
 async function getOwners(activityId, client) {
   const db = client || crmDB
@@ -168,16 +185,17 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
       return { skipped: true, reason: 'already_exists', activity_id: duplicateRes.rows[0].id }
     }
 
+    const act_no_retry = await generateActNo('call', client)
     const insertRes = await client.query(`
       INSERT INTO crm_activities (
         ar_code, owner_id, created_by, activity_type, subject, description,
         status, priority, due_date, start_datetime, call_direction, system_created,
         followup_type, followup_policy_id, followup_key,
         retry_of_activity_id, attempt_no, retry_due_at, retry_group_key,
-        requires_owner_assignment, owner_assignment_note
+        requires_owner_assignment, owner_assignment_note, act_no
       )
       VALUES ($1,$2,$3,'call',$4,$5,'open',$6,$7::timestamptz::date,$7,'outbound',TRUE,
-              'no_answer_retry',1,$8,$9,$10,$7,$11,$12,$13)
+              'no_answer_retry',1,$8,$9,$10,$7,$11,$12,$13,$14)
       ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
       RETURNING *
     `, [
@@ -194,6 +212,7 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
       retryGroupKey,
       ownerIds.length === 0,
       ownerIds.length === 0 ? 'งานโทรซ้ำนี้ไม่มี owner จากงานเดิม' : null,
+      act_no_retry,
     ])
     if (!insertRes.rows.length) {
       await client.query('ROLLBACK')
@@ -1008,19 +1027,20 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN')
 
+    const act_no = await generateActNo(activity_type, client)
     const result = await client.query(`
       INSERT INTO crm_activities
         (ar_code, owner_id, created_by, activity_type, subject, description, status, priority,
          due_date, start_datetime, end_datetime, location,
          call_direction, call_result, call_phone, duration_sec,
-         meeting_url, outcome, all_day, group_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         meeting_url, outcome, all_day, group_id, act_no)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       RETURNING *`,
       [ar_code || null, primaryId, req.user.id,
        activity_type, subject, description, status, priority,
        due_date || null, start_datetime || null, end_datetime || null, location || null,
        call_direction || null, call_result || null, call_phone || null, duration_sec || null,
-       meeting_url || null, outcome || null, all_day, group_id || null]
+       meeting_url || null, outcome || null, all_day, group_id || null, act_no]
     )
     const activity = result.rows[0]
 
@@ -1298,18 +1318,19 @@ router.put('/:id', async (req, res) => {
 
       for (const newArCode of add_ar_codes) {
         if (!newArCode) continue
+        const act_no_grp = await generateActNo(updated.activity_type, client)
         const newAct = await client.query(`
           INSERT INTO crm_activities
             (ar_code, owner_id, created_by, activity_type, subject, description, status, priority,
-             due_date, start_datetime, end_datetime, location, meeting_url, outcome, all_day, group_id)
-          VALUES ($1,$2,$3,$4,$5,$6,'open',$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             due_date, start_datetime, end_datetime, location, meeting_url, outcome, all_day, group_id, act_no)
+          VALUES ($1,$2,$3,$4,$5,$6,'open',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
           RETURNING *
         `, [
           newArCode, resolvedPrimary, req.user.id,
           updated.activity_type, updated.subject, updated.description, updated.priority,
           updated.due_date || null, updated.start_datetime || null, updated.end_datetime || null,
           updated.location || null, updated.meeting_url || null, updated.outcome || null,
-          updated.all_day, old.group_id,
+          updated.all_day, old.group_id, act_no_grp,
         ])
         const newActId = newAct.rows[0].id
         for (const uid of resolvedOwners) {

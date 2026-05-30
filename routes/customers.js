@@ -59,7 +59,17 @@ async function replaceCustomerOwners(client, arCode, owners, assignedBy) {
 // ─────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 20, status, owner, crm_only } = req.query
+    const { search = '', page = 1, limit = 20, status, owner, crm_only,
+            followup_enabled, sort_by = 'code', sort_dir = 'asc' } = req.query
+
+    const SORT_WHITELIST = {
+      code:               'c.code',
+      name_1:             'c.name_1',
+      province:           'ep.name_1',
+      last_purchase_date: 'last_purchase_date',
+    }
+    const sortCol     = SORT_WHITELIST[sort_by] || 'c.code'
+    const sortDirSafe = sort_dir?.toLowerCase() === 'desc' ? 'DESC' : 'ASC'
     const offset = (parseInt(page) - 1) * parseInt(limit)
 
     // ── 1. สร้าง ar_code whitelist จาก filter ──────────────
@@ -98,6 +108,18 @@ router.get('/', async (req, res) => {
       }
     }
 
+    // filter by followup_enabled
+    let followupArCodes = null
+    if (followup_enabled === 'true') {
+      const fRes = await crmDB.query(
+        `SELECT ar_code FROM crm_customer_profile WHERE followup_enabled = TRUE`
+      )
+      followupArCodes = fRes.rows.map(r => r.ar_code)
+      if (followupArCodes.length === 0) {
+        return res.json({ data: [], total: 0, page: parseInt(page), limit: parseInt(limit) })
+      }
+    }
+
     // ใช้ในหน้า ActivityForm: ค้นหาได้เฉพาะลูกค้าที่ถูกบันทึกเข้า CRM แล้ว
     let crmOnlyArCodes = null
     if (String(crm_only).toLowerCase() === 'true') {
@@ -124,6 +146,10 @@ router.get('/', async (req, res) => {
       params.push(statusArCodes)
       where.push(`c.code = ANY($${params.length})`)
     }
+    if (followupArCodes) {
+      params.push(followupArCodes)
+      where.push(`c.code = ANY($${params.length})`)
+    }
     if (crmOnlyArCodes) {
       params.push(crmOnlyArCodes)
       where.push(`c.code = ANY($${params.length})`)
@@ -144,12 +170,23 @@ router.get('/', async (req, res) => {
       SELECT
         c.code, c.name_1, c.country, c.address, c.province,
         c.amper, c.tambon, c.zip_code, c.website, c.remark,
-        d.sale_code, u.name_1 AS sale_name
+        d.sale_code, u.name_1 AS sale_name,
+        ep.name_1 AS province_name,
+        ea.name_1 AS amper_name,
+        (
+          SELECT MAX(t.doc_date)
+          FROM ic_trans t
+          WHERE t.cust_code = c.code
+            AND t.trans_flag = 44
+            AND t.last_status = 0
+        ) AS last_purchase_date
       FROM ar_customer c
       LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
       LEFT JOIN erp_user u           ON u.code = d.sale_code
+      LEFT JOIN erp_province ep      ON ep.code = c.province
+      LEFT JOIN erp_amper    ea      ON ea.code = c.amper AND ea.province = c.province
       WHERE ${where.join(' AND ')}
-      ORDER BY c.code
+      ORDER BY ${sortCol} ${sortDirSafe} NULLS LAST
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
 
@@ -187,6 +224,18 @@ router.get('/', async (req, res) => {
       const crm = crmMap[c.code] || null
       return { ...c, crm }
     })
+
+    if (sort_by === 'next_followup') {
+      const dir = sortDirSafe === 'DESC' ? -1 : 1
+      data.sort((a, b) => {
+        const da = a.crm?.next_followup ? new Date(a.crm.next_followup) : null
+        const db = b.crm?.next_followup ? new Date(b.crm.next_followup) : null
+        if (!da && !db) return 0
+        if (!da) return 1
+        if (!db) return -1
+        return dir * (da - db)
+      })
+    }
 
     res.json({ data, total, page: parseInt(page), limit: parseInt(limit) })
   } catch (err) {
@@ -393,11 +442,33 @@ router.patch('/:code/followup', async (req, res) => {
     const hasFollowupEnabled = Object.prototype.hasOwnProperty.call(req.body, 'followup_enabled')
     const hasPauseUntil = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_until')
     const hasPauseReason = Object.prototype.hasOwnProperty.call(req.body, 'followup_pause_reason')
-    const hasNextFollowup = Object.prototype.hasOwnProperty.call(req.body, 'next_followup')
+    let hasNextFollowup = Object.prototype.hasOwnProperty.call(req.body, 'next_followup')
     const hasFollowupInterval = Object.prototype.hasOwnProperty.call(req.body, 'followup_interval_days')
     const normalizedInterval = hasFollowupInterval
       ? normalizeFollowupInterval(followup_interval_days)
       : null
+
+    // ถ้ากำลังเปิด followup_enabled = true และ next_followup ไม่ได้ถูก set ใน request นี้
+    // ให้ตรวจค่าปัจจุบันใน DB — ถ้าว่างหรือเลยวันนี้ ให้ default เป็น today+1 (Asia/Bangkok)
+    let resolvedNextFollowup = next_followup || null
+    if (hasFollowupEnabled && followup_enabled === true && !hasNextFollowup) {
+      const cur = await crmDB.query(
+        `SELECT next_followup FROM crm_customer_profile WHERE ar_code = $1`, [code]
+      )
+      const existingDate = cur.rows[0]?.next_followup
+      // คำนวณวันที่ใน Asia/Bangkok โดยใช้ Intl เพื่อหลีกเลี่ยง UTC offset
+      const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
+      const todayStr = `${bkkNow.getFullYear()}-${String(bkkNow.getMonth() + 1).padStart(2, '0')}-${String(bkkNow.getDate()).padStart(2, '0')}`
+      const tomorrowBkk = new Date(bkkNow)
+      tomorrowBkk.setDate(tomorrowBkk.getDate() + 1)
+      const tomorrowStr = `${tomorrowBkk.getFullYear()}-${String(tomorrowBkk.getMonth() + 1).padStart(2, '0')}-${String(tomorrowBkk.getDate()).padStart(2, '0')}`
+      // existingDate จาก DB เป็น Date object หรือ string YYYY-MM-DD
+      const existingStr = existingDate ? existingDate.toISOString?.().slice(0, 10) ?? String(existingDate).slice(0, 10) : null
+      if (!existingStr || existingStr <= todayStr) {
+        resolvedNextFollowup = tomorrowStr
+        hasNextFollowup = true
+      }
+    }
 
     const result = await crmDB.query(`
       UPDATE crm_customer_profile SET
@@ -424,7 +495,7 @@ router.patch('/:code/followup', async (req, res) => {
       hasPauseReason,
       followup_pause_reason || null,
       hasNextFollowup,
-      next_followup || null,
+      resolvedNextFollowup,
       hasFollowupInterval,
       normalizedInterval,
       req.user.id,
