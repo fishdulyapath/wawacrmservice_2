@@ -15,7 +15,7 @@ const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.c
 // ── Helper: สร้างรหัสกิจกรรม act_no ─────────────────────────
 // รูปแบบ: C-yyyymmdd-0001 (call), M-yyyymmdd-0001 (meeting), W-yyyymmdd-0001 (task)
 // running number แยกต่อวัน + แยกตาม prefix
-const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W' }
+const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
 async function generateActNo(activityType, client) {
   const db = client || crmDB
   const prefix = ACT_PREFIX[activityType] || 'W'

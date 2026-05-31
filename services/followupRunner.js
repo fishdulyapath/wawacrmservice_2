@@ -2,7 +2,7 @@ const { crmDB } = require('../db')
 const { notifyMany } = require('./notifyService')
 const { ensureCustomerFollowupPolicy } = require('./followupPolicy')
 
-const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W' }
+const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
 async function generateActNo(activityType, client) {
   const db = client || crmDB
   const prefix = ACT_PREFIX[activityType] || 'W'
