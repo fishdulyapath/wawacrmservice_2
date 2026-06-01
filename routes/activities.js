@@ -16,17 +16,27 @@ const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.c
 // รูปแบบ: C-yyyymmdd-0001 (call), M-yyyymmdd-0001 (meeting), W-yyyymmdd-0001 (task)
 // running number แยกต่อวัน + แยกตาม prefix
 const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
-async function generateActNo(activityType, client) {
-  const db = client || crmDB
+async function generateActNo(activityType) {
+  // ใช้ session-level advisory lock + connection แยก (นอก outer transaction)
+  // เพื่อให้ COUNT เห็น committed rows และป้องกัน race condition
   const prefix = ACT_PREFIX[activityType] || 'W'
   const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
   const dateStr = `${bkkNow.getFullYear()}${String(bkkNow.getMonth() + 1).padStart(2, '0')}${String(bkkNow.getDate()).padStart(2, '0')}`
-  const res = await db.query(
-    `SELECT COUNT(*) AS cnt FROM crm_activities WHERE act_no LIKE $1`,
-    [`${prefix}-${dateStr}-%`]
-  )
-  const next = parseInt(res.rows[0].cnt) + 1
-  return `${prefix}-${dateStr}-${String(next).padStart(4, '0')}`
+  const lockKey = (prefix.charCodeAt(0) * 100000000 + parseInt(dateStr)) % 2147483647
+  const lockClient = await crmDB.connect()
+  try {
+    await lockClient.query(`SELECT pg_advisory_lock($1)`, [lockKey])
+    const res = await lockClient.query(
+      `SELECT COUNT(*) AS cnt FROM crm_activities WHERE act_no LIKE $1`,
+      [`${prefix}-${dateStr}-%`]
+    )
+    const next = parseInt(res.rows[0].cnt) + 1
+    return `${prefix}-${dateStr}-${String(next).padStart(4, '0')}`
+  } finally {
+    // ปล่อย session lock และ release connection
+    try { await lockClient.query(`SELECT pg_advisory_unlock($1)`, [lockKey]) } catch {}
+    lockClient.release()
+  }
 }
 
 // ── Helper: ดึง owners ของ activity ──────────────────────────
@@ -185,7 +195,7 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
       return { skipped: true, reason: 'already_exists', activity_id: duplicateRes.rows[0].id }
     }
 
-    const act_no_retry = await generateActNo('call', client)
+    const act_no_retry = await generateActNo('call')
     const insertRes = await client.query(`
       INSERT INTO crm_activities (
         ar_code, owner_id, created_by, activity_type, subject, description,
@@ -748,7 +758,16 @@ router.patch('/groups/:groupKey/bulk-close', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, page = 1, limit = 20 } = req.query
+    const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, page = 1, limit = 20,
+            sort_by = 'created_at', sort_dir = 'desc' } = req.query
+
+    const SORT_WHITELIST = {
+      created_at:     'a.created_at',
+      due_date:       'a.due_date',
+      start_datetime: 'a.start_datetime',
+    }
+    const sortCol     = SORT_WHITELIST[sort_by] || 'a.created_at'
+    const sortDirSafe = sort_dir?.toLowerCase() === 'asc' ? 'ASC' : 'DESC'
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
     const conditions = [`a.status != 'deleted'`]
@@ -815,6 +834,11 @@ router.get('/', async (req, res) => {
       conditions.push(`(
         a.subject ILIKE $${params.length}
         OR a.ar_code ILIKE $${params.length}
+        OR a.act_no ILIKE $${params.length}
+        OR EXISTS (
+          SELECT 1 FROM crm_users u_cr
+          WHERE u_cr.id = a.created_by AND u_cr.name ILIKE $${params.length}
+        )
         OR EXISTS (
           SELECT 1
           FROM crm_activity_owners ao_q
@@ -855,13 +879,13 @@ router.get('/', async (req, res) => {
           ELSE 'cancelled'
         END AS derived_status,
         -- status ของ current user
-        (SELECT ao.status FROM crm_activity_owners ao WHERE ao.activity_id=a.id AND ao.user_id=${req.user.id} AND ao.removed_at IS NULL LIMIT 1) AS my_status
+        (SELECT ao.status FROM crm_activity_owners ao WHERE ao.activity_id=a.id AND ao.user_id=${req.user.id} AND ao.removed_at IS NULL LIMIT 1) AS my_status,
+        -- ชื่อผู้สร้าง
+        (SELECT u.name FROM crm_users u WHERE u.id = a.created_by LIMIT 1) AS created_by_name
       FROM crm_activities a
       ${where}
       ORDER BY
-        CASE WHEN a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status='open') THEN 0 ELSE 1 END,
-        a.due_date ASC NULLS LAST,
-        a.start_datetime ASC NULLS LAST,
+        ${sortCol} ${sortDirSafe} NULLS LAST,
         a.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
@@ -1066,7 +1090,7 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN')
 
-    const act_no = await generateActNo(activity_type, client)
+    const act_no = await generateActNo(activity_type)
     const result = await client.query(`
       INSERT INTO crm_activities
         (ar_code, owner_id, created_by, activity_type, subject, description, status, priority,
@@ -1357,7 +1381,7 @@ router.put('/:id', async (req, res) => {
 
       for (const newArCode of add_ar_codes) {
         if (!newArCode) continue
-        const act_no_grp = await generateActNo(updated.activity_type, client)
+        const act_no_grp = await generateActNo(updated.activity_type)
         const newAct = await client.query(`
           INSERT INTO crm_activities
             (ar_code, owner_id, created_by, activity_type, subject, description, status, priority,
