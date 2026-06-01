@@ -7,7 +7,7 @@ router.use(authMiddleware)
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/sales/summary
-// KPI ภาพรวมยอดขาย + top 5 ลูกค้า + top 5 พนักงาน
+// KPI ภาพรวมยอดขาย + top 10 ลูกค้า + top 10 พนักงาน
 // query: date_from, date_to, sale_code, cust_code
 // ─────────────────────────────────────────────────────────────
 router.get('/summary', requireRole('admin', 'manager'), async (req, res) => {
@@ -45,7 +45,7 @@ router.get('/summary', requireRole('admin', 'manager'), async (req, res) => {
         ${where}
         GROUP BY t.cust_code, c.name_1
         ORDER BY total_amount DESC
-        LIMIT 5
+        LIMIT 10
       `, params),
 
       posDB.query(`
@@ -59,7 +59,7 @@ router.get('/summary', requireRole('admin', 'manager'), async (req, res) => {
         ${where}
         GROUP BY t.sale_code, e.name_1
         ORDER BY total_amount DESC
-        LIMIT 5
+        LIMIT 10
       `, params),
     ])
 
@@ -128,17 +128,21 @@ router.get('/trend', requireRole('admin', 'manager'), async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // GET /api/sales/by-customer
 // ยอดขายแยกตามลูกค้า
-// query: date_from, date_to, sale_code
+// query: date_from, date_to, sale_code, q
 // ─────────────────────────────────────────────────────────────
 router.get('/by-customer', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { date_from, date_to, sale_code } = req.query
+    const { date_from, date_to, sale_code, q } = req.query
     const params = []
     const conds  = ['t.trans_flag = 44', 't.last_status = 0']
 
     if (date_from)  { params.push(date_from);  conds.push(`t.doc_date >= $${params.length}::date`) }
     if (date_to)    { params.push(date_to);    conds.push(`t.doc_date <= $${params.length}::date`) }
     if (sale_code)  { params.push(sale_code);  conds.push(`t.sale_code = $${params.length}`) }
+    if (q) {
+      params.push(`%${q}%`)
+      conds.push(`(t.cust_code ILIKE $${params.length} OR c.name_1 ILIKE $${params.length})`)
+    }
 
     const where = 'WHERE ' + conds.join(' AND ')
 
@@ -170,39 +174,53 @@ router.get('/by-customer', requireRole('admin', 'manager'), async (req, res) => 
 // ─────────────────────────────────────────────────────────────
 // GET /api/sales/by-salesperson
 // ยอดขายแยกตามพนักงาน
-// query: date_from, date_to, cust_code
+// query: date_from, date_to, cust_code, q
 // ─────────────────────────────────────────────────────────────
 router.get('/by-salesperson', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { date_from, date_to, cust_code } = req.query
+    const { date_from, date_to, cust_code, q } = req.query
     const params = []
     const conds  = ['t.trans_flag = 44', 't.last_status = 0']
+    const userConds = [`e.code <> ''`]
 
     if (date_from)  { params.push(date_from);  conds.push(`t.doc_date >= $${params.length}::date`) }
     if (date_to)    { params.push(date_to);    conds.push(`t.doc_date <= $${params.length}::date`) }
     if (cust_code)  { params.push(cust_code);  conds.push(`t.cust_code = $${params.length}`) }
+    if (q) {
+      params.push(`%${q}%`)
+      userConds.push(`(e.code ILIKE $${params.length} OR e.name_1 ILIKE $${params.length})`)
+    }
 
     const where = 'WHERE ' + conds.join(' AND ')
+    const userWhere = 'WHERE ' + userConds.join(' AND ')
 
     const result = await posDB.query(`
       SELECT
-        t.sale_code,
-        e.name_1                                      AS sale_name,
-        COUNT(*)                                      AS total_orders,
-        ROUND(SUM(t.total_amount)::numeric, 2)        AS total_amount,
-        ROUND(AVG(t.total_amount)::numeric, 2)        AS avg_amount
-      FROM ic_trans t
-      LEFT JOIN erp_user e ON e.code = t.sale_code
-      ${where}
-      GROUP BY t.sale_code, e.name_1
-      ORDER BY total_amount DESC
+        e.code                                           AS sale_code,
+        e.name_1                                         AS sale_name,
+        COALESCE(s.total_orders, 0)                      AS total_orders,
+        COALESCE(s.total_amount, 0)                      AS total_amount,
+        COALESCE(s.avg_amount, 0)                        AS avg_amount
+      FROM erp_user e
+      LEFT JOIN (
+        SELECT
+          t.sale_code,
+          COUNT(*)                                      AS total_orders,
+          ROUND(SUM(t.total_amount)::numeric, 2)        AS total_amount,
+          ROUND(AVG(t.total_amount)::numeric, 2)        AS avg_amount
+        FROM ic_trans t
+        ${where}
+        GROUP BY t.sale_code
+      ) s ON s.sale_code = e.code
+      ${userWhere}
+      ORDER BY total_amount DESC, e.name_1 ASC
     `, params)
 
     res.json(result.rows.map(r => ({
       ...r,
       total_orders: parseInt(r.total_orders),
-      total_amount: parseFloat(r.total_amount),
-      avg_amount:   parseFloat(r.avg_amount),
+      total_amount: parseFloat(r.total_amount) || 0,
+      avg_amount:   parseFloat(r.avg_amount) || 0,
     })))
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -396,11 +414,11 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, 
 // ─────────────────────────────────────────────────────────────
 // GET /api/sales/top-products
 // TOP N สินค้าขายดี จาก ic_trans_detail
-// query: date_from, date_to, sale_code, cust_code, limit (default 5)
+// query: date_from, date_to, sale_code, cust_code, limit (default 10)
 // ─────────────────────────────────────────────────────────────
 router.get('/top-products', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { date_from, date_to, sale_code, cust_code, limit: lim = 5 } = req.query
+    const { date_from, date_to, sale_code, cust_code, limit: lim = 10 } = req.query
     const params = []
     const conds  = ['t.trans_flag = 44', 't.last_status = 0']
 
@@ -439,13 +457,166 @@ router.get('/top-products', requireRole('admin', 'manager'), async (req, res) =>
 })
 
 // ─────────────────────────────────────────────────────────────
+// GET /api/sales/by-product
+// ยอดขายแยกตามสินค้า จาก ic_trans_detail พร้อมค้นหาและโหลดเพิ่ม
+// query: date_from, date_to, sale_code, q, page, limit
+// ─────────────────────────────────────────────────────────────
+router.get('/by-product', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const { date_from, date_to, sale_code, q, page = 1, limit = 30 } = req.query
+    const safeLimit = Math.min(Math.max(parseInt(limit) || 30, 1), 100)
+    const safePage = Math.max(parseInt(page) || 1, 1)
+    const offset = (safePage - 1) * safeLimit
+    const params = []
+    const conds = ['d.trans_flag = 44', 'd.status = 0', 't.last_status = 0']
+
+    if (date_from) { params.push(date_from); conds.push(`t.doc_date >= $${params.length}::date`) }
+    if (date_to)   { params.push(date_to);   conds.push(`t.doc_date <= $${params.length}::date`) }
+    if (sale_code) { params.push(sale_code); conds.push(`t.sale_code = $${params.length}`) }
+    if (q) {
+      params.push(`%${q}%`)
+      conds.push(`(d.item_code ILIKE $${params.length} OR d.item_name ILIKE $${params.length})`)
+    }
+
+    const where = 'WHERE ' + conds.join(' AND ')
+    const countRes = await posDB.query(`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT d.item_code, d.item_name
+        FROM ic_trans_detail d
+        JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+        ${where}
+        GROUP BY d.item_code, d.item_name, d.unit_code
+      ) x
+    `, params)
+    const total = parseInt(countRes.rows[0].count) || 0
+
+    params.push(safeLimit, offset)
+    const dataRes = await posDB.query(`
+      SELECT
+        d.item_code,
+        d.item_name,
+        d.unit_code,
+        COUNT(*)                                 AS line_count,
+        COUNT(DISTINCT d.doc_no)                AS doc_count,
+        ROUND(SUM(d.qty)::numeric, 2)           AS total_qty,
+        ROUND(SUM(d.sum_amount)::numeric, 2)    AS total_amount,
+        ROUND(AVG(NULLIF(d.price, 0))::numeric, 2) AS avg_price
+      FROM ic_trans_detail d
+      JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+      ${where}
+      GROUP BY d.item_code, d.item_name, d.unit_code
+      ORDER BY total_amount DESC, total_qty DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params)
+
+    res.json({
+      data: dataRes.rows.map(r => ({
+        ...r,
+        line_count:   parseInt(r.line_count),
+        doc_count:    parseInt(r.doc_count),
+        total_qty:    parseFloat(r.total_qty),
+        total_amount: parseFloat(r.total_amount),
+        avg_price:    parseFloat(r.avg_price) || 0,
+      })),
+      pagination: {
+        total,
+        page: safePage,
+        limit: safeLimit,
+        pages: Math.ceil(total / safeLimit),
+      },
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/sales/by-category
+// ยอดขายแยกตามหมวดสินค้า จาก ic_inventory.item_category
+// query: date_from, date_to, sale_code, q, page, limit
+// ─────────────────────────────────────────────────────────────
+router.get('/by-category', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const { date_from, date_to, sale_code, q, page = 1, limit = 30 } = req.query
+    const safeLimit = Math.min(Math.max(parseInt(limit) || 30, 1), 100)
+    const safePage = Math.max(parseInt(page) || 1, 1)
+    const offset = (safePage - 1) * safeLimit
+    const params = []
+    const conds = ['d.trans_flag = 44', 'd.status = 0', 't.last_status = 0']
+
+    if (date_from) { params.push(date_from); conds.push(`t.doc_date >= $${params.length}::date`) }
+    if (date_to)   { params.push(date_to);   conds.push(`t.doc_date <= $${params.length}::date`) }
+    if (sale_code) { params.push(sale_code); conds.push(`t.sale_code = $${params.length}`) }
+    if (q) {
+      params.push(`%${q}%`)
+      conds.push(`(i.item_category ILIKE $${params.length} OR c.name_1 ILIKE $${params.length})`)
+    }
+
+    const where = 'WHERE ' + conds.join(' AND ')
+    const countRes = await posDB.query(`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT COALESCE(NULLIF(i.item_category, ''), '-') AS category_code
+        FROM ic_trans_detail d
+        JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+        LEFT JOIN ic_inventory i ON i.code = d.item_code
+        LEFT JOIN ic_category c ON c.code = i.item_category
+        ${where}
+        GROUP BY COALESCE(NULLIF(i.item_category, ''), '-'), COALESCE(NULLIF(c.name_1, ''), 'ไม่ระบุหมวด')
+      ) x
+    `, params)
+    const total = parseInt(countRes.rows[0].count) || 0
+
+    params.push(safeLimit, offset)
+    const dataRes = await posDB.query(`
+      SELECT
+        COALESCE(NULLIF(i.item_category, ''), '-')       AS category_code,
+        COALESCE(NULLIF(c.name_1, ''), 'ไม่ระบุหมวด')   AS category_name,
+        COUNT(DISTINCT d.item_code)                     AS item_count,
+        COUNT(*)                                        AS line_count,
+        COUNT(DISTINCT d.doc_no)                        AS doc_count,
+        ROUND(SUM(d.qty)::numeric, 2)                   AS total_qty,
+        ROUND(SUM(d.sum_amount)::numeric, 2)            AS total_amount
+      FROM ic_trans_detail d
+      JOIN ic_trans t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+      LEFT JOIN ic_inventory i ON i.code = d.item_code
+      LEFT JOIN ic_category c ON c.code = i.item_category
+      ${where}
+      GROUP BY COALESCE(NULLIF(i.item_category, ''), '-'), COALESCE(NULLIF(c.name_1, ''), 'ไม่ระบุหมวด')
+      ORDER BY total_amount DESC, total_qty DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params)
+
+    res.json({
+      data: dataRes.rows.map(r => ({
+        ...r,
+        item_count:   parseInt(r.item_count),
+        line_count:   parseInt(r.line_count),
+        doc_count:    parseInt(r.doc_count),
+        total_qty:    parseFloat(r.total_qty),
+        total_amount: parseFloat(r.total_amount),
+      })),
+      pagination: {
+        total,
+        page: safePage,
+        limit: safeLimit,
+        pages: Math.ceil(total / safeLimit),
+      },
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
 // GET /api/sales/top-salespeople
 // TOP N ทีมขาย
-// query: date_from, date_to, cust_code, limit (default 5)
+// query: date_from, date_to, cust_code, limit (default 10)
 // ─────────────────────────────────────────────────────────────
 router.get('/top-salespeople', requireRole('admin', 'manager'), async (req, res) => {
   try {
-    const { date_from, date_to, cust_code, limit: lim = 5 } = req.query
+    const { date_from, date_to, cust_code, limit: lim = 10 } = req.query
     const params = []
     const conds  = ['t.trans_flag = 44', 't.last_status = 0']
 
