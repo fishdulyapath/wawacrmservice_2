@@ -1,6 +1,6 @@
 const express = require('express')
 const router  = express.Router()
-const { crmDB } = require('../db')
+const { crmDB, posDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 
 router.use(authMiddleware)
@@ -36,8 +36,26 @@ router.get('/', async (req, res) => {
     )
 
     const total = parseInt(countResult.rows[0].count)
+
+    // ดึงชื่อลูกค้าจาก POS สำหรับ notification ที่มี ar_code
+    const arCodes = [...new Set(data.rows.map(r => r.ar_code).filter(Boolean))]
+    let customerMap = {}
+    if (arCodes.length > 0) {
+      try {
+        const placeholders = arCodes.map((_, i) => `$${i + 1}`).join(',')
+        const posRes = await posDB.query(
+          `SELECT code, name_1 FROM ar_customer WHERE code IN (${placeholders})`, arCodes
+        )
+        posRes.rows.forEach(r => { customerMap[r.code] = r.name_1 })
+      } catch {}
+    }
+    const rows = data.rows.map(r => ({
+      ...r,
+      customer_name: customerMap[r.ar_code] || null,
+    }))
+
     res.json({
-      data: data.rows,
+      data: rows,
       unread_count: parseInt(unreadResult.rows[0].count),
       pagination: {
         total,
