@@ -981,7 +981,46 @@ router.get('/:id', async (req, res) => {
     // override status ด้วย derived_status (crm_activities.status ไม่ได้ถูก update เมื่อปิดงาน)
     activity.status = activity.my_status || activity.derived_status || 'open'
 
+    // ตรวจว่า user กำลังติดตาม activity นี้อยู่หรือไม่
+    const followRes = await crmDB.query(
+      `SELECT 1 FROM crm_activity_follows WHERE activity_id=$1 AND user_id=$2`,
+      [activity.id, req.user.id]
+    )
+    activity.is_following = followRes.rows.length > 0
+
     res.json(activity)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/activities/:id/follow  — toggle ติดตาม/เลิกติดตาม
+// ─────────────────────────────────────────────────────────────
+router.post('/:id/follow', async (req, res) => {
+  try {
+    const act = await crmDB.query(
+      `SELECT id FROM crm_activities WHERE id=$1 AND status != 'deleted'`, [req.params.id]
+    )
+    if (!act.rows.length) return res.status(404).json({ error: 'ไม่พบกิจกรรม' })
+
+    const existing = await crmDB.query(
+      `SELECT 1 FROM crm_activity_follows WHERE activity_id=$1 AND user_id=$2`,
+      [req.params.id, req.user.id]
+    )
+    if (existing.rows.length) {
+      await crmDB.query(
+        `DELETE FROM crm_activity_follows WHERE activity_id=$1 AND user_id=$2`,
+        [req.params.id, req.user.id]
+      )
+      res.json({ following: false })
+    } else {
+      await crmDB.query(
+        `INSERT INTO crm_activity_follows (activity_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [req.params.id, req.user.id]
+      )
+      res.json({ following: true })
+    }
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1436,6 +1475,27 @@ router.put('/:id', async (req, res) => {
       await notifyMany(activeOwners.map(o => o.user_id), {
         notiType: 'updated',
         title: 'กิจกรรมถูกแก้ไข',
+        message: updated.subject,
+        refType: 'activity',
+        refId: updated.id,
+        arCode: updated.ar_code || null,
+      })
+    }
+
+    // notify followers (ที่ไม่ใช่ owner และไม่ใช่คนแก้ไข)
+    const activeOwnerIds = activeOwners.map(o => o.user_id)
+    const followersRes = await crmDB.query(
+      `SELECT user_id FROM crm_activity_follows
+       WHERE activity_id=$1
+         AND user_id != $2
+         AND user_id != ALL($3::int[])`,
+      [updated.id, req.user.id, activeOwnerIds.length ? activeOwnerIds : [0]]
+    )
+    const followerIds = followersRes.rows.map(r => r.user_id)
+    if (followerIds.length) {
+      await notifyMany(followerIds, {
+        notiType: 'activity_update',
+        title: 'กิจกรรมที่ติดตามถูกแก้ไข',
         message: updated.subject,
         refType: 'activity',
         refId: updated.id,

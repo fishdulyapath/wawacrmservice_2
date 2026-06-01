@@ -5,6 +5,20 @@ const { notify, notifyMany } = require('./notifyService')
 const { syncAllFleetSheets } = require('./fleetSync')
 const { ensureCustomerFollowupPolicy } = require('./followupPolicy')
 
+const ACT_PREFIX_CRON = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
+async function generateActNo(activityType, client) {
+  const db = client || crmDB
+  const prefix = ACT_PREFIX_CRON[activityType] || 'W'
+  const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
+  const dateStr = `${bkkNow.getFullYear()}${String(bkkNow.getMonth() + 1).padStart(2, '0')}${String(bkkNow.getDate()).padStart(2, '0')}`
+  const res = await db.query(
+    `SELECT COUNT(*) AS cnt FROM crm_activities WHERE act_no LIKE $1`,
+    [`${prefix}-${dateStr}-%`]
+  )
+  const next = parseInt(res.rows[0].cnt) + 1
+  return `${prefix}-${dateStr}-${String(next).padStart(4, '0')}`
+}
+
 /**
  * เริ่ม Cron Jobs ทั้งหมดของระบบ LINE
  * เรียกใช้ใน index.js: require('./services/cronJobs').start()
@@ -196,15 +210,16 @@ function start() {
             requiresOwnerAssignment ? 'ลูกค้ายังไม่มีทีมผู้ดูแล CRM กรุณาระบุผู้รับผิดชอบ' : ''
           ].filter(Boolean).join('\n')
 
+          const act_no_cron = await generateActNo('call', client)
           const insertRes = await client.query(`
             INSERT INTO crm_activities (
               ar_code, owner_id, created_by, activity_type, subject, description,
               status, priority, due_date, start_datetime, call_direction, system_created,
               followup_type, followup_policy_id, followup_key,
-              requires_owner_assignment, owner_assignment_note
+              requires_owner_assignment, owner_assignment_note, act_no
             )
             VALUES ($1,$2,$3,'call',$4,$5,'open','normal',$6,($6::date + $10::time),'outbound',TRUE,
-                    'scheduled',1,$7,$8,$9)
+                    'scheduled',1,$7,$8,$9,$11)
             ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
             RETURNING *
           `, [
@@ -218,6 +233,7 @@ function start() {
             requiresOwnerAssignment,
             requiresOwnerAssignment ? 'ไม่มี CRM owner ตอนระบบสร้างงาน' : null,
             settings.auto_create_time,
+            act_no_cron,
           ])
 
           if (!insertRes.rows.length) {

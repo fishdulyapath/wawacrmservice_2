@@ -6,6 +6,7 @@ const path     = require('path')
 const fs       = require('fs')
 const { crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
+const { notifyMany } = require('../services/notifyService')
 
 router.use(authMiddleware)
 
@@ -144,6 +145,40 @@ router.post('/', upload.array('files', MAX_FILES), async (req, res) => {
     comment.attachments = await saveCommentFiles(activityId, comment.id, req.files || [], req.user.id)
     comment.user_name = req.user.name || req.user.code || null
     comment.user_code = req.user.code || null
+
+    // แจ้ง owners (ที่ไม่ใช่คนสร้าง comment) และ followers ที่ไม่ใช่ owner
+    try {
+      const ownersRes = await crmDB.query(
+        `SELECT user_id FROM crm_activity_owners
+         WHERE activity_id=$1 AND removed_at IS NULL AND user_id != $2`,
+        [activityId, req.user.id]
+      )
+      const followersRes = await crmDB.query(
+        `SELECT f.user_id FROM crm_activity_follows f
+         WHERE f.activity_id=$1
+           AND f.user_id != $2
+           AND NOT EXISTS (
+             SELECT 1 FROM crm_activity_owners ao
+             WHERE ao.activity_id=$1 AND ao.user_id=f.user_id AND ao.removed_at IS NULL
+           )`,
+        [activityId, req.user.id]
+      )
+      const notifyIds = [
+        ...ownersRes.rows.map(r => r.user_id),
+        ...followersRes.rows.map(r => r.user_id),
+      ]
+      if (notifyIds.length) {
+        await notifyMany(notifyIds, {
+          notiType: 'activity_update',
+          title: `${req.user.name || req.user.code} แสดงความคิดเห็นในกิจกรรม`,
+          message: commentText.length > 80 ? commentText.slice(0, 80) + '...' : commentText,
+          refType: 'activity',
+          refId: parseInt(activityId),
+        })
+      }
+    } catch (notifyErr) {
+      console.error('[Comments] notify error:', notifyErr.message)
+    }
 
     res.status(201).json(comment)
   } catch (err) {
