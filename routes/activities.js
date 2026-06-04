@@ -326,9 +326,28 @@ router.get('/by-customer/:arCode', async (req, res) => {
 
     // status filter
     if (status === 'open') {
-      conditions.push(`a.status IN ('open','in_progress')`)
+      conditions.push(`(
+        a.requires_owner_assignment = TRUE
+        OR EXISTS (
+          SELECT 1 FROM crm_activity_owners ax
+          WHERE ax.activity_id = a.id
+            AND ax.removed_at IS NULL
+            AND ax.status = 'open'
+        )
+      )`)
     } else if (status === 'done') {
-      conditions.push(`a.status = 'done'`)
+      conditions.push(`NOT EXISTS (
+          SELECT 1 FROM crm_activity_owners ax
+          WHERE ax.activity_id = a.id
+            AND ax.removed_at IS NULL
+            AND ax.status = 'open'
+        )
+        AND EXISTS (
+          SELECT 1 FROM crm_activity_owners ax
+          WHERE ax.activity_id = a.id
+            AND ax.removed_at IS NULL
+            AND ax.status = 'done'
+        )`)
     } else if (status === 'deleted') {
       conditions.push(`a.status = 'deleted'`)
     } else {
@@ -361,7 +380,23 @@ router.get('/by-customer/:arCode', async (req, res) => {
              a.system_created, a.followup_type, a.requires_owner_assignment,
              a.retry_due_at, a.attempt_no, a.retry_of_activity_id,
              a.created_at, a.created_by,
-             cu.name AS created_by_name
+             cu.name AS created_by_name,
+             CASE
+               WHEN a.requires_owner_assignment = TRUE THEN 'open'
+               WHEN EXISTS (
+                 SELECT 1 FROM crm_activity_owners ax
+                 WHERE ax.activity_id = a.id
+                   AND ax.removed_at IS NULL
+                   AND ax.status = 'open'
+               ) THEN 'open'
+               WHEN EXISTS (
+                 SELECT 1 FROM crm_activity_owners ax
+                 WHERE ax.activity_id = a.id
+                   AND ax.removed_at IS NULL
+                   AND ax.status = 'done'
+               ) THEN 'done'
+               ELSE 'cancelled'
+             END AS derived_status
       FROM crm_activities a
       LEFT JOIN crm_users cu ON cu.id = a.created_by
       ${where}
@@ -394,6 +429,7 @@ router.get('/by-customer/:arCode', async (req, res) => {
 
     const activities = dataRes.rows.map(a => ({
       ...a,
+      status: a.derived_status || a.status,
       owners: (ownersMap[a.id] || []).map(o => ({
         user_id: o.user_id,
         name: o.name,
