@@ -9,6 +9,7 @@ const { ensureCustomerFollowupPolicy, normalizeFollowupInterval } = require('../
 router.use(authMiddleware)
 
 const canManageFollowup = u => u?.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u?.role)
+let customerStoreLinkReady = false
 
 function normalizeCustomerOwners(crm = {}) {
   const source = Array.isArray(crm.owners)
@@ -54,13 +55,140 @@ async function replaceCustomerOwners(client, arCode, owners, assignedBy) {
   }
 }
 
+async function ensureCustomerStoreLinkTable() {
+  if (customerStoreLinkReady) return
+  await crmDB.query(`
+    CREATE TABLE IF NOT EXISTS crm_customer_store_link (
+      ar_code     TEXT NOT NULL,
+      store_id    TEXT NOT NULL,
+      link_type   TEXT NOT NULL DEFAULT 'manual',
+      confidence  NUMERIC,
+      note        TEXT,
+      created_by  TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      deleted_at  TIMESTAMPTZ,
+      PRIMARY KEY (ar_code, store_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_customer_store_link_ar_code
+      ON crm_customer_store_link(ar_code) WHERE deleted_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_crm_customer_store_link_store_id
+      ON crm_customer_store_link(store_id) WHERE deleted_at IS NULL;
+  `)
+  customerStoreLinkReady = true
+}
+
+function fleetStoreStatsSql(extraWhere = '') {
+  return `
+    SELECT
+      ls.store_id,
+      COUNT(DISTINCT ls.list_id)::int AS visits,
+      COALESCE(SUM(ret.return_total), 0) AS return_total,
+      COALESCE(SUM(prob.problem_count), 0)::int AS problem_count,
+      COALESCE(SUM(prob.store_closed_count), 0)::int AS store_closed_count,
+      MAX(COALESCE(co.date_time_check_out, ci.date_time_check_in, ls.created_at)) AS latest_visit_at
+    FROM fleet_list_stores ls
+    LEFT JOIN fleet_check_ins ci ON ci.list_id = ls.list_id AND ci.deleted_at IS NULL
+    LEFT JOIN fleet_check_outs co ON co.list_id = ls.list_id AND co.deleted_at IS NULL
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(SUM(total), 0) AS return_total
+      FROM fleet_return_products rp
+      WHERE rp.deleted_at IS NULL AND rp.check_out_id = co.check_out_id
+    ) ret ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT
+        COUNT(*) AS problem_count,
+        COUNT(CASE WHEN problem_type ILIKE '%ร้านปิด%' THEN 1 END) AS store_closed_count
+      FROM fleet_problems p
+      WHERE p.deleted_at IS NULL AND p.list_id = ls.list_id
+    ) prob ON TRUE
+    WHERE ls.deleted_at IS NULL
+      AND ls.store_id IS NOT NULL
+      ${extraWhere}
+    GROUP BY ls.store_id
+  `
+}
+
+async function loadFleetCustomerCodes(fleetStatus) {
+  const whereByStatus = {
+    has_fleet:     'visits > 0',
+    has_returns:   'return_total > 0',
+    has_problems:  'problem_count > 0',
+    store_closed:  'store_closed_count > 0',
+  }
+  const where = whereByStatus[fleetStatus] || whereByStatus.has_fleet
+
+  try {
+    await ensureCustomerStoreLinkTable()
+    const result = await crmDB.query(`
+      WITH store_stats AS (${fleetStoreStatsSql()}),
+      customer_stats AS (
+        SELECT
+          COALESCE(l.ar_code, ss.store_id) AS ar_code,
+          COALESCE(SUM(ss.visits), 0)::int AS visits,
+          COALESCE(SUM(ss.return_total), 0) AS return_total,
+          COALESCE(SUM(ss.problem_count), 0)::int AS problem_count,
+          COALESCE(SUM(ss.store_closed_count), 0)::int AS store_closed_count
+        FROM store_stats ss
+        LEFT JOIN crm_customer_store_link l ON l.store_id = ss.store_id AND l.deleted_at IS NULL
+        GROUP BY COALESCE(l.ar_code, ss.store_id)
+      )
+      SELECT ar_code
+      FROM customer_stats
+      WHERE ${where}
+    `)
+    return result.rows.map(r => r.ar_code).filter(Boolean)
+  } catch (err) {
+    console.warn('[customers/fleet filter]', err.message)
+    return []
+  }
+}
+
+async function loadFleetSummaryByArCodes(codes) {
+  if (!codes.length) return {}
+
+  try {
+    await ensureCustomerStoreLinkTable()
+    const result = await crmDB.query(`
+      WITH customer_store AS (
+        SELECT DISTINCT ar_code, store_id
+        FROM (
+          SELECT ar_code, store_id
+          FROM crm_customer_store_link
+          WHERE ar_code = ANY($1)
+            AND deleted_at IS NULL
+          UNION ALL
+          SELECT code AS ar_code, code AS store_id
+          FROM UNNEST($1::text[]) AS x(code)
+        ) x
+      ),
+      store_stats AS (${fleetStoreStatsSql('AND ls.store_id IN (SELECT store_id FROM customer_store)')})
+      SELECT
+        cs.ar_code,
+        COALESCE(SUM(ss.visits), 0)::int AS visits,
+        COALESCE(SUM(ss.return_total), 0) AS return_total,
+        COALESCE(SUM(ss.problem_count), 0)::int AS problem_count,
+        COALESCE(SUM(ss.store_closed_count), 0)::int AS store_closed_count,
+        MAX(ss.latest_visit_at) AS latest_visit_at
+      FROM customer_store cs
+      JOIN store_stats ss ON ss.store_id = cs.store_id
+      GROUP BY cs.ar_code
+    `, [codes])
+
+    return Object.fromEntries(result.rows.map(r => [r.ar_code, r]))
+  } catch (err) {
+    console.warn('[customers/fleet summary]', err.message)
+    return {}
+  }
+}
+
 // ─────────────────────────────────────────────
 // GET /api/customers  — List ลูกค้าทั้งหมด
 // ─────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const { search = '', page = 1, limit = 20, status, owner, crm_only,
-            followup_enabled, sort_by = 'code', sort_dir = 'asc' } = req.query
+            followup_enabled, fleet_status, sort_by = 'code', sort_dir = 'asc' } = req.query
 
     const SORT_WHITELIST = {
       code:               'c.code',
@@ -71,6 +199,7 @@ router.get('/', async (req, res) => {
     const sortCol     = SORT_WHITELIST[sort_by] || 'c.code'
     const sortDirSafe = sort_dir?.toLowerCase() === 'desc' ? 'DESC' : 'ASC'
     const offset = (parseInt(page) - 1) * parseInt(limit)
+    let nextFollowupOrderCodes = null
 
     // ── 1. สร้าง ar_code whitelist จาก filter ──────────────
     // filter by owner: CRM owner ทุกคน + POS sale_code อ้างอิงเดิม
@@ -131,6 +260,29 @@ router.get('/', async (req, res) => {
     }
 
     // ── 2. Build WHERE สำหรับ POS query ───────────────────
+    let fleetIncludeArCodes = null
+    let fleetExcludeArCodes = null
+    if (fleet_status) {
+      if (fleet_status === 'no_fleet') {
+        fleetExcludeArCodes = await loadFleetCustomerCodes('has_fleet')
+      } else {
+        fleetIncludeArCodes = await loadFleetCustomerCodes(fleet_status)
+        if (fleetIncludeArCodes.length === 0) {
+          return res.json({ data: [], total: 0, page: parseInt(page), limit: parseInt(limit) })
+        }
+      }
+    }
+
+    if (sort_by === 'next_followup') {
+      const orderResult = await crmDB.query(`
+        SELECT ar_code
+        FROM crm_customer_profile
+        WHERE next_followup IS NOT NULL
+        ORDER BY next_followup ${sortDirSafe} NULLS LAST, ar_code ASC
+      `)
+      nextFollowupOrderCodes = orderResult.rows.map(r => r.ar_code)
+    }
+
     let where = ['1=1']
     let params = []
 
@@ -154,6 +306,14 @@ router.get('/', async (req, res) => {
       params.push(crmOnlyArCodes)
       where.push(`c.code = ANY($${params.length})`)
     }
+    if (fleetIncludeArCodes) {
+      params.push(fleetIncludeArCodes)
+      where.push(`c.code = ANY($${params.length})`)
+    }
+    if (fleetExcludeArCodes?.length) {
+      params.push(fleetExcludeArCodes)
+      where.push(`NOT (c.code = ANY($${params.length}))`)
+    }
 
     // ── 3. COUNT ──────────────────────────────────────────
     const countResult = await posDB.query(
@@ -163,6 +323,17 @@ router.get('/', async (req, res) => {
     const total = parseInt(countResult.rows[0].count)
 
     // ── 4. PAGE query ─────────────────────────────────────
+    let orderSql = `${sortCol} ${sortDirSafe} NULLS LAST, c.code ASC`
+    if (sort_by === 'next_followup') {
+      params.push(nextFollowupOrderCodes || [])
+      const orderParam = params.length
+      orderSql = `
+        CASE WHEN array_position($${orderParam}::text[], c.code::text) IS NULL THEN 1 ELSE 0 END ASC,
+        array_position($${orderParam}::text[], c.code::text) ASC,
+        c.code ASC
+      `
+    }
+
     params.push(parseInt(limit))
     params.push(offset)
 
@@ -186,7 +357,7 @@ router.get('/', async (req, res) => {
       LEFT JOIN erp_province ep      ON ep.code = c.province
       LEFT JOIN erp_amper    ea      ON ea.code = c.amper AND ea.province = c.province
       WHERE ${where.join(' AND ')}
-      ORDER BY ${sortCol} ${sortDirSafe} NULLS LAST
+      ORDER BY ${orderSql}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
 
@@ -220,22 +391,13 @@ router.get('/', async (req, res) => {
       })
     }
 
+    const fleetMap = await loadFleetSummaryByArCodes(codes)
+
     const data = posResult.rows.map(c => {
-      const crm = crmMap[c.code] || null
+      const crm = crmMap[c.code] ? { ...crmMap[c.code] } : (fleetMap[c.code] ? {} : null)
+      if (crm && fleetMap[c.code]) crm.fleet = fleetMap[c.code]
       return { ...c, crm }
     })
-
-    if (sort_by === 'next_followup') {
-      const dir = sortDirSafe === 'DESC' ? -1 : 1
-      data.sort((a, b) => {
-        const da = a.crm?.next_followup ? new Date(a.crm.next_followup) : null
-        const db = b.crm?.next_followup ? new Date(b.crm.next_followup) : null
-        if (!da && !db) return 0
-        if (!da) return 1
-        if (!db) return -1
-        return dir * (da - db)
-      })
-    }
 
     res.json({ data, total, page: parseInt(page), limit: parseInt(limit) })
   } catch (err) {

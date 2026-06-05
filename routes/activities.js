@@ -1836,7 +1836,11 @@ router.patch('/:id/done', async (req, res) => {
         UPDATE crm_customer_profile p
         SET last_contacted = NOW(),
             next_followup = CASE
-              WHEN s.enabled = TRUE THEN (CURRENT_DATE + (s.default_call_interval_days * INTERVAL '1 day'))::date
+              WHEN s.enabled = TRUE AND p.followup_enabled = TRUE
+                THEN (
+                  (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+                  + (COALESCE(p.followup_interval_days, s.default_call_interval_days) * INTERVAL '1 day')
+                )::date
               ELSE p.next_followup
             END
         FROM crm_followup_settings s
