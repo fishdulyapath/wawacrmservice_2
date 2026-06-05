@@ -104,8 +104,17 @@ async function adjustedRetryDueAt(minutes, businessStart, businessEnd) {
   return result.rows[0].due_at
 }
 
+const CALL_RETRY_RESULTS = new Set(['no_answer', 'busy', 'left_voicemail'])
+function callRetryResultLabel(result) {
+  return {
+    no_answer: 'ไม่รับสาย',
+    busy: 'สายไม่ว่าง',
+    left_voicemail: 'ฝากข้อความ',
+  }[result] || result || 'ไม่ระบุผลการโทร'
+}
+
 async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
-  if (actRow.activity_type !== 'call' || actRow.call_result !== 'no_answer' || !actRow.ar_code) {
+  if (actRow.activity_type !== 'call' || !CALL_RETRY_RESULTS.has(actRow.call_result) || !actRow.ar_code) {
     return null
   }
   if (options.skipRetryToday) {
@@ -145,9 +154,9 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
     FROM crm_activities
     WHERE ar_code = $1
       AND activity_type = 'call'
-      AND call_result = 'no_answer'
+      AND call_result = ANY($2)
       AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
-  `, [actRow.ar_code])
+  `, [actRow.ar_code, [...CALL_RETRY_RESULTS]])
   const attemptsToday = Number(countRes.rows[0]?.attempts || 0)
   const maxAttempts = Number(settings.no_answer_max_attempts_per_day || 3)
   if (attemptsToday >= maxAttempts) {
@@ -175,6 +184,7 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
     String(settings.business_end_time || '17:30').slice(0, 5),
   )
   const followupKey = `no-answer-retry:${actRow.id}:${nextAttemptNo}`
+  const resultLabel = callRetryResultLabel(actRow.call_result)
 
   const client = await crmDB.connect()
   try {
@@ -213,7 +223,7 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
       primaryOwnerId,
       reqUserId,
       `โทรซ้ำลูกค้า ${actRow.ar_code} ครั้งที่ ${nextAttemptNo}/${maxAttempts}`,
-      `สร้างโดยระบบหลังบันทึกผลว่าไม่รับสาย\nอ้างอิงงานเดิม #${actRow.id}`,
+      `สร้างโดยระบบหลังบันทึกผลโทรว่า${resultLabel}\nอ้างอิงงานเดิม #${actRow.id}`,
       actRow.priority || 'normal',
       retryDueAt,
       followupKey,
@@ -284,10 +294,13 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
 // ─────────────────────────────────────────────────────────────
 router.get('/stats', async (req, res) => {
   try {
-    const isMine = !canViewAll(req.user)
-    const params = isMine ? [req.user.id] : []
+    const requestedOwnerId = req.query.owner_id ? parseInt(req.query.owner_id, 10) : null
+    const filterUser = !canViewAll(req.user)
+      ? req.user.id
+      : (Number.isInteger(requestedOwnerId) && requestedOwnerId > 0 ? requestedOwnerId : null)
+    const params = filterUser ? [filterUser] : []
     // openCond: นับเฉพาะ activity ที่ยังเปิดอยู่ (มี owner status=open)
-    const openSub  = isMine
+    const openSub  = filterUser
       ? `EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.user_id=$1 AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled'))`
       : `(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`
 
@@ -1827,7 +1840,7 @@ router.patch('/:id/done', async (req, res) => {
 
     let retry = null
     const latestAct = { ...result.rows[0], status: derivedStatus }
-    if (latestAct.activity_type === 'call' && latestAct.call_result === 'no_answer') {
+    if (latestAct.activity_type === 'call' && CALL_RETRY_RESULTS.has(latestAct.call_result)) {
       retry = await createNoAnswerRetryActivity(latestAct, req.user.id, {
         skipRetryToday: !!skip_retry_today,
       })

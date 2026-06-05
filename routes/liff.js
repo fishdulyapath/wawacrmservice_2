@@ -3,9 +3,224 @@ const router  = express.Router()
 const { posDB, crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 const { logAudit } = require('../middleware/audit')
+const { notifyMany } = require('../services/notifyService')
 
 // ทุก LIFF endpoint ต้อง login
 router.use(authMiddleware)
+
+const CALL_RETRY_RESULTS = new Set(['no_answer', 'busy', 'left_voicemail'])
+const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
+
+async function generateActNo(activityType) {
+  const prefix = ACT_PREFIX[activityType] || 'W'
+  const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
+  const dateStr = `${bkkNow.getFullYear()}${String(bkkNow.getMonth() + 1).padStart(2, '0')}${String(bkkNow.getDate()).padStart(2, '0')}`
+  const lockKey = (prefix.charCodeAt(0) * 100000000 + parseInt(dateStr)) % 2147483647
+  const lockClient = await crmDB.connect()
+  try {
+    await lockClient.query(`SELECT pg_advisory_lock($1)`, [lockKey])
+    const res = await lockClient.query(
+      `SELECT COUNT(*) AS cnt FROM crm_activities WHERE act_no LIKE $1`,
+      [`${prefix}-${dateStr}-%`]
+    )
+    const next = parseInt(res.rows[0].cnt) + 1
+    return `${prefix}-${dateStr}-${String(next).padStart(4, '0')}`
+  } finally {
+    try { await lockClient.query(`SELECT pg_advisory_unlock($1)`, [lockKey]) } catch {}
+    lockClient.release()
+  }
+}
+
+async function adjustedRetryDueAt(minutes, businessStart, businessEnd) {
+  const result = await crmDB.query(`
+    WITH raw AS (
+      SELECT NOW() + ($1::int || ' minutes')::interval AS candidate
+    ), local AS (
+      SELECT candidate, candidate AT TIME ZONE 'Asia/Bangkok' AS local_candidate
+      FROM raw
+    )
+    SELECT CASE
+      WHEN local_candidate::time < $2::time
+        THEN (local_candidate::date + $2::time) AT TIME ZONE 'Asia/Bangkok'
+      WHEN local_candidate::time > $3::time
+        THEN ((local_candidate::date + INTERVAL '1 day')::date + $2::time) AT TIME ZONE 'Asia/Bangkok'
+      ELSE candidate
+    END AS due_at
+    FROM local
+  `, [minutes, businessStart, businessEnd])
+  return result.rows[0].due_at
+}
+
+function callRetryResultLabel(result) {
+  return {
+    no_answer: 'ไม่รับสาย',
+    busy: 'สายไม่ว่าง',
+    left_voicemail: 'ฝากข้อความ',
+  }[result] || result || 'ไม่ระบุผลการโทร'
+}
+
+async function createLiffRetryActivity(actRow, reqUserId, options = {}) {
+  if (actRow.activity_type !== 'call' || !CALL_RETRY_RESULTS.has(actRow.call_result) || !actRow.ar_code) {
+    return null
+  }
+  if (options.skipRetryToday) {
+    return { skipped: true, reason: 'skip_today' }
+  }
+
+  const settingsRes = await crmDB.query(`
+    SELECT * FROM crm_followup_settings
+    WHERE id = 1 AND enabled = TRUE
+  `)
+  const settings = settingsRes.rows[0]
+  if (!settings) return null
+
+  const customerPolicyRes = await crmDB.query(`
+    SELECT followup_enabled, followup_pause_until
+    FROM crm_customer_profile
+    WHERE ar_code = $1
+  `, [actRow.ar_code])
+  const customerPolicy = customerPolicyRes.rows[0]
+  if (customerPolicy) {
+    if (customerPolicy.followup_enabled === false) {
+      return { skipped: true, reason: 'customer_disabled' }
+    }
+    if (customerPolicy.followup_pause_until) {
+      const pauseRes = await crmDB.query(
+        `SELECT ($1::date >= (NOW() AT TIME ZONE 'Asia/Bangkok')::date) AS active`,
+        [customerPolicy.followup_pause_until]
+      )
+      if (pauseRes.rows[0]?.active) {
+        return { skipped: true, reason: 'customer_paused', pause_until: customerPolicy.followup_pause_until }
+      }
+    }
+  }
+
+  const countRes = await crmDB.query(`
+    SELECT COUNT(*)::int AS attempts
+    FROM crm_activities
+    WHERE ar_code = $1
+      AND activity_type = 'call'
+      AND call_result = ANY($2)
+      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
+  `, [actRow.ar_code, [...CALL_RETRY_RESULTS]])
+  const attemptsToday = Number(countRes.rows[0]?.attempts || 0)
+  const maxAttempts = Number(settings.no_answer_max_attempts_per_day || 3)
+  if (attemptsToday >= maxAttempts) {
+    return { skipped: true, reason: 'max_attempts', attempts_today: attemptsToday, max_attempts: maxAttempts }
+  }
+
+  const groupKeyRes = await crmDB.query(
+    `SELECT 'no-answer:' || $1::text || ':' || to_char(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS retry_group_key`,
+    [actRow.ar_code]
+  )
+  const retryGroupKey = actRow.retry_group_key || groupKeyRes.rows[0].retry_group_key
+  const ownersRes = await crmDB.query(`
+    SELECT user_id, is_primary
+    FROM crm_activity_owners
+    WHERE activity_id = $1 AND removed_at IS NULL
+    ORDER BY is_primary DESC, assigned_at ASC
+  `, [actRow.id])
+  const ownerIds = ownersRes.rows.map(r => Number(r.user_id)).filter(Boolean)
+  const primaryOwnerId = ownerIds[0] || actRow.owner_id || reqUserId
+  const nextAttemptNo = attemptsToday + 1
+  const retryDueAt = await adjustedRetryDueAt(
+    Number(settings.no_answer_retry_minutes || 30),
+    String(settings.business_start_time || '08:30').slice(0, 5),
+    String(settings.business_end_time || '17:30').slice(0, 5),
+  )
+  const followupKey = `no-answer-retry:${actRow.id}:${nextAttemptNo}`
+  const resultLabel = callRetryResultLabel(actRow.call_result)
+  const actNo = await generateActNo('call')
+
+  const client = await crmDB.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [retryGroupKey])
+
+    const duplicateRes = await client.query(`
+      SELECT id FROM crm_activities
+      WHERE (
+          retry_of_activity_id = $1
+          OR retry_group_key = $2
+        )
+        AND status NOT IN ('done','cancelled','deleted')
+      LIMIT 1
+    `, [actRow.id, retryGroupKey])
+    if (duplicateRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists', activity_id: duplicateRes.rows[0].id }
+    }
+
+    const insertRes = await client.query(`
+      INSERT INTO crm_activities (
+        ar_code, owner_id, created_by, activity_type, subject, description,
+        status, priority, due_date, start_datetime, call_direction, system_created,
+        followup_type, followup_policy_id, followup_key,
+        retry_of_activity_id, attempt_no, retry_due_at, retry_group_key,
+        requires_owner_assignment, owner_assignment_note, act_no
+      )
+      VALUES ($1,$2,$3,'call',$4,$5,'open',$6,$7::timestamptz::date,$7,'outbound',TRUE,
+              'no_answer_retry',1,$8,$9,$10,$7,$11,$12,$13,$14)
+      ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
+      RETURNING *
+    `, [
+      actRow.ar_code,
+      primaryOwnerId,
+      reqUserId,
+      `โทรซ้ำลูกค้า ${actRow.ar_code} ครั้งที่ ${nextAttemptNo}/${maxAttempts}`,
+      `สร้างโดยระบบหลังบันทึกผลโทรว่า${resultLabel}\nอ้างอิงงานเดิม #${actRow.id}`,
+      actRow.priority || 'normal',
+      retryDueAt,
+      followupKey,
+      actRow.id,
+      nextAttemptNo,
+      retryGroupKey,
+      ownerIds.length === 0,
+      ownerIds.length === 0 ? 'งานโทรซ้ำนี้ไม่มี owner จากงานเดิม' : null,
+      actNo,
+    ])
+    if (!insertRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists' }
+    }
+
+    const retry = insertRes.rows[0]
+    for (const uid of ownerIds) {
+      await client.query(`
+        INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
+        VALUES ($1,$2,$3,'open',$4)
+        ON CONFLICT (activity_id, user_id) DO NOTHING
+      `, [retry.id, uid, uid === primaryOwnerId, reqUserId])
+    }
+
+    await client.query('COMMIT')
+
+    if (ownerIds.length) {
+      const dueText = new Date(retryDueAt).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' })
+      await notifyMany(ownerIds, {
+        notiType: 'activity_update',
+        title: `ตั้งงานโทรซ้ำ ${nextAttemptNo}/${maxAttempts}`,
+        message: `${retry.subject} เวลา ${dueText} น.`,
+        refType: 'activity',
+        refId: retry.id,
+        arCode: retry.ar_code,
+      })
+    }
+
+    return {
+      created: true,
+      activity_id: retry.id,
+      retry_due_at: retry.retry_due_at,
+      attempt_no: retry.attempt_no,
+      max_attempts: maxAttempts,
+    }
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/liff/tasks
@@ -93,7 +308,8 @@ router.patch('/tasks/:id/done', async (req, res) => {
     const { id } = req.params
     const userId  = req.user.id
     const {
-      outcome, call_phone, call_result, call_direction, duration_sec
+      outcome, call_phone, call_result, call_direction, duration_sec,
+      skip_retry_today
     } = req.body
 
     // ตรวจว่าเป็น active owner ของงานนี้
@@ -117,7 +333,7 @@ router.patch('/tasks/:id/done', async (req, res) => {
     )
 
     // อัปเดต call/outcome fields บน activity row
-    await crmDB.query(
+    const updateRes = await crmDB.query(
       `UPDATE crm_activities
        SET outcome     = COALESCE($2, outcome),
            call_phone  = COALESCE($3, call_phone),
@@ -125,7 +341,8 @@ router.patch('/tasks/:id/done', async (req, res) => {
            call_direction = COALESCE($5, call_direction),
            duration_sec   = COALESCE($6, duration_sec),
            updated_at  = NOW()
-       WHERE id = $1`,
+       WHERE id = $1
+       RETURNING *`,
       [
         id,
         outcome     || null,
@@ -151,7 +368,20 @@ router.patch('/tasks/:id/done', async (req, res) => {
     await logAudit({ tableName: 'crm_activities', recordId: id, action: 'UPDATE',
       newData: { status: 'done', outcome, call_phone, call_result, call_direction, duration_sec } }, req)
 
-    res.json({ success: true })
+    let retry = null
+    const latestAct = { ...updateRes.rows[0], status: derivedStatus }
+    if (latestAct.activity_type === 'call' && CALL_RETRY_RESULTS.has(latestAct.call_result)) {
+      try {
+        retry = await createLiffRetryActivity(latestAct, userId, {
+          skipRetryToday: !!skip_retry_today,
+        })
+      } catch (retryErr) {
+        console.error(`[LIFF Retry] activity ${latestAct.id}`, retryErr.message)
+        retry = { skipped: true, reason: 'retry_error', error: retryErr.message }
+      }
+    }
+
+    res.json({ success: true, retry })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -267,7 +497,8 @@ router.post('/quick-activity', async (req, res) => {
       ar_code, activity_type = 'call', subject,
       description, status = 'open', priority = 'normal',
       due_date, start_datetime, call_direction,
-      call_result, call_phone, duration_sec
+      call_result, call_phone, duration_sec, skip_retry_today,
+      followup_type
     } = req.body
 
     if (!ar_code || !subject)
@@ -277,19 +508,21 @@ router.post('/quick-activity', async (req, res) => {
       INSERT INTO crm_activities
         (ar_code, owner_id, activity_type, subject, description,
          status, priority, due_date, start_datetime,
-         call_direction, call_result, call_phone, duration_sec)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-      RETURNING id
+         call_direction, call_result, call_phone, duration_sec, followup_type)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      RETURNING *
     `, [
       ar_code, userId, activity_type, subject, description || null,
       status, priority,
       due_date || null,
       start_datetime || (activity_type === 'call' ? new Date() : null),
       call_direction || null, call_result || null,
-      call_phone || null, duration_sec || null
+      call_phone || null, duration_sec || null,
+      followup_type || null
     ])
 
-    const activityId = result.rows[0].id
+    const activity = result.rows[0]
+    const activityId = activity.id
 
     // insert owner row — ถ้าไม่มีจะทำให้ tasks query ไม่เจองานนี้
     await crmDB.query(`
@@ -303,7 +536,19 @@ router.post('/quick-activity', async (req, res) => {
       arCode: ar_code, action: 'INSERT', newData: req.body
     }, req)
 
-    res.status(201).json({ success: true, id: activityId })
+    let retry = null
+    if (activity.activity_type === 'call' && activity.status === 'done' && CALL_RETRY_RESULTS.has(activity.call_result)) {
+      try {
+        retry = await createLiffRetryActivity(activity, userId, {
+          skipRetryToday: !!skip_retry_today,
+        })
+      } catch (retryErr) {
+        console.error(`[LIFF Retry] activity ${activity.id}`, retryErr.message)
+        retry = { skipped: true, reason: 'retry_error', error: retryErr.message }
+      }
+    }
+
+    res.status(201).json({ success: true, id: activityId, retry })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

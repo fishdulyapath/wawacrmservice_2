@@ -10,6 +10,7 @@ router.use(authMiddleware)
 
 const canManageFollowup = u => u?.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u?.role)
 let customerStoreLinkReady = false
+const CALL_RETRY_RESULTS = ['no_answer', 'busy', 'left_voicemail']
 
 function normalizeCustomerOwners(crm = {}) {
   const source = Array.isArray(crm.owners)
@@ -526,7 +527,7 @@ router.get('/:code', async (req, res) => {
          FROM crm_activities a
          WHERE a.ar_code = $1
            AND a.activity_type = 'call'
-           AND a.call_result = 'no_answer'
+           AND a.call_result = ANY($2)
            AND DATE(a.updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')) AS no_answer_attempts_today,
         (SELECT json_build_object(
            'id', a.id,
@@ -554,7 +555,7 @@ router.get('/:code', async (req, res) => {
            'business_end_time', to_char(s.business_end_time, 'HH24:MI')
          )
          FROM crm_followup_settings s WHERE s.id = 1) AS policy
-    `, [code])
+    `, [code, CALL_RETRY_RESULTS])
 
     // แปลง website "lat,lng" → latitude, longitude
     const cus = { ...cusResult.rows[0] }

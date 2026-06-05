@@ -118,14 +118,24 @@ function start() {
     }
   }, cronOpts)
 
-  // ── 1.6 No-answer Retry Due Alert: แจ้งเมื่อถึงเวลาโทรซ้ำ ──
+  // ── 1.6 Call Retry Due Alert: แจ้งเมื่อถึงเวลาโทรซ้ำ ──
   cron.schedule('* * * * *', async () => {
     try {
       const todayStr = bangkokDate()
       const result = await crmDB.query(`
         SELECT a.id, a.subject, a.activity_type, a.start_datetime, a.retry_due_at, a.priority, a.ar_code,
                a.attempt_no,
-               u.id AS user_id, u.line_user_id, u.line_notify_enabled
+               u.id AS user_id, u.line_user_id, u.line_notify_enabled,
+               EXISTS (
+                 SELECT 1 FROM crm_line_message_log lg
+                 WHERE lg.user_id = u.id
+                   AND lg.ref_type = 'activity'
+                   AND lg.ref_id = a.id
+                   AND lg.message_type IN ('task_reminder','task_overdue')
+                   AND lg.success = TRUE
+                   AND lg.sent_at >= $1::date
+                   AND lg.sent_at <  ($1::date + INTERVAL '1 day')
+               ) AS has_line_success_today
         FROM crm_activities a
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
