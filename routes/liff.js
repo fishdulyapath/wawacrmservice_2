@@ -81,9 +81,6 @@ async function createLiffRetryActivity(actRow, reqUserId, options = {}) {
   `, [actRow.ar_code])
   const customerPolicy = customerPolicyRes.rows[0]
   if (customerPolicy) {
-    if (customerPolicy.followup_enabled === false) {
-      return { skipped: true, reason: 'customer_disabled' }
-    }
     if (customerPolicy.followup_pause_until) {
       const pauseRes = await crmDB.query(
         `SELECT ($1::date >= (NOW() AT TIME ZONE 'Asia/Bangkok')::date) AS active`,
@@ -95,25 +92,27 @@ async function createLiffRetryActivity(actRow, reqUserId, options = {}) {
     }
   }
 
+  const retryGroupKey = actRow.retry_group_key || `no-answer:${actRow.id}`
+  const retryRootId = Number(String(retryGroupKey).match(/^no-answer:(\d+)$/)?.[1]) || actRow.retry_of_activity_id || actRow.id
+
   const countRes = await crmDB.query(`
     SELECT COUNT(*)::int AS attempts
     FROM crm_activities
-    WHERE ar_code = $1
-      AND activity_type = 'call'
-      AND call_result = ANY($2)
-      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
-  `, [actRow.ar_code, [...CALL_RETRY_RESULTS]])
+    WHERE activity_type = 'call'
+      AND call_result = ANY($1)
+      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+      AND (
+        id = $2
+        OR retry_of_activity_id = $2
+        OR retry_group_key = $3
+      )
+  `, [[...CALL_RETRY_RESULTS], retryRootId, retryGroupKey])
   const attemptsToday = Number(countRes.rows[0]?.attempts || 0)
   const maxAttempts = Number(settings.no_answer_max_attempts_per_day || 3)
   if (attemptsToday >= maxAttempts) {
     return { skipped: true, reason: 'max_attempts', attempts_today: attemptsToday, max_attempts: maxAttempts }
   }
 
-  const groupKeyRes = await crmDB.query(
-    `SELECT 'no-answer:' || $1::text || ':' || to_char(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM-DD') AS retry_group_key`,
-    [actRow.ar_code]
-  )
-  const retryGroupKey = actRow.retry_group_key || groupKeyRes.rows[0].retry_group_key
   const ownersRes = await crmDB.query(`
     SELECT user_id, is_primary
     FROM crm_activity_owners
