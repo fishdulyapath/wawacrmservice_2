@@ -673,15 +673,13 @@ router.get('/salespeople', requireRole('admin', 'manager'), async (req, res) => 
 
 // ─────────────────────────────────────────────────────────────
 // GET /api/sales/map
-// ยอดขายรายลูกค้าพร้อมพิกัดจาก ap_ar_transport_label
+// ยอดขายรายลูกค้าพร้อมพิกัดจาก ar_customer.website ("lat,lng")
 // Params: date_from, date_to, sale_code
 // ─────────────────────────────────────────────────────────────
 router.get('/map', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { date_from, date_to, sale_code } = req.query
-    const conds  = ['t.trans_flag = 44', 't.last_status = 0',
-                    'tl.latitude IS NOT NULL', 'tl.latitude <> 0',
-                    'tl.longitude IS NOT NULL', 'tl.longitude <> 0']
+    const conds  = ['t.trans_flag = 44', 't.last_status = 0']
     const params = []
 
     if (date_from) { params.push(date_from); conds.push(`t.doc_date >= $${params.length}`) }
@@ -691,6 +689,17 @@ router.get('/map', requireRole('admin', 'manager'), async (req, res) => {
     const where = conds.join(' AND ')
 
     const result = await posDB.query(`
+      WITH customer_geo AS (
+        SELECT
+          code,
+          name_1,
+          province,
+          amper,
+          split_part(trim(website), ',', 1)::numeric AS latitude,
+          split_part(trim(website), ',', 2)::numeric AS longitude
+        FROM ar_customer
+        WHERE trim(COALESCE(website, '')) ~ '^-?[0-9]+([.][0-9]+)?,-?[0-9]+([.][0-9]+)?$'
+      )
       SELECT
         t.cust_code,
         c.name_1                               AS cust_name,
@@ -698,17 +707,20 @@ router.get('/map', requireRole('admin', 'manager'), async (req, res) => {
         COALESCE(ep.name_1, c.province, '')    AS province,
         c.amper                                AS amper_code,
         COALESCE(ea.name_1, c.amper, '')       AS amper,
-        AVG(tl.latitude)::float                AS lat,
-        AVG(tl.longitude)::float               AS lng,
+        c.latitude::float                      AS lat,
+        c.longitude::float                     AS lng,
         COUNT(DISTINCT t.doc_no)               AS total_orders,
         ROUND(SUM(t.total_amount)::numeric, 2) AS total_amount
       FROM ic_trans t
-      JOIN ap_ar_transport_label tl ON tl.cust_code = t.cust_code
-      LEFT JOIN ar_customer c   ON c.code     = t.cust_code
+      JOIN customer_geo c   ON c.code     = t.cust_code
       LEFT JOIN erp_province ep ON ep.code    = c.province
-      LEFT JOIN erp_amper    ea ON ea.code    = c.amper AND ea.province = c.province
+      LEFT JOIN erp_amper    ea ON ea.code    = c.amper
       WHERE ${where}
-      GROUP BY t.cust_code, c.name_1, c.province, ep.name_1, c.amper, ea.name_1
+        AND c.latitude BETWEEN -90 AND 90
+        AND c.longitude BETWEEN -180 AND 180
+        AND c.latitude <> 0
+        AND c.longitude <> 0
+      GROUP BY t.cust_code, c.name_1, c.province, ep.name_1, c.amper, ea.name_1, c.latitude, c.longitude
       ORDER BY total_amount DESC
     `, params)
 
