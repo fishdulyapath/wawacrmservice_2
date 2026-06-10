@@ -100,7 +100,7 @@ async function createLiffRetryActivity(actRow, reqUserId, options = {}) {
     FROM crm_activities
     WHERE activity_type = 'call'
       AND call_result = ANY($1)
-      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+      AND DATE(COALESCE(call_result_at, cdr_end_stamp, cdr_start_stamp, created_at) AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
       AND (
         id = $2
         OR retry_of_activity_id = $2
@@ -339,6 +339,7 @@ router.patch('/tasks/:id/done', async (req, res) => {
            call_result = COALESCE($4, call_result),
            call_direction = COALESCE($5, call_direction),
            duration_sec   = COALESCE($6, duration_sec),
+           call_result_at = CASE WHEN $4 IS NOT NULL THEN NOW() ELSE call_result_at END,
            updated_at  = NOW()
        WHERE id = $1
        RETURNING *`,
@@ -362,7 +363,7 @@ router.patch('/tasks/:id/done', async (req, res) => {
       if (active.every(o => o.status === 'done')) derivedStatus = 'done'
       else if (active.every(o => o.status === 'cancelled')) derivedStatus = 'cancelled'
     }
-    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [id, derivedStatus])
+    await crmDB.query(`UPDATE crm_activities SET status=$2, updated_at=NOW() WHERE id=$1`, [id, derivedStatus])
 
     await logAudit({ tableName: 'crm_activities', recordId: id, action: 'UPDATE',
       newData: { status: 'done', outcome, call_phone, call_result, call_direction, duration_sec } }, req)
@@ -507,8 +508,8 @@ router.post('/quick-activity', async (req, res) => {
       INSERT INTO crm_activities
         (ar_code, owner_id, activity_type, subject, description,
          status, priority, due_date, start_datetime,
-         call_direction, call_result, call_phone, duration_sec, followup_type)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         call_direction, call_result, call_phone, duration_sec, followup_type, call_result_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING *
     `, [
       ar_code, userId, activity_type, subject, description || null,
@@ -517,7 +518,8 @@ router.post('/quick-activity', async (req, res) => {
       start_datetime || (activity_type === 'call' ? new Date() : null),
       call_direction || null, call_result || null,
       call_phone || null, duration_sec || null,
-      followup_type || null
+      followup_type || null,
+      call_result ? new Date() : null
     ])
 
     const activity = result.rows[0]

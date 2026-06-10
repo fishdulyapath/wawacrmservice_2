@@ -154,7 +154,7 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
     FROM crm_activities
     WHERE activity_type = 'call'
       AND call_result = ANY($1)
-      AND DATE(updated_at AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+      AND DATE(COALESCE(call_result_at, cdr_end_stamp, cdr_start_stamp, created_at) AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
       AND (
         id = $2
         OR retry_of_activity_id = $2
@@ -411,7 +411,7 @@ router.get('/by-customer/:arCode', async (req, res) => {
       FROM crm_activities a
       LEFT JOIN crm_users cu ON cu.id = a.created_by
       ${where}
-      ORDER BY COALESCE(a.start_datetime, a.due_date::timestamp, a.created_at) DESC
+      ORDER BY a.updated_at DESC NULLS LAST, a.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
 
@@ -537,6 +537,7 @@ router.get('/groups', async (req, res) => {
         MAX(a.due_date) AS due_date,
         MAX(a.created_by) AS created_by,
         MAX(a.created_at) AS created_at,
+        MAX(a.updated_at) AS updated_at,
         COUNT(DISTINCT a.id) AS member_count,
         COUNT(DISTINCT a.id) FILTER (
           WHERE NOT EXISTS (
@@ -568,6 +569,7 @@ router.get('/groups', async (req, res) => {
           WHEN COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0 THEN 0
           ELSE 1
         END,
+        MAX(a.updated_at) DESC NULLS LAST,
         MAX(COALESCE(a.start_datetime, a.due_date::timestamp)) DESC NULLS LAST,
         MAX(a.created_at) DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -806,14 +808,15 @@ router.patch('/groups/:groupKey/bulk-close', async (req, res) => {
 router.get('/', async (req, res) => {
   try {
     const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, page = 1, limit = 20,
-            sort_by = 'created_at', sort_dir = 'desc' } = req.query
+            sort_by = 'updated_at', sort_dir = 'desc' } = req.query
 
     const SORT_WHITELIST = {
       created_at:     'a.created_at',
+      updated_at:     'a.updated_at',
       due_date:       'a.due_date',
       start_datetime: 'a.start_datetime',
     }
-    const sortCol     = SORT_WHITELIST[sort_by] || 'a.created_at'
+    const sortCol     = SORT_WHITELIST[sort_by] || 'a.updated_at'
     const sortDirSafe = sort_dir?.toLowerCase() === 'asc' ? 'ASC' : 'DESC'
     const offset = (parseInt(page) - 1) * parseInt(limit)
     const params = []
@@ -933,6 +936,7 @@ router.get('/', async (req, res) => {
       ${where}
       ORDER BY
         ${sortCol} ${sortDirSafe} NULLS LAST,
+        a.updated_at DESC,
         a.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
@@ -1346,7 +1350,7 @@ router.put('/:id', async (req, res) => {
       // update owner_id column (compat)
       const primaryRow = newPrimaryId || newOwnerList[0]
       if (primaryRow) {
-        await client.query(`UPDATE crm_activities SET owner_id=$2 WHERE id=$1`, [req.params.id, primaryRow])
+        await client.query(`UPDATE crm_activities SET owner_id=$2, updated_at=NOW() WHERE id=$1`, [req.params.id, primaryRow])
       }
       if (newOwnerList.length) {
         await client.query(`
@@ -1663,12 +1667,12 @@ router.patch('/:id/status', async (req, res) => {
     // ── Sync crm_activities.status from owners ──
     const owners = await getOwners(req.params.id)
     const derivedStatus = deriveActivityStatus(owners)
-    await crmDB.query(
-      `UPDATE crm_activities SET status=$2, outcome=COALESCE($3, outcome), updated_at=NOW() WHERE id=$1`,
+    const activityRes = await crmDB.query(
+      `UPDATE crm_activities SET status=$2, outcome=COALESCE($3, outcome), updated_at=NOW() WHERE id=$1 RETURNING *`,
       [req.params.id, derivedStatus, outcome || null]
     )
 
-    res.json({ success: true, status, activity_status: derivedStatus })
+    res.json({ success: true, ...activityRes.rows[0], status, activity_status: derivedStatus })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1802,6 +1806,7 @@ router.patch('/:id/done', async (req, res) => {
         cdr_recording_url = COALESCE($8, cdr_recording_url),
         cdr_start_stamp   = COALESCE($9::timestamptz, cdr_start_stamp),
         cdr_end_stamp     = COALESCE($10::timestamptz, cdr_end_stamp),
+        call_result_at    = CASE WHEN $4 IS NOT NULL THEN COALESCE($10::timestamptz, $9::timestamptz, NOW()) ELSE call_result_at END,
         updated_at        = NOW()
       WHERE id=$1 RETURNING *`,
       [req.params.id,
@@ -1834,7 +1839,7 @@ router.patch('/:id/done', async (req, res) => {
     // ── Sync crm_activities.status from owners ──
     const owners = await getOwners(req.params.id)
     const derivedStatus = deriveActivityStatus(owners)
-    await crmDB.query(`UPDATE crm_activities SET status=$2 WHERE id=$1`, [req.params.id, derivedStatus])
+    await crmDB.query(`UPDATE crm_activities SET status=$2, updated_at=NOW() WHERE id=$1`, [req.params.id, derivedStatus])
 
     let retry = null
     const latestAct = { ...result.rows[0], status: derivedStatus }

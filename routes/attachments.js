@@ -25,6 +25,10 @@ const upload = multer({
 })
 
 // ── GET /api/activities/:id/attachments ──────────────────────
+async function touchActivity(activityId) {
+  await crmDB.query(`UPDATE crm_activities SET updated_at = NOW() WHERE id = $1`, [activityId])
+}
+
 router.get('/', async (req, res) => {
   try {
     const result = await crmDB.query(
@@ -136,6 +140,10 @@ router.post('/', upload.array('files', MAX_FILES), async (req, res) => {
     }
   }
 
+  if (saved.length) {
+    await touchActivity(req.params.id)
+  }
+
   res.status(201).json(saved)
 })
 
@@ -162,6 +170,7 @@ router.delete('/:attId', async (req, res) => {
     })
 
     await crmDB.query('DELETE FROM crm_activity_attachments WHERE id=$1', [req.params.attId])
+    await touchActivity(req.params.id)
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })

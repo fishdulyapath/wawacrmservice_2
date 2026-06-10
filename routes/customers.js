@@ -528,7 +528,7 @@ router.get('/:code', async (req, res) => {
          WHERE a.ar_code = $1
            AND a.activity_type = 'call'
            AND a.call_result = ANY($2)
-           AND DATE(a.updated_at AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')) AS no_answer_attempts_today,
+           AND DATE(COALESCE(a.call_result_at, a.cdr_end_stamp, a.cdr_start_stamp, a.created_at) AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date) AS no_answer_attempts_today,
         (SELECT json_build_object(
            'id', a.id,
            'subject', a.subject,

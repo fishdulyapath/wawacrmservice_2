@@ -25,6 +25,10 @@ function safeSegment(value) {
   return String(value || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'unknown'
 }
 
+async function touchActivity(activityId) {
+  await crmDB.query(`UPDATE crm_activities SET updated_at = NOW() WHERE id = $1`, [activityId])
+}
+
 async function saveCommentFiles(activityId, commentId, files, userId) {
   if (!files?.length) return []
 
@@ -145,6 +149,7 @@ router.post('/', upload.array('files', MAX_FILES), async (req, res) => {
     comment.attachments = await saveCommentFiles(activityId, comment.id, req.files || [], req.user.id)
     comment.user_name = req.user.name || req.user.code || null
     comment.user_code = req.user.code || null
+    await touchActivity(activityId)
 
     // แจ้ง owners (ที่ไม่ใช่คนสร้าง comment) และ followers ที่ไม่ใช่ owner
     try {
@@ -212,6 +217,7 @@ router.delete('/:commentId', async (req, res) => {
     })
 
     await crmDB.query('DELETE FROM crm_activity_comments WHERE id=$1', [req.params.commentId])
+    await touchActivity(req.params.id)
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
