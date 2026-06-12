@@ -305,11 +305,11 @@ router.get('/stats', async (req, res) => {
     const r = await crmDB.query(`
       SELECT
         COUNT(*) FILTER (WHERE (
-          (a.activity_type = 'task' AND a.due_date < CURRENT_DATE)
+          (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
           OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
         ) AND ${openSub}) AS overdue,
         COUNT(*) FILTER (WHERE (
-          (a.activity_type = 'task' AND DATE(a.due_date) = CURRENT_DATE)
+          (a.activity_type IN ('task','transfer') AND DATE(a.due_date) = CURRENT_DATE)
           OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
         ) AND ${openSub}) AS today,
         COUNT(*) FILTER (WHERE ${openSub}) AS open,
@@ -501,7 +501,7 @@ router.get('/groups', async (req, res) => {
       havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0`
     } else if (status === 'overdue') {
       conditions.push(`(
-        (a.activity_type = 'task' AND a.due_date < CURRENT_DATE)
+        (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
         OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
       )`)
       havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0`
@@ -846,19 +846,19 @@ router.get('/', async (req, res) => {
 
     if (due === 'overdue') {
       conditions.push(`(
-        (a.activity_type = 'task' AND a.due_date < CURRENT_DATE)
+        (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
         OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'today') {
       conditions.push(`(
-        (a.activity_type = 'task' AND DATE(a.due_date) = CURRENT_DATE)
+        (a.activity_type IN ('task','transfer') AND DATE(a.due_date) = CURRENT_DATE)
         OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok'))
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'week') {
       conditions.push(`(
-        (a.activity_type = 'task' AND a.due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
+        (a.activity_type IN ('task','transfer') AND a.due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
         OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') BETWEEN (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') AND (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') + INTERVAL '7 days')
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
