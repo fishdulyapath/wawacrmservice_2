@@ -14,6 +14,19 @@ const posDB = new Pool({
   connectionTimeoutMillis: 5000
 })
 
+// POS Images Database — product images blob storage, e.g. <posdb>_images
+const posImagesDB = new Pool({
+  host: process.env.POS_HOST,
+  port: parseInt(process.env.POS_PORT),
+  user: process.env.POS_USER,
+  password: process.env.POS_PASSWORD,
+  database: process.env.POS_IMAGES_DB || `${process.env.POS_DB || 'posdb'}_images`,
+  options: '-c timezone=Asia/Bangkok',
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000
+})
+
 // CRM Database — CRM Data (wawa.iszai.com)
 const crmDB = new Pool({
   host: process.env.CRM_HOST,
@@ -29,6 +42,7 @@ const crmDB = new Pool({
 
 // ตั้ง timezone GMT+7 ทุก connection
 posDB.on('error', (err) => console.error('[POS DB] Unexpected error:', err))
+posImagesDB.on('error', (err) => console.error('[POS Images DB] Unexpected error:', err))
 crmDB.on('error', (err) => console.error('[CRM DB] Unexpected error:', err))
 
-module.exports = { posDB, crmDB }
+module.exports = { posDB, posImagesDB, crmDB }

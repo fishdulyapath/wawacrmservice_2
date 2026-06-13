@@ -76,8 +76,9 @@ app.use(cors({
 // LINE webhook ต้องการ raw body เพื่อ verify signature
 app.use('/api/line/webhook', express.raw({ type: 'application/json' }))
 
-// ทุก route อื่นใช้ JSON parser ปกติ
-app.use(express.json())
+// ทุก route อื่นใช้ JSON parser ปกติ; product image upload ส่ง base64 จึงต้องเพิ่ม limit
+app.use(express.json({ limit: '25mb' }))
+app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
 // ── Request logger (dev) ───────────────
 if (process.env.NODE_ENV !== 'production') {
@@ -92,6 +93,7 @@ app.use('/api/liff',       require('./routes/liff'))         // LIFF API
 app.use('/api/line',       require('./routes/line'))         // LINE webhooks
 app.use('/api/auth',            require('./routes/auth'))          // Public
 app.use('/api/customers', require('./routes/customers'))     // Auth required
+app.use('/api/products',      require('./routes/products'))       // POS product master
 app.use('/api/employees',      require('./routes/employees'))      // Auth required
 app.use('/api/activities',     require('./routes/activities'))     // Auth required
 app.use('/api/followup-settings', require('./routes/followupSettings')) // Follow-up policy
