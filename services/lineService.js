@@ -336,6 +336,71 @@ async function sendNewAssignment(lineUserId, userId, customer) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Purchase Reorder Alert — แจ้งเตือนสินค้าถึงจุดสั่งซื้อ MIN/ROP
+// ─────────────────────────────────────────────────────────────
+async function sendPurchaseReorderAlert(user, rows = [], options = {}) {
+  const lineUserId = user.line_user_id || user.lineUserId
+  const userId = user.user_id || user.id
+  const totalCount = Number(options.totalCount || rows.length || 0)
+  const warehouse = options.warehouse || 'MMA01'
+  const asOfDate = options.asOfDate || ''
+  const viewUrl = liffUrl('/purchase-planning/alerts')
+  const topRows = rows.slice(0, 10)
+
+  const rowText = topRows.map((row, index) => {
+    const name = row.ic_name ? ` ${String(row.ic_name).slice(0, 42)}` : ''
+    const available = fmtQty(row.available_qty)
+    const minStock = fmtQty(row.min_stock)
+    const suggestQty = fmtQty(row.suggest_qty)
+    return `${index + 1}. ${row.ic_code}${name}\n   พร้อมใช้ ${available} / MIN ${minStock} / แนะนำ ${suggestQty}`
+  }).join('\n')
+
+  const moreText = totalCount > topRows.length
+    ? `\n\nและอีก ${fmtQty(totalCount - topRows.length, 0)} รายการ`
+    : ''
+
+  const text =
+    `แจ้งเตือนจุดสั่งซื้อ MIN/ROP\n` +
+    `พบสินค้า ${fmtQty(totalCount, 0)} รายการถึงจุดสั่งซื้อ\n` +
+    `คลัง ${warehouse}${asOfDate ? ` วันที่ ${asOfDate}` : ''}\n\n` +
+    `${rowText || 'ไม่มีรายการถึงจุดสั่งซื้อ'}${moreText}\n\n` +
+    `เปิดรายงาน: ${viewUrl}`
+
+  const messages = [{ type: 'text', text }]
+
+  try {
+    await sendMessage(lineUserId, messages)
+    await logMessage({
+      userId,
+      lineUserId,
+      messageType: 'purchase_reorder_alert',
+      refType: 'purchase_planning',
+      payload: { messages, options, sample_rows: topRows },
+      success: true,
+    })
+  } catch (e) {
+    await logMessage({
+      userId,
+      lineUserId,
+      messageType: 'purchase_reorder_alert',
+      refType: 'purchase_planning',
+      payload: { messages, options, sample_rows: topRows },
+      success: false,
+      errorMessage: e.message,
+    })
+    throw e
+  }
+}
+
+function fmtQty(value, digits = 2) {
+  const num = Number(value || 0)
+  return num.toLocaleString('th-TH', {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: 0,
+  })
+}
+
+// ─────────────────────────────────────────────────────────────
 // Helpers — UI Components
 // ─────────────────────────────────────────────────────────────
 function _statBox(label, value, color = '#374151') {
@@ -362,5 +427,5 @@ function _infoRow(label, value) {
 
 module.exports = {
   sendMessage, replyMessage, replyOrPush, sendDailySummary, sendTaskReminder,
-  sendNewAssignment, buildCustomerCard, logMessage
+  sendNewAssignment, sendPurchaseReorderAlert, buildCustomerCard, logMessage
 }

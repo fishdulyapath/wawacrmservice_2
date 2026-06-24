@@ -1,0 +1,1746 @@
+const express = require('express')
+const crypto = require('crypto')
+const { posDB } = require('../db')
+const { authMiddleware, requireRole } = require('../middleware/auth')
+
+const router = express.Router()
+
+router.use(authMiddleware, requireRole('admin'))
+
+const reportJobs = new Map()
+const REPORT_JOB_TTL_MS = 10 * 60 * 1000
+
+function clean(value) {
+  return String(value || '').trim()
+}
+
+function toIntOrNull(value) {
+  if (value === '' || value === null || value === undefined) return null
+  const num = Number(value)
+  if (!Number.isFinite(num)) return null
+  return Math.max(0, Math.trunc(num))
+}
+
+function toNumber(value, fallback = 0) {
+  const num = Number(value)
+  return Number.isFinite(num) ? num : fallback
+}
+
+function boolQuery(value) {
+  const text = String(value || '').trim().toLowerCase()
+  return text === '1' || text === 'true' || text === 'yes'
+}
+
+function optionalDate(value) {
+  const text = clean(value)
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null
+}
+
+function pageParams(req) {
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 30))
+  return { page, limit, offset: (page - 1) * limit }
+}
+
+function takeParams(source, names) {
+  return names.reduce((acc, name) => {
+    if (source[name] !== undefined && source[name] !== null && source[name] !== '') acc[name] = source[name]
+    return acc
+  }, {})
+}
+
+function reportJobKey(userCode, query) {
+  const payload = {
+    userCode: clean(userCode),
+    query: takeParams(query, ['search', 'days', 'as_of_date', 'warehouse', 'group_main', 'ap_code', 'alert_only']),
+  }
+  return crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex')
+}
+
+function pruneReportJobs() {
+  const now = Date.now()
+  for (const [id, job] of reportJobs.entries()) {
+    if (now - job.updatedAt > REPORT_JOB_TTL_MS) reportJobs.delete(id)
+  }
+}
+
+function searchClause(search, fields, startIndex = 1) {
+  const parts = clean(search).split(/\s+/).filter(Boolean)
+  if (!parts.length) return { sql: '', params: [] }
+  const params = []
+  const clauses = parts.map((part, idx) => {
+    params.push(`%${part}%`)
+    const p = `$${startIndex + idx}`
+    return `(${fields.map((field) => `COALESCE(${field}, '') ILIKE ${p}::text`).join(' OR ')})`
+  })
+  return { sql: ` AND ${clauses.join(' AND ')}`, params }
+}
+
+async function withPosTransaction(fn) {
+  const client = await posDB.connect()
+  try {
+    await client.query('BEGIN')
+    const result = await fn(client)
+    await client.query('COMMIT')
+    return result
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+function supplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
+  const params = []
+  const whereParts = [
+    'd.trans_flag = 12',
+    'COALESCE(d.status, 0) = 0',
+    "COALESCE(d.cust_code, '') <> ''",
+  ]
+  const addParam = (value) => {
+    params.push(value)
+    return `$${startIndex + params.length - 1}`
+  }
+
+  if (fromDate) whereParts.push(`d.doc_date::date >= ${addParam(fromDate)}::date`)
+  if (toDate) whereParts.push(`d.doc_date::date <= ${addParam(toDate)}::date`)
+
+  return {
+    params,
+    sql: `
+      WITH purchase_suppliers AS (
+        SELECT
+          d.cust_code AS ap_code,
+          MAX(d.doc_date)::date AS latest_purchase_date,
+          COUNT(*)::int AS purchase_line_count
+        FROM ic_trans_detail d
+        JOIN ap_supplier s ON s.code = d.cust_code
+        WHERE ${whereParts.join(' AND ')}
+        GROUP BY d.cust_code
+      ),
+      missing_suppliers AS (
+        SELECT
+          p.ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          p.latest_purchase_date,
+          p.purchase_line_count
+        FROM purchase_suppliers p
+        JOIN ap_supplier s ON s.code = p.ap_code
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM purchase_planning_supplier_setting setting
+          WHERE setting.ap_code = p.ap_code
+        )
+      )
+    `,
+  }
+}
+
+function itemSupplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
+  const params = []
+  const whereParts = [
+    'd.trans_flag = 12',
+    'COALESCE(d.status, 0) = 0',
+    "COALESCE(d.item_code, '') <> ''",
+    "COALESCE(d.cust_code, '') <> ''",
+  ]
+  const addParam = (value) => {
+    params.push(value)
+    return `$${startIndex + params.length - 1}`
+  }
+
+  if (fromDate) whereParts.push(`d.doc_date::date >= ${addParam(fromDate)}::date`)
+  if (toDate) whereParts.push(`d.doc_date::date <= ${addParam(toDate)}::date`)
+
+  return {
+    params,
+    sql: `
+      WITH purchase_pairs AS (
+        SELECT
+          d.item_code AS ic_code,
+          d.cust_code AS ap_code,
+          MAX(d.doc_date)::date AS latest_purchase_date,
+          COUNT(*)::int AS purchase_line_count
+        FROM ic_trans_detail d
+        JOIN ic_inventory i ON i.code = d.item_code
+        JOIN ap_supplier s ON s.code = d.cust_code
+        WHERE ${whereParts.join(' AND ')}
+        GROUP BY d.item_code, d.cust_code
+      ),
+      existing_line AS (
+        SELECT ic_code, COALESCE(MAX(line_number), 0)::int AS max_line_number
+        FROM ap_item_by_supplier
+        GROUP BY ic_code
+      ),
+      missing_pairs AS (
+        SELECT
+          p.ic_code,
+          COALESCE(i.name_1, '') AS ic_name,
+          p.ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          p.latest_purchase_date,
+          p.purchase_line_count,
+          COALESCE(e.max_line_number, 0)::int AS max_line_number
+        FROM purchase_pairs p
+        JOIN ic_inventory i ON i.code = p.ic_code
+        JOIN ap_supplier s ON s.code = p.ap_code
+        LEFT JOIN existing_line e ON e.ic_code = p.ic_code
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ap_item_by_supplier link
+          WHERE link.ic_code = p.ic_code
+            AND link.ap_code = p.ap_code
+        )
+      )
+    `,
+  }
+}
+
+function planningOptions(req) {
+  const today = new Date().toISOString().slice(0, 10)
+  const asOfDate = optionalDate(req.query.as_of_date) || today
+  const warehouse = clean(req.query.warehouse || 'MMA01') || 'MMA01'
+  const days = Math.min(365, Math.max(1, parseInt(req.query.days, 10) || 30))
+  return { asOfDate, warehouse, days }
+}
+
+function planningWhere(req, startIndex = 1) {
+  const params = []
+  const whereParts = [
+    "COALESCE(i.code, '') <> ''",
+    'COALESCE(i.item_type, 0) NOT IN (1, 3)',
+    'COALESCE(d.is_hold_sale, 0) <> 1',
+    'COALESCE(d.is_hold_purchase, 0) <> 1',
+    `EXISTS (
+      SELECT 1
+      FROM ap_item_by_supplier config_link
+      JOIN purchase_planning_item_supplier_resolved config_resolved
+        ON config_resolved.ic_code = config_link.ic_code
+       AND config_resolved.ap_code = config_link.ap_code
+      WHERE config_link.ic_code = i.code
+        AND COALESCE(config_resolved.planning_enabled, 1) = 1
+        AND COALESCE(config_resolved.lead_time_days, 0) > 0
+        AND COALESCE(config_resolved.late_buffer_days, 0) > 0
+        AND COALESCE(config_resolved.wholesale_buffer_days, 0) > 0
+        AND COALESCE(config_resolved.order_cycle_days, 0) > 0
+    )`,
+  ]
+
+  const addParam = (value) => {
+    params.push(value)
+    return `$${startIndex + params.length - 1}`
+  }
+
+  const search = clean(req.query.search)
+  for (const keyword of search.split(/\s+/).filter(Boolean)) {
+    const p = addParam(`%${keyword}%`)
+    whereParts.push(`(
+      i.code ILIKE ${p}::text
+      OR COALESCE(i.name_1, '') ILIKE ${p}::text
+      OR COALESCE(i.name_eng_1, '') ILIKE ${p}::text
+      OR EXISTS (
+        SELECT 1
+        FROM ic_inventory_barcode b
+        WHERE b.ic_code = i.code
+          AND b.barcode ILIKE ${p}::text
+      )
+    )`)
+  }
+
+  const groupMain = clean(req.query.group_main)
+  if (groupMain) whereParts.push(`COALESCE(i.group_main, '') = ${addParam(groupMain)}::text`)
+
+  const apCode = clean(req.query.ap_code)
+  if (apCode) {
+    const p = addParam(apCode)
+    whereParts.push(`EXISTS (
+      SELECT 1
+      FROM ap_item_by_supplier link
+      WHERE link.ic_code = i.code
+        AND link.ap_code = ${p}::text
+    )`)
+  }
+
+  const icCodes = Array.isArray(req.query.ic_codes)
+    ? req.query.ic_codes.map(clean).filter(Boolean)
+    : []
+  if (icCodes.length) whereParts.push(`i.code = ANY(${addParam(icCodes)}::text[])`)
+
+  return { sql: `WHERE ${whereParts.join(' AND ')}`, params }
+}
+
+function buildPlanningMetricsSql({
+  whereSql,
+  startIndex = 1,
+  includePagination = true,
+  singleItem = false,
+  useDailyStock = true,
+  paginationMode = 'candidate',
+}) {
+  const offsetParam = `$${startIndex}`
+  const limitParam = `$${startIndex + 1}`
+  const itemParam = `$${startIndex}`
+  const finalPagination = includePagination && paginationMode === 'final'
+    ? `OFFSET ${offsetParam} LIMIT ${limitParam}`
+    : ''
+  const candidateLimit = includePagination && paginationMode !== 'final'
+    ? `ORDER BY i.code OFFSET ${offsetParam} LIMIT ${limitParam}`
+    : singleItem
+      ? `AND i.code = ${itemParam}::text ORDER BY i.code`
+      : 'ORDER BY i.code'
+  const stockDaysSql = useDailyStock
+    ? `
+    stock_days AS (
+      SELECT
+        ds.sales_date,
+        sb.ic_code,
+        sb.warehouse,
+        SUM(COALESCE(sb.balance_qty, 0)) AS stock_qty
+      FROM date_series ds
+      CROSS JOIN item_code_list icl
+      CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
+        ds.sales_date::date,
+        icl.codes::varchar,
+        $2::varchar,
+        ''::varchar
+      ) sb
+      GROUP BY ds.sales_date, sb.ic_code, sb.warehouse
+    ),`
+    : ''
+  const davgSql = useDailyStock
+    ? `
+    davg AS (
+      SELECT
+        c.ic_code,
+        COUNT(*) FILTER (WHERE COALESCE(sd.stock_qty, 0) > 0)::int AS active_stock_days,
+        COUNT(*) FILTER (WHERE COALESCE(sd.stock_qty, 0) <= 0)::int AS stockout_days,
+        COALESCE(
+          percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(sales.sales_qty, 0))
+            FILTER (WHERE COALESCE(sd.stock_qty, 0) > 0),
+          0
+        ) AS d_avg
+      FROM candidates c
+      CROSS JOIN date_series ds
+      LEFT JOIN stock_days sd
+        ON sd.ic_code = c.ic_code AND sd.sales_date = ds.sales_date AND sd.warehouse = $2::text
+      LEFT JOIN sales_daily sales
+        ON sales.ic_code = c.ic_code AND sales.sales_date = ds.sales_date
+      GROUP BY c.ic_code
+    )`
+    : `
+    davg AS (
+      SELECT
+        c.ic_code,
+        $3::int AS active_stock_days,
+        0::int AS stockout_days,
+        COALESCE(
+          percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(sales.sales_qty, 0)),
+          0
+        ) AS d_avg
+      FROM candidates c
+      CROSS JOIN date_series ds
+      LEFT JOIN sales_daily sales
+        ON sales.ic_code = c.ic_code AND sales.sales_date = ds.sales_date
+      GROUP BY c.ic_code
+    )`
+
+  return `
+    WITH candidates AS (
+      SELECT
+        i.code AS ic_code,
+        COALESCE(i.name_1, '') AS ic_name,
+        COALESCE(i.name_eng_1, '') AS ic_name_eng,
+        COALESCE(i.unit_standard, '') AS unit_code,
+        COALESCE(i.group_main, '') AS group_main,
+        COALESCE(i.supplier_code, '') AS legacy_supplier_code,
+        i.last_movement_date,
+        COALESCE(d.is_hold_sale, 0) AS is_hold_sale,
+        COALESCE(d.is_hold_purchase, 0) AS is_hold_purchase
+      FROM ic_inventory i
+      LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+      ${whereSql}
+      ${candidateLimit}
+    ),
+    item_code_list AS (
+      SELECT COALESCE(string_agg(ic_code, ',' ORDER BY ic_code), '') AS codes
+      FROM candidates
+    ),
+    date_series AS (
+      SELECT generate_series(
+        ($1::date - (($3::int - 1) || ' day')::interval)::date,
+        $1::date,
+        '1 day'::interval
+      )::date AS sales_date
+    ),
+    stock_balance AS (
+      SELECT
+        sb.ic_code,
+        sb.warehouse,
+        SUM(COALESCE(sb.balance_qty, 0)) AS balance_qty,
+        MAX(COALESCE(sb.average_cost_end, 0)) AS average_cost
+      FROM item_code_list icl
+      CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
+        $1::date,
+        icl.codes::varchar,
+        $2::varchar,
+        ''::varchar
+      ) sb
+      GROUP BY sb.ic_code, sb.warehouse
+    ),
+    ${stockDaysSql}
+    sales_daily AS (
+      SELECT
+        td.item_code AS ic_code,
+        td.doc_date::date AS sales_date,
+        SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS sales_qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag = 44
+        AND COALESCE(td.status, 0) = 0
+        AND td.doc_date::date BETWEEN ($1::date - (($3::int - 1) || ' day')::interval)::date AND $1::date
+      GROUP BY td.item_code, td.doc_date::date
+    ),
+    ${davgSql},
+    reserve_add AS (
+      SELECT td.doc_no, td.item_code AS ic_code, td.wh_code,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag = 34
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.wh_code, '') = $2::text
+      GROUP BY td.doc_no, td.item_code, td.wh_code
+    ),
+    reserve_reduce AS (
+      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code, td.wh_code,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag IN (36, 44, 39)
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.ref_doc_no, '') <> ''
+        AND COALESCE(td.wh_code, '') = $2::text
+      GROUP BY td.ref_doc_no, td.item_code, td.wh_code
+    ),
+    book_out AS (
+      SELECT a.ic_code, SUM(GREATEST(a.qty - COALESCE(r.qty, 0), 0)) AS book_out_qty
+      FROM reserve_add a
+      LEFT JOIN reserve_reduce r
+        ON r.doc_no = a.doc_no
+       AND r.ic_code = a.ic_code
+       AND r.wh_code = a.wh_code
+      GROUP BY a.ic_code
+    ),
+    sale_order_add AS (
+      SELECT td.doc_no, td.item_code AS ic_code, td.wh_code,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag = 36
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.wh_code, '') = $2::text
+      GROUP BY td.doc_no, td.item_code, td.wh_code
+    ),
+    sale_order_reduce AS (
+      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code, td.wh_code,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag IN (44, 37)
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.ref_doc_no, '') <> ''
+        AND COALESCE(td.wh_code, '') = $2::text
+      GROUP BY td.ref_doc_no, td.item_code, td.wh_code
+    ),
+    accrued_out AS (
+      SELECT a.ic_code, SUM(GREATEST(a.qty - COALESCE(r.qty, 0), 0)) AS accrued_out_qty
+      FROM sale_order_add a
+      LEFT JOIN sale_order_reduce r
+        ON r.doc_no = a.doc_no
+       AND r.ic_code = a.ic_code
+       AND r.wh_code = a.wh_code
+      GROUP BY a.ic_code
+    ),
+    po_lines AS (
+      SELECT
+        td.doc_no,
+        td.line_number,
+        td.item_code AS ic_code,
+        td.wh_code,
+        SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag = 6
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.wh_code, '') = $2::text
+      GROUP BY td.doc_no, td.line_number, td.item_code, td.wh_code
+    ),
+    po_reduce AS (
+      SELECT
+        td.ref_doc_no AS doc_no,
+        td.ref_row AS line_number,
+        td.item_code AS ic_code,
+        SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag IN (7, 12, 310)
+        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.ref_doc_no, '') <> ''
+      GROUP BY td.ref_doc_no, td.ref_row, td.item_code
+    ),
+    accrued_in AS (
+      SELECT
+        p.ic_code,
+        SUM(GREATEST(p.qty - COALESCE(r.qty, 0), 0)) AS accrued_in_qty
+      FROM po_lines p
+      LEFT JOIN po_reduce r
+        ON r.doc_no = p.doc_no
+       AND r.line_number = p.line_number
+       AND r.ic_code = p.ic_code
+      GROUP BY p.ic_code
+    ),
+    movement_3m AS (
+      SELECT
+        td.item_code AS ic_code,
+        SUM(CASE WHEN td.trans_flag = 12 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS purchase_qty_3m,
+        SUM(CASE WHEN td.trans_flag = 44 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS sale_qty_3m,
+        SUM(CASE WHEN td.trans_flag = 12 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS purchase_amount_3m,
+        SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS sale_amount_3m,
+        MAX(td.doc_date)::date AS last_doc_date
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag IN (12, 44)
+        AND COALESCE(td.status, 0) = 0
+        AND td.doc_date::date BETWEEN ($1::date - interval '90 day')::date AND $1::date
+      GROUP BY td.item_code
+    ),
+    latest_purchase AS (
+      SELECT DISTINCT ON (td.item_code, td.cust_code)
+        td.item_code AS ic_code,
+        td.cust_code AS ap_code,
+        td.price,
+        td.price_exclude_vat,
+        td.unit_code,
+        td.doc_no,
+        td.doc_date::date AS doc_date,
+        td.doc_time
+      FROM ic_trans_detail td
+      JOIN candidates c ON c.ic_code = td.item_code
+      WHERE td.trans_flag = 12
+        AND COALESCE(td.status, 0) = 0
+        AND COALESCE(td.item_code, '') <> ''
+        AND COALESCE(td.cust_code, '') <> ''
+      ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+    ),
+    supplier_options AS (
+      SELECT
+        link.ic_code,
+        link.ap_code,
+        COALESCE(s.name_1, '') AS ap_name,
+        lp.price AS last_purchase_price,
+        lp.price_exclude_vat AS last_purchase_price_exclude_vat,
+        COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
+        lp.doc_date AS last_purchase_date,
+        COALESCE(r.lead_time_days, 0) AS lead_time_days,
+        COALESCE(r.late_buffer_days, 0) AS late_buffer_days,
+        COALESCE(r.wholesale_buffer_days, 0) AS wholesale_buffer_days,
+        COALESCE(r.order_cycle_days, 0) AS order_cycle_days,
+        COALESCE(r.min_order_qty, 0) AS min_order_qty,
+        COALESCE(NULLIF(r.pack_size, 0), 1) AS pack_size,
+        COALESCE(r.purchase_unit_code, '') AS purchase_unit_code,
+        COALESCE(r.is_preferred, 0) AS is_preferred,
+        COUNT(*) OVER (PARTITION BY link.ic_code)::int AS supplier_count,
+        ROW_NUMBER() OVER (
+          PARTITION BY link.ic_code
+          ORDER BY
+            COALESCE(lp.price, 999999999999),
+            CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+            lp.doc_date DESC NULLS LAST,
+            link.ap_code
+        ) AS rn
+      FROM ap_item_by_supplier link
+      JOIN candidates c ON c.ic_code = link.ic_code
+      LEFT JOIN ap_supplier s ON s.code = link.ap_code
+      LEFT JOIN purchase_planning_item_supplier_resolved r
+        ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
+      LEFT JOIN latest_purchase lp
+        ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+      WHERE COALESCE(link.ic_code, '') <> ''
+        AND COALESCE(link.ap_code, '') <> ''
+        AND COALESCE(r.planning_enabled, 1) = 1
+        AND COALESCE(r.lead_time_days, 0) > 0
+        AND COALESCE(r.late_buffer_days, 0) > 0
+        AND COALESCE(r.wholesale_buffer_days, 0) > 0
+        AND COALESCE(r.order_cycle_days, 0) > 0
+    ),
+    chosen_supplier AS (
+      SELECT *
+      FROM supplier_options
+      WHERE rn = 1
+    ),
+    calculated AS (
+      SELECT
+        c.*,
+        COALESCE(sb.balance_qty, 0) AS balance_qty,
+        COALESCE(sb.average_cost, 0) AS average_cost,
+        COALESCE(ai.accrued_in_qty, 0) AS accrued_in_qty_calc,
+        COALESCE(bo.book_out_qty, 0) AS book_out_qty,
+        COALESCE(ao.accrued_out_qty, 0) AS accrued_out_qty_calc,
+        (COALESCE(sb.balance_qty, 0) + COALESCE(ai.accrued_in_qty, 0) - COALESCE(bo.book_out_qty, 0) - COALESCE(ao.accrued_out_qty, 0)) AS available_qty,
+        COALESCE(dv.d_avg, 0) AS d_avg,
+        COALESCE(dv.active_stock_days, 0) AS active_stock_days,
+        COALESCE(dv.stockout_days, 0) AS stockout_days,
+        COALESCE(m.purchase_qty_3m, 0) AS purchase_qty_3m,
+        COALESCE(m.sale_qty_3m, 0) AS sale_qty_3m,
+        COALESCE(m.purchase_amount_3m, 0) AS purchase_amount_3m,
+        COALESCE(m.sale_amount_3m, 0) AS sale_amount_3m,
+        GREATEST(COALESCE(c.last_movement_date, m.last_doc_date), COALESCE(m.last_doc_date, c.last_movement_date)) AS last_doc_date,
+        cs.ap_code,
+        cs.ap_name,
+        cs.last_purchase_price,
+        cs.last_purchase_price_exclude_vat,
+        cs.last_purchase_unit_code,
+        cs.last_purchase_date,
+        COALESCE(cs.lead_time_days, 0) AS lead_time_days,
+        COALESCE(cs.late_buffer_days, 0) AS late_buffer_days,
+        COALESCE(cs.wholesale_buffer_days, 0) AS wholesale_buffer_days,
+        COALESCE(cs.order_cycle_days, 0) AS order_cycle_days,
+        COALESCE(cs.min_order_qty, 0) AS min_order_qty,
+        COALESCE(NULLIF(cs.pack_size, 0), 1) AS pack_size,
+        COALESCE(cs.purchase_unit_code, '') AS purchase_unit_code,
+        COALESCE(cs.is_preferred, 0) AS is_preferred,
+        COALESCE(cs.supplier_count, 0) AS supplier_count
+      FROM candidates c
+      LEFT JOIN stock_balance sb ON sb.ic_code = c.ic_code AND sb.warehouse = $2::text
+      LEFT JOIN davg dv ON dv.ic_code = c.ic_code
+      LEFT JOIN accrued_in ai ON ai.ic_code = c.ic_code
+      LEFT JOIN book_out bo ON bo.ic_code = c.ic_code
+      LEFT JOIN accrued_out ao ON ao.ic_code = c.ic_code
+      LEFT JOIN movement_3m m ON m.ic_code = c.ic_code
+      LEFT JOIN chosen_supplier cs ON cs.ic_code = c.ic_code
+    ),
+    final_rows AS (
+      SELECT
+        *,
+        (d_avg * (lead_time_days + late_buffer_days + wholesale_buffer_days)) AS min_stock,
+        (d_avg * (lead_time_days + late_buffer_days + wholesale_buffer_days + order_cycle_days)) AS max_stock
+      FROM calculated
+    )
+    SELECT
+      *,
+      CASE
+        WHEN d_avg <= 0 AND sale_qty_3m <= 0 AND purchase_qty_3m <= 0 THEN 'inactive'
+        WHEN last_doc_date IS NULL OR last_doc_date < ($1::date - interval '60 day')::date THEN 'inactive'
+        WHEN active_stock_days < $3::int THEN 'insufficient_sales_days'
+        WHEN available_qty > max_stock THEN 'high'
+        WHEN available_qty <= min_stock THEN 'low'
+        ELSE 'normal'
+      END AS stock_status,
+      CASE
+        WHEN d_avg > 0 AND active_stock_days >= $3::int AND available_qty <= min_stock
+          THEN CEIL(GREATEST(max_stock - available_qty, min_order_qty, 0) / NULLIF(pack_size, 0)) * pack_size
+        ELSE 0
+      END AS suggest_qty,
+      CASE WHEN d_avg > 0 THEN available_qty / d_avg ELSE NULL END AS stock_cover_days
+    FROM final_rows
+    ORDER BY suggest_qty DESC NULLS LAST, ic_code
+  `
+}
+
+function summaryFromRows(rows) {
+  const summary = rows.reduce((acc, row) => {
+    const status = row.stock_status || 'unknown'
+    const apCode = clean(row.ap_code) || 'NO_SUPPLIER'
+    const apName = clean(row.ap_name) || 'ไม่ระบุเจ้าหนี้'
+    const suggestAmount = Number(row.suggest_qty || 0) * Number(row.last_purchase_price || 0)
+
+    acc.total += 1
+    acc[status] = (acc[status] || 0) + 1
+    acc.suggest_qty += Number(row.suggest_qty || 0)
+    acc.suggest_amount += suggestAmount
+
+    if (suggestAmount > 0) {
+      if (!acc.supplier_order_map[apCode]) {
+        acc.supplier_order_map[apCode] = {
+          ap_code: apCode,
+          ap_name: apName,
+          suggest_amount: 0,
+          suggest_qty: 0,
+        }
+      }
+      acc.supplier_order_map[apCode].suggest_amount += suggestAmount
+      acc.supplier_order_map[apCode].suggest_qty += Number(row.suggest_qty || 0)
+    }
+
+    if (!acc.stock_status_amount_map[status]) {
+      acc.stock_status_amount_map[status] = {
+        stock_status: status,
+        sale_amount_3m: 0,
+        purchase_amount_3m: 0,
+      }
+    }
+    acc.stock_status_amount_map[status].sale_amount_3m += Number(row.sale_amount_3m || 0)
+    acc.stock_status_amount_map[status].purchase_amount_3m += Number(row.purchase_amount_3m || 0)
+
+    if (Number(row.supplier_count || 0) > 0) acc.with_supplier += 1
+    else acc.without_supplier += 1
+    return acc
+  }, {
+    total: 0,
+    low: 0,
+    normal: 0,
+    high: 0,
+    inactive: 0,
+    insufficient_sales_days: 0,
+    suggest_qty: 0,
+    suggest_amount: 0,
+    with_supplier: 0,
+    without_supplier: 0,
+    supplier_order_map: {},
+    stock_status_amount_map: {},
+  })
+
+  const statusOrder = ['high', 'normal', 'low', 'insufficient_sales_days', 'inactive', 'unknown']
+  const supplierOrderChart = Object.values(summary.supplier_order_map)
+    .sort((a, b) => Number(b.suggest_amount || 0) - Number(a.suggest_amount || 0))
+    .slice(0, 10)
+  const stockStatusAmountChart = statusOrder
+    .filter((status) => summary.stock_status_amount_map[status])
+    .map((status) => summary.stock_status_amount_map[status])
+
+  delete summary.supplier_order_map
+  delete summary.stock_status_amount_map
+  return {
+    ...summary,
+    supplier_order_chart: supplierOrderChart,
+    stock_status_amount_chart: stockStatusAmountChart,
+  }
+}
+
+function sortPlanningRows(rows) {
+  return rows.sort((a, b) => {
+    const suggestDiff = Number(b.suggest_qty || 0) - Number(a.suggest_qty || 0)
+    if (suggestDiff !== 0) return suggestDiff
+    return String(a.ic_code || '').localeCompare(String(b.ic_code || ''))
+  })
+}
+
+async function runReportJob(job) {
+  try {
+    const options = job.options
+    const queryReq = { query: job.query }
+    const alertOnly = boolQuery(job.query.alert_only)
+    job.status = 'running'
+    job.updatedAt = Date.now()
+
+    const orderWhere = planningWhere(queryReq, 4)
+    const candidateResult = await posDB.query(
+      `WITH candidates AS (
+         SELECT
+           i.code AS ic_code
+         FROM ic_inventory i
+         LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+         ${orderWhere.sql}
+       ),
+       item_code_list AS (
+         SELECT COALESCE(string_agg(ic_code, ',' ORDER BY ic_code), '') AS codes
+         FROM candidates
+       ),
+       stock_balance AS (
+         SELECT
+           sb.ic_code,
+           sb.warehouse,
+           SUM(COALESCE(sb.balance_qty, 0)) AS balance_qty
+         FROM item_code_list icl
+         CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
+           $1::date,
+           icl.codes::varchar,
+           $3::varchar,
+           ''::varchar
+         ) sb
+         GROUP BY sb.ic_code, sb.warehouse
+       ),
+       po_lines AS (
+         SELECT
+           td.doc_no,
+           td.line_number,
+           td.item_code AS ic_code,
+           SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+         FROM ic_trans_detail td
+         JOIN candidates c ON c.ic_code = td.item_code
+         WHERE td.trans_flag = 6
+           AND COALESCE(td.last_status, 0) = 0
+           AND COALESCE(td.wh_code, '') = $3::text
+         GROUP BY td.doc_no, td.line_number, td.item_code
+       ),
+       po_reduce AS (
+         SELECT
+           td.ref_doc_no AS doc_no,
+           td.ref_row AS line_number,
+           td.item_code AS ic_code,
+           SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+         FROM ic_trans_detail td
+         JOIN candidates c ON c.ic_code = td.item_code
+         WHERE td.trans_flag IN (7, 12, 310)
+           AND COALESCE(td.last_status, 0) = 0
+           AND COALESCE(td.ref_doc_no, '') <> ''
+         GROUP BY td.ref_doc_no, td.ref_row, td.item_code
+       ),
+       accrued_in AS (
+         SELECT
+           p.ic_code,
+           SUM(GREATEST(p.qty - COALESCE(r.qty, 0), 0)) AS accrued_in_qty
+         FROM po_lines p
+         LEFT JOIN po_reduce r
+           ON r.doc_no = p.doc_no
+          AND r.line_number = p.line_number
+          AND r.ic_code = p.ic_code
+         GROUP BY p.ic_code
+       ),
+       sales_sort AS (
+         SELECT
+           td.item_code AS ic_code,
+           SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS sale_qty
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 44
+           AND COALESCE(td.status, 0) = 0
+           AND td.doc_date::date BETWEEN ($1::date - (($2::int - 1) || ' day')::interval)::date AND $1::date
+         GROUP BY td.item_code
+       )
+       SELECT c.ic_code
+       FROM candidates c
+       LEFT JOIN stock_balance sb ON sb.ic_code = c.ic_code AND sb.warehouse = $3::text
+       LEFT JOIN accrued_in ai ON ai.ic_code = c.ic_code
+       LEFT JOIN sales_sort ss ON ss.ic_code = c.ic_code
+       ORDER BY
+         GREATEST(
+           ((COALESCE(ss.sale_qty, 0) / NULLIF($2::numeric, 0)) * 4)
+             - (COALESCE(sb.balance_qty, 0) + COALESCE(ai.accrued_in_qty, 0)),
+           0
+         ) DESC,
+         COALESCE(ss.sale_qty, 0) DESC,
+         c.ic_code`,
+      [options.asOfDate, options.days, options.warehouse, ...orderWhere.params],
+    )
+
+    const codes = candidateResult.rows.map((row) => row.ic_code).filter(Boolean)
+    job.total = codes.length
+
+    for (let offset = 0; offset < codes.length; offset += job.batchSize) {
+      if (job.cancelled) return
+      const batchCodes = codes.slice(offset, offset + job.batchSize)
+      const batchReq = { query: { ...job.query, ic_codes: batchCodes } }
+      const where = planningWhere(batchReq, 4)
+      const startIndex = 4 + where.params.length
+      const result = await posDB.query(
+        buildPlanningMetricsSql({
+          whereSql: where.sql,
+          startIndex,
+          includePagination: false,
+          useDailyStock: true,
+        }),
+        [options.asOfDate, options.warehouse, options.days, ...where.params],
+      )
+      const rows = alertOnly
+        ? result.rows.filter((row) => row.stock_status === 'low')
+        : result.rows
+      job.rows.push(...rows)
+      job.processed = Math.min(codes.length, offset + batchCodes.length)
+      job.partialSummary = summaryFromRows(job.rows)
+      job.updatedAt = Date.now()
+    }
+
+    sortPlanningRows(job.rows)
+    job.summary = summaryFromRows(job.rows)
+    job.status = 'complete'
+    job.processed = job.total
+    job.updatedAt = Date.now()
+  } catch (err) {
+    job.status = 'failed'
+    job.error = err.message
+    job.updatedAt = Date.now()
+  }
+}
+
+router.get('/supplier-settings', async (req, res) => {
+  const { page, limit, offset } = pageParams(req)
+  const search = searchClause(req.query.search, ['s.code', 's.name_1'], 1)
+  const params = [...search.params]
+
+  try {
+    const countResult = await posDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM ap_supplier s
+       LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
+       WHERE COALESCE(s.code, '') <> ''${search.sql}`,
+      params,
+    )
+
+    const dataResult = await posDB.query(
+      `SELECT
+          s.code AS ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          p.lead_time_days,
+          p.late_buffer_days,
+          p.wholesale_buffer_days,
+          p.order_cycle_days,
+          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.remark, '') AS remark,
+          p.last_update_date_time
+       FROM ap_supplier s
+       LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
+       WHERE COALESCE(s.code, '') <> ''${search.sql}
+       ORDER BY s.code
+       OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+      [...params, offset, limit],
+    )
+
+    res.json({
+      data: dataResult.rows,
+      total: countResult.rows[0]?.total || 0,
+      page,
+      limit,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/supplier-settings/save/:apCode', async (req, res) => {
+  const apCode = clean(req.params.apCode)
+  const body = req.body || {}
+  const userCode = clean(req.user?.code)
+  if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
+
+  try {
+    const result = await posDB.query(
+      `INSERT INTO purchase_planning_supplier_setting (
+          ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+          planning_enabled, remark, create_code, last_update_code
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+       ON CONFLICT (ap_code) DO UPDATE SET
+          lead_time_days = EXCLUDED.lead_time_days,
+          late_buffer_days = EXCLUDED.late_buffer_days,
+          wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+          order_cycle_days = EXCLUDED.order_cycle_days,
+          planning_enabled = EXCLUDED.planning_enabled,
+          remark = EXCLUDED.remark,
+          last_update_code = EXCLUDED.last_update_code,
+          last_update_date_time = now()
+       RETURNING *`,
+      [
+        apCode,
+        toIntOrNull(body.lead_time_days),
+        toIntOrNull(body.late_buffer_days),
+        toIntOrNull(body.wholesale_buffer_days),
+        toIntOrNull(body.order_cycle_days),
+        Number(body.planning_enabled) === 0 ? 0 : 1,
+        clean(body.remark).slice(0, 255),
+        userCode,
+      ],
+    )
+    res.json({ success: true, data: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/supplier-settings/sync-from-purchase-history', async (req, res) => {
+  const body = req.body || {}
+  const dryRun = boolQuery(body.dry_run)
+  const fromDate = optionalDate(body.from_date)
+  const toDate = optionalDate(body.to_date)
+  const remark = clean(body.remark || 'sync from purchase history').slice(0, 255)
+  const userCode = clean(req.user?.code)
+  const cte = supplierHistoryCte({ fromDate, toDate, startIndex: 1 })
+
+  try {
+    if (dryRun) {
+      const previewResult = await posDB.query(
+        `${cte.sql}
+         SELECT ap_code, ap_name, latest_purchase_date, purchase_line_count,
+                COUNT(*) OVER()::int AS missing_count
+         FROM missing_suppliers
+         ORDER BY latest_purchase_date DESC NULLS LAST, ap_code
+         LIMIT 20`,
+        cte.params,
+      )
+      return res.json({
+        success: true,
+        dryRun: true,
+        missingCount: Number(previewResult.rows[0]?.missing_count || 0),
+        insertedCount: 0,
+        preview: previewResult.rows.map(({ missing_count, ...row }) => row),
+        fromDate,
+        toDate,
+      })
+    }
+
+    const result = await withPosTransaction((client) => client.query(
+      `${cte.sql},
+       inserted AS (
+         INSERT INTO purchase_planning_supplier_setting (
+           ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+           planning_enabled, remark, create_code, last_update_code
+         )
+         SELECT ap_code, 1, 1, 1, 1, 1, $${cte.params.length + 1}, $${cte.params.length + 2}, $${cte.params.length + 2}
+         FROM missing_suppliers
+         ORDER BY latest_purchase_date DESC NULLS LAST, ap_code
+         ON CONFLICT (ap_code) DO NOTHING
+         RETURNING ap_code
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM missing_suppliers) AS missing_count,
+         (SELECT COUNT(*)::int FROM inserted) AS inserted_count`,
+      [...cte.params, remark, userCode],
+    ))
+
+    res.json({
+      success: true,
+      dryRun: false,
+      missingCount: Number(result.rows[0]?.missing_count || 0),
+      insertedCount: Number(result.rows[0]?.inserted_count || 0),
+      preview: [],
+      fromDate,
+      toDate,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/item-settings', async (req, res) => {
+  const { page, limit, offset } = pageParams(req)
+  const search = searchClause(req.query.search, ['i.code', 'i.name_1', 'i.name_eng_1'], 1)
+  const params = [...search.params]
+
+  try {
+    const countResult = await posDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM ic_inventory i
+       LEFT JOIN purchase_planning_item_setting p ON p.ic_code = i.code
+       WHERE COALESCE(i.code, '') <> ''${search.sql}`,
+      params,
+    )
+
+    const dataResult = await posDB.query(
+      `SELECT
+          i.code AS ic_code,
+          COALESCE(i.name_1, '') AS ic_name,
+          COALESCE(i.unit_standard, '') AS unit_code,
+          COALESCE(d.is_hold_sale, 0) AS is_hold_sale,
+          COALESCE(d.is_hold_purchase, 0) AS is_hold_purchase,
+          p.lead_time_days,
+          p.late_buffer_days,
+          p.wholesale_buffer_days,
+          p.order_cycle_days,
+          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.remark, '') AS remark,
+          p.last_update_date_time
+       FROM ic_inventory i
+       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+       LEFT JOIN purchase_planning_item_setting p ON p.ic_code = i.code
+       WHERE COALESCE(i.code, '') <> ''${search.sql}
+       ORDER BY i.code
+       OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+      [...params, offset, limit],
+    )
+
+    res.json({
+      data: dataResult.rows,
+      total: countResult.rows[0]?.total || 0,
+      page,
+      limit,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/item-settings/save/:icCode', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  const body = req.body || {}
+  const userCode = clean(req.user?.code)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  try {
+    const result = await posDB.query(
+      `INSERT INTO purchase_planning_item_setting (
+          ic_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+          planning_enabled, remark, create_code, last_update_code
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+       ON CONFLICT (ic_code) DO UPDATE SET
+          lead_time_days = EXCLUDED.lead_time_days,
+          late_buffer_days = EXCLUDED.late_buffer_days,
+          wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+          order_cycle_days = EXCLUDED.order_cycle_days,
+          planning_enabled = EXCLUDED.planning_enabled,
+          remark = EXCLUDED.remark,
+          last_update_code = EXCLUDED.last_update_code,
+          last_update_date_time = now()
+       RETURNING *`,
+      [
+        icCode,
+        toIntOrNull(body.lead_time_days),
+        toIntOrNull(body.late_buffer_days),
+        toIntOrNull(body.wholesale_buffer_days),
+        toIntOrNull(body.order_cycle_days),
+        Number(body.planning_enabled) === 0 ? 0 : 1,
+        clean(body.remark).slice(0, 255),
+        userCode,
+      ],
+    )
+    res.json({ success: true, data: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/item-supplier-settings', async (req, res) => {
+  const { page, limit, offset } = pageParams(req)
+  const search = searchClause(req.query.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 1)
+  const params = [...search.params]
+
+  try {
+    const countResult = await posDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM (
+         SELECT DISTINCT link.ic_code, link.ap_code
+         FROM ap_item_by_supplier link
+         LEFT JOIN ic_inventory i ON i.code = link.ic_code
+         LEFT JOIN ap_supplier s ON s.code = link.ap_code
+         WHERE COALESCE(link.ic_code, '') <> ''
+           AND COALESCE(link.ap_code, '') <> ''${search.sql}
+       ) x`,
+      params,
+    )
+
+    const dataResult = await posDB.query(
+      `WITH latest_price AS (
+         SELECT DISTINCT ON (item_code, cust_code)
+           item_code AS ic_code,
+           cust_code AS ap_code,
+           price,
+           unit_code,
+           doc_date,
+           doc_time
+         FROM ic_trans_detail
+         WHERE trans_flag = 12
+           AND COALESCE(status, 0) = 0
+           AND COALESCE(item_code, '') <> ''
+           AND COALESCE(cust_code, '') <> ''
+         ORDER BY item_code, cust_code, doc_date DESC, doc_time DESC, doc_no DESC
+       )
+       SELECT DISTINCT ON (link.ic_code, link.ap_code)
+          link.ic_code,
+          COALESCE(i.name_1, '') AS ic_name,
+          COALESCE(i.unit_standard, '') AS item_unit_code,
+          link.ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          lp.price AS last_purchase_price,
+          COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
+          lp.doc_date AS last_purchase_date,
+          p.lead_time_days,
+          p.late_buffer_days,
+          p.wholesale_buffer_days,
+          p.order_cycle_days,
+          COALESCE(p.min_order_qty, 0) AS min_order_qty,
+          COALESCE(NULLIF(p.pack_size, 0), 1) AS pack_size,
+          COALESCE(p.purchase_unit_code, '') AS purchase_unit_code,
+          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.is_preferred, 0) AS is_preferred,
+          COALESCE(p.remark, '') AS remark,
+          p.last_update_date_time
+       FROM ap_item_by_supplier link
+       LEFT JOIN ic_inventory i ON i.code = link.ic_code
+       LEFT JOIN ap_supplier s ON s.code = link.ap_code
+       LEFT JOIN purchase_planning_item_supplier_setting p
+         ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
+       LEFT JOIN latest_price lp
+         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+       WHERE COALESCE(link.ic_code, '') <> ''
+         AND COALESCE(link.ap_code, '') <> ''${search.sql}
+       ORDER BY link.ic_code, link.ap_code
+       OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+      [...params, offset, limit],
+    )
+
+    res.json({
+      data: dataResult.rows,
+      total: countResult.rows[0]?.total || 0,
+      page,
+      limit,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/item-supplier-settings/save', async (req, res) => {
+  const body = req.body || {}
+  const icCode = clean(body.ic_code)
+  const apCode = clean(body.ap_code)
+  const userCode = clean(req.user?.code)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+  if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
+
+  const minOrderQty = Math.max(0, toNumber(body.min_order_qty, 0))
+  const packSize = Math.max(0.000001, toNumber(body.pack_size, 1))
+
+  try {
+    const result = await posDB.query(
+      `INSERT INTO purchase_planning_item_supplier_setting (
+          ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+          min_order_qty, pack_size, purchase_unit_code, planning_enabled, is_preferred,
+          remark, create_code, last_update_code
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+       ON CONFLICT (ic_code, ap_code) DO UPDATE SET
+          lead_time_days = EXCLUDED.lead_time_days,
+          late_buffer_days = EXCLUDED.late_buffer_days,
+          wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+          order_cycle_days = EXCLUDED.order_cycle_days,
+          min_order_qty = EXCLUDED.min_order_qty,
+          pack_size = EXCLUDED.pack_size,
+          purchase_unit_code = EXCLUDED.purchase_unit_code,
+          planning_enabled = EXCLUDED.planning_enabled,
+          is_preferred = EXCLUDED.is_preferred,
+          remark = EXCLUDED.remark,
+          last_update_code = EXCLUDED.last_update_code,
+          last_update_date_time = now()
+       RETURNING *`,
+      [
+        icCode,
+        apCode,
+        toIntOrNull(body.lead_time_days),
+        toIntOrNull(body.late_buffer_days),
+        toIntOrNull(body.wholesale_buffer_days),
+        toIntOrNull(body.order_cycle_days),
+        minOrderQty,
+        packSize,
+        clean(body.purchase_unit_code).slice(0, 25),
+        Number(body.planning_enabled) === 0 ? 0 : 1,
+        Number(body.is_preferred) === 1 ? 1 : 0,
+        clean(body.remark).slice(0, 255),
+        userCode,
+      ],
+    )
+    res.json({ success: true, data: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/item-supplier-settings/sync-from-purchase-history', async (req, res) => {
+  const body = req.body || {}
+  const dryRun = boolQuery(body.dry_run)
+  const fromDate = optionalDate(body.from_date)
+  const toDate = optionalDate(body.to_date)
+  const remark = clean(body.remark || 'sync from purchase history').slice(0, 255)
+  const cte = itemSupplierHistoryCte({ fromDate, toDate, startIndex: 1 })
+
+  try {
+    if (dryRun) {
+      const previewResult = await posDB.query(
+        `${cte.sql}
+         SELECT ic_code, ic_name, ap_code, ap_name, latest_purchase_date, purchase_line_count,
+                COUNT(*) OVER()::int AS missing_count
+         FROM missing_pairs
+         ORDER BY latest_purchase_date DESC NULLS LAST, ic_code, ap_code
+         LIMIT 20`,
+        cte.params,
+      )
+      return res.json({
+        success: true,
+        dryRun: true,
+        missingCount: Number(previewResult.rows[0]?.missing_count || 0),
+        insertedCount: 0,
+        preview: previewResult.rows.map(({ missing_count, max_line_number, ...row }) => row),
+        fromDate,
+        toDate,
+      })
+    }
+
+    const result = await withPosTransaction((client) => client.query(
+      `${cte.sql},
+       inserted AS (
+         INSERT INTO ap_item_by_supplier (ap_code, ic_code, remark, status, line_number)
+         SELECT
+           ap_code,
+           ic_code,
+           $${cte.params.length + 1},
+           0,
+           max_line_number + ROW_NUMBER() OVER (
+             PARTITION BY ic_code
+             ORDER BY latest_purchase_date DESC NULLS LAST, ap_code
+           )
+         FROM missing_pairs
+         ORDER BY ic_code, latest_purchase_date DESC NULLS LAST, ap_code
+         RETURNING ic_code, ap_code
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM missing_pairs) AS missing_count,
+         (SELECT COUNT(*)::int FROM inserted) AS inserted_count`,
+      [...cte.params, remark],
+    ))
+
+    res.json({
+      success: true,
+      dryRun: false,
+      missingCount: Number(result.rows[0]?.missing_count || 0),
+      insertedCount: Number(result.rows[0]?.inserted_count || 0),
+      preview: [],
+      fromDate,
+      toDate,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/report', async (req, res) => {
+  const { page, limit, offset } = pageParams(req)
+  const options = planningOptions(req)
+  const countWhere = planningWhere(req, 1)
+  const where = planningWhere(req, 4)
+  const startIndex = 4 + where.params.length
+
+  try {
+    const countResult = await posDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM ic_inventory i
+       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+       ${countWhere.sql}`,
+      countWhere.params,
+    )
+
+    const rowsResult = await posDB.query(
+      buildPlanningMetricsSql({ whereSql: where.sql, startIndex, includePagination: true }),
+      [options.asOfDate, options.warehouse, options.days, ...where.params, offset, limit],
+    )
+
+    res.json({
+      data: rowsResult.rows,
+      total: countResult.rows[0]?.total || 0,
+      page,
+      limit,
+      options,
+      summary: summaryFromRows(rowsResult.rows),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/report-lazy', async (req, res) => {
+  pruneReportJobs()
+  const body = req.body || {}
+  const query = takeParams(body, ['search', 'days', 'as_of_date', 'warehouse', 'group_main', 'ap_code', 'alert_only'])
+  const batchSize = Math.min(10, Math.max(1, parseInt(body.batch_size, 10) || 5))
+  const key = reportJobKey(req.user?.code, query)
+
+  try {
+    const existing = reportJobs.get(key)
+    if (existing && existing.status !== 'failed') {
+      existing.updatedAt = Date.now()
+      return res.json({
+        job_id: existing.id,
+        status: existing.status,
+        total: existing.total,
+        processed: existing.processed,
+        options: existing.options,
+      })
+    }
+
+    const queryReq = { query }
+    const countWhere = planningWhere(queryReq, 1)
+    const options = planningOptions(queryReq)
+    const countResult = await posDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM ic_inventory i
+       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+       ${countWhere.sql}`,
+      countWhere.params,
+    )
+
+    const id = key
+    const job = {
+      id,
+      query,
+      options,
+      batchSize,
+      total: Number(countResult.rows[0]?.total || 0),
+      processed: 0,
+      rows: [],
+      summary: summaryFromRows([]),
+      partialSummary: summaryFromRows([]),
+      status: 'queued',
+      error: '',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      cancelled: false,
+    }
+    reportJobs.set(id, job)
+    setImmediate(() => runReportJob(job))
+
+    res.json({
+      job_id: id,
+      status: job.status,
+      total: job.total,
+      processed: job.processed,
+      options,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/report-lazy/:jobId', async (req, res) => {
+  pruneReportJobs()
+  const job = reportJobs.get(clean(req.params.jobId))
+  if (!job) return res.status(404).json({ error: 'ไม่พบงานคำนวณรายงาน กรุณาโหลดใหม่' })
+
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0)
+  const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 30))
+  const rows = job.status === 'complete'
+    ? job.rows.slice(offset, offset + limit)
+    : sortPlanningRows([...job.rows]).slice(offset, offset + limit)
+
+  job.updatedAt = Date.now()
+  res.json({
+    job_id: job.id,
+    status: job.status,
+    error: job.error,
+    data: rows,
+    total: job.total,
+    processed: job.processed,
+    offset,
+    limit,
+    has_more: job.status === 'complete' ? offset + rows.length < job.rows.length : true,
+    summary: job.status === 'complete' ? job.summary : null,
+    partial_summary: job.partialSummary,
+    options: job.options,
+  })
+})
+
+router.get('/items/:icCode/suppliers', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  const options = planningOptions(req)
+  const baseReq = { query: { ...req.query, search: '' } }
+  const where = planningWhere(baseReq, 4)
+  const metricSql = buildPlanningMetricsSql({ whereSql: where.sql, startIndex: 4 + where.params.length, includePagination: false, singleItem: true })
+
+  try {
+    const metricResult = await posDB.query(
+      metricSql,
+      [options.asOfDate, options.warehouse, options.days, ...where.params, icCode],
+    )
+    if (!metricResult.rows.length) return res.status(404).json({ error: 'ไม่พบสินค้า' })
+    const metric = metricResult.rows[0]
+
+    const supplierResult = await posDB.query(
+      `WITH latest_purchase AS (
+         SELECT DISTINCT ON (td.item_code, td.cust_code)
+           td.item_code AS ic_code,
+           td.cust_code AS ap_code,
+           td.price,
+           td.price_exclude_vat,
+           td.unit_code,
+           td.doc_no,
+           td.doc_date::date AS doc_date,
+           td.doc_time
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 12
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = $1::text
+           AND COALESCE(td.cust_code, '') <> ''
+         ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+       )
+       SELECT
+         link.ic_code,
+         link.ap_code,
+         COALESCE(s.name_1, '') AS ap_name,
+         lp.price AS last_purchase_price,
+         lp.price_exclude_vat AS last_purchase_price_exclude_vat,
+         COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
+         lp.doc_no AS last_purchase_doc_no,
+         lp.doc_date AS last_purchase_date,
+         COALESCE(r.lead_time_days, 0) AS lead_time_days,
+         COALESCE(r.late_buffer_days, 0) AS late_buffer_days,
+         COALESCE(r.wholesale_buffer_days, 0) AS wholesale_buffer_days,
+         COALESCE(r.order_cycle_days, 0) AS order_cycle_days,
+         COALESCE(r.min_order_qty, 0) AS min_order_qty,
+         COALESCE(NULLIF(r.pack_size, 0), 1) AS pack_size,
+         COALESCE(r.purchase_unit_code, '') AS purchase_unit_code,
+         COALESCE(r.is_preferred, 0) AS is_preferred,
+         ROW_NUMBER() OVER (
+           ORDER BY
+             COALESCE(lp.price, 999999999999),
+             CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+             lp.doc_date DESC NULLS LAST,
+             link.ap_code
+         ) AS rank_no
+       FROM ap_item_by_supplier link
+       LEFT JOIN ap_supplier s ON s.code = link.ap_code
+       LEFT JOIN purchase_planning_item_supplier_resolved r
+         ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
+       LEFT JOIN latest_purchase lp
+         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+       WHERE link.ic_code = $1::text
+         AND COALESCE(link.ap_code, '') <> ''
+         AND COALESCE(r.planning_enabled, 1) = 1
+         AND COALESCE(r.lead_time_days, 0) > 0
+         AND COALESCE(r.late_buffer_days, 0) > 0
+         AND COALESCE(r.wholesale_buffer_days, 0) > 0
+         AND COALESCE(r.order_cycle_days, 0) > 0
+       ORDER BY rank_no, link.ap_code`,
+      [icCode],
+    )
+
+    const suppliers = supplierResult.rows.map((supplier) => {
+      const lead = Number(supplier.lead_time_days || 0)
+      const late = Number(supplier.late_buffer_days || 0)
+      const wholesale = Number(supplier.wholesale_buffer_days || 0)
+      const cycle = Number(supplier.order_cycle_days || 0)
+      const dAvg = Number(metric.d_avg || 0)
+      const available = Number(metric.available_qty || 0)
+      const minStock = dAvg * (lead + late + wholesale)
+      const maxStock = dAvg * (lead + late + wholesale + cycle)
+      const packSize = Math.max(Number(supplier.pack_size || 1), 0.000001)
+      const minOrderQty = Math.max(Number(supplier.min_order_qty || 0), 0)
+      const hasEnoughSalesDays = Number(metric.active_stock_days || 0) >= Number(options.days || 30)
+      const suggestQty = dAvg > 0 && hasEnoughSalesDays && available <= minStock
+        ? Math.ceil(Math.max(maxStock - available, minOrderQty, 0) / packSize) * packSize
+        : 0
+      return {
+        ...supplier,
+        min_stock: minStock,
+        max_stock: maxStock,
+        suggest_qty: suggestQty,
+        suggest_amount: suggestQty * Number(supplier.last_purchase_price || 0),
+        is_default: Number(supplier.rank_no) === 1 ? 1 : 0,
+      }
+    })
+
+    res.json({ item: metric, data: suppliers, options })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/items/:icCode/detail', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  const options = planningOptions(req)
+  const baseReq = { query: { ...req.query, search: '' } }
+  const where = planningWhere(baseReq, 4)
+  const metricSql = buildPlanningMetricsSql({ whereSql: where.sql, startIndex: 4 + where.params.length, includePagination: false, singleItem: true })
+
+  try {
+    const [metricResult, barcodeResult, purchaseResult, salesTotalResult, topCustomerResult, chartResult, pendingResult, supplierResult] = await Promise.all([
+      posDB.query(metricSql, [options.asOfDate, options.warehouse, options.days, ...where.params, icCode]),
+      posDB.query(
+        `SELECT barcode, COALESCE(unit_code, '') AS unit_code
+         FROM ic_inventory_barcode
+         WHERE ic_code = $1::text
+         ORDER BY barcode
+         LIMIT 20`,
+        [icCode],
+      ),
+      posDB.query(
+        `SELECT
+           td.doc_date::date AS doc_date,
+           td.doc_time,
+           td.doc_no,
+           td.cust_code AS ap_code,
+           COALESCE(s.name_1, '') AS ap_name,
+           td.barcode,
+           td.unit_code,
+           td.qty,
+           td.price,
+           td.price_exclude_vat,
+           td.sum_amount,
+           td.sum_amount_exclude_vat,
+           td.average_cost
+         FROM ic_trans_detail td
+         LEFT JOIN ap_supplier s ON s.code = td.cust_code
+         WHERE td.trans_flag = 12
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = $1::text
+         ORDER BY td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         LIMIT 5`,
+        [icCode],
+      ),
+      posDB.query(
+        `SELECT
+           COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '29 day'), 0) AS qty_30,
+           COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '89 day'), 0) AS qty_90,
+           COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '179 day'), 0) AS qty_180,
+           COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS qty_365,
+           COALESCE(SUM(td.sum_amount) FILTER (WHERE td.doc_date::date >= $2::date - interval '29 day'), 0) AS amount_30,
+           COALESCE(SUM(td.sum_amount) FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS amount_365
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 44
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = $1::text
+           AND td.doc_date::date BETWEEN $2::date - interval '364 day' AND $2::date`,
+        [icCode, options.asOfDate],
+      ),
+      posDB.query(
+        `SELECT
+           COALESCE(td.cust_code, '') AS cust_code,
+           SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty,
+           SUM(td.sum_amount) AS amount,
+           MAX(td.doc_date)::date AS last_sale_date
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 44
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = $1::text
+           AND td.doc_date::date BETWEEN $2::date - interval '364 day' AND $2::date
+         GROUP BY td.cust_code
+         ORDER BY qty DESC NULLS LAST
+         LIMIT 10`,
+        [icCode, options.asOfDate],
+      ),
+      posDB.query(
+        `WITH days AS (
+           SELECT generate_series($2::date - interval '89 day', $2::date, '1 day'::interval)::date AS doc_date
+         ),
+         move AS (
+           SELECT
+             td.doc_date::date AS doc_date,
+             SUM(CASE WHEN td.trans_flag = 44 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS sale_qty,
+             SUM(CASE WHEN td.trans_flag = 12 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS purchase_qty,
+             SUM(CASE WHEN td.trans_flag = 48 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS credit_note_qty
+           FROM ic_trans_detail td
+           WHERE td.trans_flag IN (12, 44, 48)
+             AND COALESCE(td.status, 0) = 0
+             AND td.item_code = $1::text
+             AND td.doc_date::date BETWEEN $2::date - interval '89 day' AND $2::date
+           GROUP BY td.doc_date::date
+         )
+         SELECT
+           days.doc_date,
+           COALESCE(move.sale_qty, 0) AS sale_qty,
+           COALESCE(move.purchase_qty, 0) AS purchase_qty,
+           COALESCE(move.credit_note_qty, 0) AS credit_note_qty
+         FROM days
+         LEFT JOIN move ON move.doc_date = days.doc_date
+         ORDER BY days.doc_date`,
+        [icCode, options.asOfDate],
+      ),
+      posDB.query(
+        `SELECT
+           td.doc_date::date AS doc_date,
+           td.doc_no,
+           td.cust_code AS ap_code,
+           COALESCE(s.name_1, '') AS ap_name,
+           td.qty,
+           td.unit_code,
+           td.ref_doc_no,
+           GREATEST(($2::date - td.doc_date::date), 0)::int AS waiting_days
+         FROM ic_trans_detail td
+         LEFT JOIN ap_supplier s ON s.code = td.cust_code
+         WHERE td.trans_flag = 6
+           AND COALESCE(td.last_status, 0) = 0
+           AND td.item_code = $1::text
+         ORDER BY td.doc_date DESC, td.doc_time DESC
+         LIMIT 20`,
+        [icCode, options.asOfDate],
+      ),
+      posDB.query(
+        `WITH latest_purchase AS (
+           SELECT DISTINCT ON (td.item_code, td.cust_code)
+             td.item_code AS ic_code,
+             td.cust_code AS ap_code,
+             td.price,
+             td.unit_code,
+             td.doc_date::date AS doc_date,
+             td.doc_time
+           FROM ic_trans_detail td
+           WHERE td.trans_flag = 12
+             AND COALESCE(td.status, 0) = 0
+             AND td.item_code = $1::text
+             AND COALESCE(td.cust_code, '') <> ''
+           ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         )
+         SELECT
+           link.ap_code,
+           COALESCE(s.name_1, '') AS ap_name,
+           lp.price AS last_purchase_price,
+           lp.unit_code AS last_purchase_unit_code,
+           lp.doc_date AS last_purchase_date,
+           COALESCE(r.lead_time_days, 0) AS lead_time_days,
+           COALESCE(r.late_buffer_days, 0) AS late_buffer_days,
+           COALESCE(r.wholesale_buffer_days, 0) AS wholesale_buffer_days,
+           COALESCE(r.order_cycle_days, 0) AS order_cycle_days,
+           COALESCE(r.min_order_qty, 0) AS min_order_qty,
+           COALESCE(NULLIF(r.pack_size, 0), 1) AS pack_size,
+           COALESCE(r.is_preferred, 0) AS is_preferred
+         FROM ap_item_by_supplier link
+         LEFT JOIN ap_supplier s ON s.code = link.ap_code
+         LEFT JOIN purchase_planning_item_supplier_resolved r
+           ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
+         LEFT JOIN latest_purchase lp
+           ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+         WHERE link.ic_code = $1::text
+           AND COALESCE(r.planning_enabled, 1) = 1
+           AND COALESCE(r.lead_time_days, 0) > 0
+           AND COALESCE(r.late_buffer_days, 0) > 0
+           AND COALESCE(r.wholesale_buffer_days, 0) > 0
+           AND COALESCE(r.order_cycle_days, 0) > 0
+         ORDER BY COALESCE(lp.price, 999999999999),
+                  CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+                  link.ap_code`,
+        [icCode],
+      ),
+    ])
+
+    if (!metricResult.rows.length) return res.status(404).json({ error: 'ไม่พบสินค้า' })
+
+    const item = metricResult.rows[0]
+    res.json({
+      item: {
+        ...item,
+        image_url: `/api/products/images/primary?item_code=${encodeURIComponent(icCode)}`,
+      },
+      barcodes: barcodeResult.rows,
+      last_purchases: purchaseResult.rows,
+      sales_totals: salesTotalResult.rows[0] || {},
+      top_customers: topCustomerResult.rows,
+      movement_chart: chartResult.rows,
+      pending_receive: pendingResult.rows,
+      suppliers: supplierResult.rows,
+      options,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /purchase-planning/trigger-alert — manual trigger สำหรับทดสอบ (admin/SUPERADMIN เท่านั้น)
+router.post('/trigger-alert', requireRole('admin', 'manager'), async (req, res) => {
+  const user = req.user || {}
+  const role = (user.role || '').toLowerCase()
+  const code = (user.code || '').toUpperCase()
+  if (role !== 'admin' && code !== 'SUPERADMIN') {
+    return res.status(403).json({ error: 'เฉพาะ admin เท่านั้น' })
+  }
+
+  try {
+    const { runPurchaseAlert } = require('../services/cronJobs')
+    const today = new Date().toISOString().slice(0, 10)
+    const result = await runPurchaseAlert({ todayStr: today, skipDedup: true })
+    res.json({ success: true, ...result })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.buildPlanningMetricsSql = buildPlanningMetricsSql
+router.runReportJob = runReportJob
+
+module.exports = router

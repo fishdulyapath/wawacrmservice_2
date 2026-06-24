@@ -4,6 +4,92 @@ const lineService = require('./lineService')
 const { notify } = require('./notifyService')
 const { syncAllFleetSheets } = require('./fleetSync')
 const { runDueFollowups } = require('./followupRunner')
+const purchasePlanningRoute = require('../routes/purchasePlanning')
+
+const PURCHASE_ALERT_WAREHOUSE = process.env.PURCHASE_ALERT_WAREHOUSE || 'MMA01'
+const PURCHASE_ALERT_DAYS = Number(process.env.PURCHASE_ALERT_DAYS || 30)
+const PURCHASE_ALERT_LIMIT = Number(process.env.PURCHASE_ALERT_LIMIT || 50)
+const PURCHASE_ALERT_BATCH_SIZE = Number(process.env.PURCHASE_ALERT_BATCH_SIZE || 100)
+
+// ─── Purchase Alert: shared logic ────────────────────────────────────────────
+// ใช้ได้ทั้ง cron daily และ manual trigger ผ่าน API
+async function runPurchaseAlert({ todayStr, skipDedup = false } = {}) {
+  const TZ = 'Asia/Bangkok'
+  if (!todayStr) {
+    todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date())
+  }
+
+  const usersResult = await crmDB.query(`
+    SELECT id AS user_id, code AS user_code, name AS user_name, line_user_id
+    FROM crm_users u
+    WHERE u.is_active = TRUE
+      AND COALESCE(u.purchase_alert_notify_enabled, FALSE) = TRUE
+      AND (u.role = 'admin' OR UPPER(COALESCE(u.code, '')) = 'SUPERADMIN')
+      ${skipDedup ? '' : `AND NOT EXISTS (
+        SELECT 1 FROM crm_line_message_log lg
+        WHERE lg.user_id = u.id
+          AND lg.message_type = 'purchase_reorder_alert'
+          AND lg.success = TRUE
+          AND lg.sent_at >= $1::date
+          AND lg.sent_at <  ($1::date + INTERVAL '1 day')
+      )`}
+  `, [todayStr])
+
+  if (!usersResult.rows.length) return { sent: 0, itemCount: 0, skipped: true }
+
+  const job = {
+    query: { alert_only: '1' },
+    options: {
+      asOfDate: todayStr,
+      warehouse: PURCHASE_ALERT_WAREHOUSE,
+      days: PURCHASE_ALERT_DAYS,
+    },
+    batchSize: PURCHASE_ALERT_BATCH_SIZE,
+    rows: [],
+    processed: 0,
+    total: 0,
+    cancelled: false,
+  }
+
+  await purchasePlanningRoute.runReportJob(job)
+  if (job.status !== 'complete') {
+    throw new Error(job.error || 'purchase planning alert job failed')
+  }
+
+  const alertRows = (job.rows || []).filter(row => Number(row.suggest_qty || 0) > 0)
+  const totalCount = alertRows.length
+  const rows = alertRows.slice(0, PURCHASE_ALERT_LIMIT)
+
+  if (!rows.length) return { sent: 0, itemCount: 0, skipped: false }
+
+  // ── ส่ง LINE ให้แต่ละ user ──
+  for (const user of usersResult.rows) {
+    if (user.line_user_id) {
+      await lineService.sendPurchaseReorderAlert(user, rows, {
+        totalCount,
+        asOfDate: todayStr,
+        warehouse: PURCHASE_ALERT_WAREHOUSE,
+        days: PURCHASE_ALERT_DAYS,
+        limit: PURCHASE_ALERT_LIMIT,
+      }).catch(e => console.error(`[PurchaseAlert] LINE ส่งไม่ได้: ${user.user_code}`, e.message))
+    }
+
+    // ── CRM in-app notification (ทุก user ที่เปิด alert) ──
+    await notify({
+      userId: user.user_id,
+      notiType: 'purchase_reorder_alert',
+      title: `มีสินค้าถึงจุดสั่งซื้อ ${totalCount} รายการ`,
+      message: `คลัง ${PURCHASE_ALERT_WAREHOUSE} วันที่ ${todayStr}`,
+      refType: 'purchase_planning',
+      linkUrl: '/purchase-planning/alerts',
+    }).catch(e => console.error(`[PurchaseAlert] CRM notify ไม่ได้: ${user.user_code}`, e.message))
+  }
+
+  console.log(`[PurchaseAlert] ส่ง ${usersResult.rows.length} คน, สินค้าถึงจุดสั่งซื้อ ${totalCount} รายการ (${todayStr})`)
+  return { sent: usersResult.rows.length, itemCount: totalCount, skipped: false }
+}
 
 /**
  * เริ่ม Cron Jobs ทั้งหมดของระบบ LINE
@@ -36,6 +122,7 @@ function start() {
   // ป้องกัน cron 2 tick ภายใน 1 นาทีเดียวกัน
   let lastDailySentRunKey = ''
   let lastAutoFollowupRunKey = ''
+  let purchaseAlertRunning = false
 
   // ── 1. Daily Summary: ทุกนาที ตรวจว่าถึงเวลาส่งไหม ──
   cron.schedule('* * * * *', async () => {
@@ -75,6 +162,20 @@ function start() {
       }
     } catch (err) {
       console.error('[Cron Daily Error]', err.message)
+    }
+  }, cronOpts)
+
+  // ── 1.1 Purchase Reorder Alert: ทุกวัน 08:00 น. (fix — ไม่ configurable) ──
+  cron.schedule('0 8 * * *', async () => {
+    if (purchaseAlertRunning) return
+    purchaseAlertRunning = true
+    try {
+      const todayStr = bangkokDate()
+      await runPurchaseAlert({ todayStr, skipDedup: false })
+    } catch (err) {
+      console.error('[Cron PurchaseAlert Error]', err.message)
+    } finally {
+      purchaseAlertRunning = false
     }
   }, cronOpts)
 
@@ -455,4 +556,4 @@ function start() {
   }, cronOpts)
 }
 
-module.exports = { start }
+module.exports = { start, runPurchaseAlert }

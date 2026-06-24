@@ -8,7 +8,7 @@ const router = express.Router()
 const PRODUCT_CODE_PATTERN = /^[A-Z0-9_-]+$/
 const PRODUCT_IMAGE_CACHE_CONTROL = 'private, max-age=0, must-revalidate'
 
-router.use(authMiddleware, requireRole('admin', 'manager'))
+router.use(authMiddleware, requireRole('admin'))
 
 function activeProductCondition(alias = 'd') {
   return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`

@@ -15,6 +15,10 @@ function normalizeHHMM(value, fallback) {
   return HHMM_RE.test(text) ? text : null
 }
 
+function isAdminUp(user = {}) {
+  return String(user.code || '').toUpperCase() === 'SUPERADMIN' || user.role === 'admin'
+}
+
 // ─────────────────────────────────────────────────────────────
 // Middleware: ตรวจ LINE Signature
 // ─────────────────────────────────────────────────────────────
@@ -300,7 +304,8 @@ router.get('/status', authMiddleware, async (req, res) => {
     const result = await crmDB.query(`
       SELECT line_user_id, line_display_name, line_picture_url,
              line_linked_at, line_notify_enabled, line_notify_time,
-             overdue_notify_time, due_tomorrow_notify_time
+             overdue_notify_time, due_tomorrow_notify_time,
+             purchase_alert_notify_enabled, purchase_alert_notify_time
       FROM crm_users WHERE id=$1
     `, [req.user.id])
     const u = result.rows[0]
@@ -312,7 +317,10 @@ router.get('/status', authMiddleware, async (req, res) => {
       notify_enabled:    u.line_notify_enabled,
       notify_time:       u.line_notify_time,
       overdue_notify_time:      u.overdue_notify_time,
-      due_tomorrow_notify_time: u.due_tomorrow_notify_time
+      due_tomorrow_notify_time: u.due_tomorrow_notify_time,
+      purchase_alert_notify_enabled: u.purchase_alert_notify_enabled,
+      purchase_alert_notify_time: u.purchase_alert_notify_time,
+      can_configure_purchase_alerts: isAdminUp(req.user)
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -323,23 +331,52 @@ router.get('/status', authMiddleware, async (req, res) => {
 // PUT /api/line/settings  — ตั้งค่า Notification
 // ─────────────────────────────────────────────────────────────
 router.put('/settings', authMiddleware, async (req, res) => {
-  const { notify_enabled, notify_time, overdue_notify_time, due_tomorrow_notify_time } = req.body
+  const {
+    notify_enabled,
+    notify_time,
+    overdue_notify_time,
+    due_tomorrow_notify_time,
+    purchase_alert_notify_enabled,
+    purchase_alert_notify_time,
+  } = req.body
   const dailyTime = normalizeHHMM(notify_time, '08:00')
   const overdueTime = normalizeHHMM(overdue_notify_time, '08:00')
   const dueTomorrowTime = normalizeHHMM(due_tomorrow_notify_time, '17:00')
-  if (!dailyTime || !overdueTime || !dueTomorrowTime) {
+  const purchaseAlertTime = normalizeHHMM(purchase_alert_notify_time, '08:00')
+  if (!dailyTime || !overdueTime || !dueTomorrowTime || !purchaseAlertTime) {
     return res.status(400).json({ error: 'เวลาแจ้งเตือนไม่ถูกต้อง' })
   }
 
   try {
-    await crmDB.query(`
-      UPDATE crm_users
-      SET line_notify_enabled=$1,
-          line_notify_time=$2,
-          overdue_notify_time=$3,
-          due_tomorrow_notify_time=$4
-      WHERE id=$5
-    `, [notify_enabled, dailyTime, overdueTime, dueTomorrowTime, req.user.id])
+    if (isAdminUp(req.user)) {
+      await crmDB.query(`
+        UPDATE crm_users
+        SET line_notify_enabled=$1,
+            line_notify_time=$2,
+            overdue_notify_time=$3,
+            due_tomorrow_notify_time=$4,
+            purchase_alert_notify_enabled=$5,
+            purchase_alert_notify_time=$6
+        WHERE id=$7
+      `, [
+        notify_enabled,
+        dailyTime,
+        overdueTime,
+        dueTomorrowTime,
+        purchase_alert_notify_enabled,
+        purchaseAlertTime,
+        req.user.id,
+      ])
+    } else {
+      await crmDB.query(`
+        UPDATE crm_users
+        SET line_notify_enabled=$1,
+            line_notify_time=$2,
+            overdue_notify_time=$3,
+            due_tomorrow_notify_time=$4
+        WHERE id=$5
+      `, [notify_enabled, dailyTime, overdueTime, dueTomorrowTime, req.user.id])
+    }
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })

@@ -94,6 +94,8 @@ app.use('/api/line',       require('./routes/line'))         // LINE webhooks
 app.use('/api/auth',            require('./routes/auth'))          // Public
 app.use('/api/customers', require('./routes/customers'))     // Auth required
 app.use('/api/products',      require('./routes/products'))       // POS product master
+app.use('/api/suppliers',     require('./routes/suppliers'))      // POS AP supplier master
+app.use('/api/purchase-planning', require('./routes/purchasePlanning')) // POS purchase planning master
 app.use('/api/employees',      require('./routes/employees'))      // Auth required
 app.use('/api/activities',     require('./routes/activities'))     // Auth required
 app.use('/api/followup-settings', require('./routes/followupSettings')) // Follow-up policy
