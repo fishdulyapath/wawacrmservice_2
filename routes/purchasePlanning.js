@@ -220,10 +220,6 @@ function planningWhere(req, startIndex = 1) {
        AND config_resolved.ap_code = config_link.ap_code
       WHERE config_link.ic_code = i.code
         AND COALESCE(config_resolved.planning_enabled, 1) = 1
-        AND COALESCE(config_resolved.lead_time_days, 0) > 0
-        AND COALESCE(config_resolved.late_buffer_days, 0) > 0
-        AND COALESCE(config_resolved.wholesale_buffer_days, 0) > 0
-        AND COALESCE(config_resolved.order_cycle_days, 0) > 0
     )`,
   ]
 
@@ -569,10 +565,6 @@ function buildPlanningMetricsSql({
       WHERE COALESCE(link.ic_code, '') <> ''
         AND COALESCE(link.ap_code, '') <> ''
         AND COALESCE(r.planning_enabled, 1) = 1
-        AND COALESCE(r.lead_time_days, 0) > 0
-        AND COALESCE(r.late_buffer_days, 0) > 0
-        AND COALESCE(r.wholesale_buffer_days, 0) > 0
-        AND COALESCE(r.order_cycle_days, 0) > 0
     ),
     chosen_supplier AS (
       SELECT *
@@ -885,7 +877,7 @@ router.get('/supplier-settings', async (req, res) => {
           p.late_buffer_days,
           p.wholesale_buffer_days,
           p.order_cycle_days,
-          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.planning_enabled, 0) AS planning_enabled,
           COALESCE(p.remark, '') AS remark,
           p.last_update_date_time
        FROM ap_supplier s
@@ -1035,7 +1027,7 @@ router.get('/item-settings', async (req, res) => {
           p.late_buffer_days,
           p.wholesale_buffer_days,
           p.order_cycle_days,
-          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.planning_enabled, 0) AS planning_enabled,
           COALESCE(p.remark, '') AS remark,
           p.last_update_date_time
        FROM ic_inventory i
@@ -1148,7 +1140,7 @@ router.get('/item-supplier-settings', async (req, res) => {
           COALESCE(p.min_order_qty, 0) AS min_order_qty,
           COALESCE(NULLIF(p.pack_size, 0), 1) AS pack_size,
           COALESCE(p.purchase_unit_code, '') AS purchase_unit_code,
-          COALESCE(p.planning_enabled, 1) AS planning_enabled,
+          COALESCE(p.planning_enabled, 0) AS planning_enabled,
           COALESCE(p.is_preferred, 0) AS is_preferred,
           COALESCE(p.remark, '') AS remark,
           p.last_update_date_time
@@ -1735,6 +1727,274 @@ router.post('/trigger-alert', requireRole('admin', 'manager'), async (req, res) 
     const today = new Date().toISOString().slice(0, 10)
     const result = await runPurchaseAlert({ todayStr: today, skipDedup: true })
     res.json({ success: true, ...result })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ── Item-Supplier Linking ──────────────────────────────────────────────────
+
+// GET /item-supplier-link/items?search=&page=&limit= — รายการสินค้า
+router.get('/item-supplier-link/items', async (req, res) => {
+  const search = clean(req.query.search)
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 20))
+  const offset = (page - 1) * limit
+
+  const params = []
+  let whereSql = ''
+  const keywords = search.split(/\s+/).filter(Boolean)
+  for (const kw of keywords) {
+    params.push(`%${kw}%`)
+    const p = `$${params.length}`
+    whereSql += ` AND (i.code ILIKE ${p} OR COALESCE(i.name_1,'') ILIKE ${p})`
+  }
+
+  try {
+    const [countResult, dataResult] = await Promise.all([
+      posDB.query(
+        `SELECT COUNT(*)::int AS total FROM ic_inventory i WHERE COALESCE(i.code,'') <> ''${whereSql}`,
+        params,
+      ),
+      posDB.query(
+        `SELECT i.code AS ic_code, COALESCE(i.name_1,'') AS ic_name, COALESCE(i.unit_standard,'') AS unit_code
+         FROM ic_inventory i
+         WHERE COALESCE(i.code,'') <> ''${whereSql}
+         ORDER BY i.code
+         OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+        [...params, offset, limit],
+      ),
+    ])
+    res.json({ data: dataResult.rows, total: countResult.rows[0]?.total || 0, page, limit })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /item-supplier-link/:icCode/linked — เจ้าหนี้ที่ผูกกับสินค้านี้แล้ว
+router.get('/item-supplier-link/:icCode/linked', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+  try {
+    const result = await posDB.query(
+      `SELECT lnk.roworder, lnk.ap_code, COALESCE(s.name_1,'') AS ap_name, lnk.remark, lnk.create_date_time_now
+       FROM ap_item_by_supplier lnk
+       LEFT JOIN ap_supplier s ON s.code = lnk.ap_code
+       WHERE lnk.ic_code = $1::text AND COALESCE(lnk.ap_code,'') <> ''
+       ORDER BY s.name_1, lnk.ap_code`,
+      [icCode],
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /item-supplier-link/:icCode/available?search= — เจ้าหนี้ที่ยังไม่ผูก
+router.get('/item-supplier-link/:icCode/available', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  const search = clean(req.query.search)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  const params = [icCode]
+  let searchSql = ''
+  const keywords = search.split(/\s+/).filter(Boolean)
+  for (const kw of keywords) {
+    params.push(`%${kw}%`)
+    const p = `$${params.length}`
+    searchSql += ` AND (s.code ILIKE ${p} OR COALESCE(s.name_1,'') ILIKE ${p})`
+  }
+
+  try {
+    const result = await posDB.query(
+      `SELECT s.code AS ap_code, COALESCE(s.name_1,'') AS ap_name
+       FROM ap_supplier s
+       WHERE COALESCE(s.code,'') <> ''
+         AND NOT EXISTS (
+           SELECT 1 FROM ap_item_by_supplier lnk
+           WHERE lnk.ic_code = $1::text AND lnk.ap_code = s.code
+         )${searchSql}
+       ORDER BY s.name_1, s.code
+       LIMIT 100`,
+      params,
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /item-supplier-link/:icCode/link — ผูกเจ้าหนี้กับสินค้า
+router.post('/item-supplier-link/:icCode/link', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  const apCode = clean(req.body?.ap_code)
+  if (!icCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
+
+  try {
+    const exists = await posDB.query(
+      `SELECT 1 FROM ap_item_by_supplier WHERE ic_code = $1::text AND ap_code = $2::text LIMIT 1`,
+      [icCode, apCode],
+    )
+    if (exists.rows.length) return res.status(409).json({ error: 'ผูกไว้แล้ว' })
+
+    await posDB.query(
+      `INSERT INTO ap_item_by_supplier (ap_code, ic_code, remark, status, line_number)
+       VALUES ($1::text, $2::text, '', 0, 0)`,
+      [apCode, icCode],
+    )
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// DELETE /item-supplier-link/:icCode/link/:apCode — ยกเลิกผูก
+router.delete('/item-supplier-link/:icCode/link/:apCode', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  const apCode = clean(req.params.apCode)
+  if (!icCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
+
+  try {
+    const result = await posDB.query(
+      `DELETE FROM ap_item_by_supplier WHERE ic_code = $1::text AND ap_code = $2::text`,
+      [icCode, apCode],
+    )
+    if (result.rowCount === 0) return res.status(404).json({ error: 'ไม่พบรายการที่ผูก' })
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /item-supplier-link/suppliers?search= — รายการเจ้าหนี้ (สำหรับ tab เลือกเจ้าหนี้ก่อน)
+router.get('/item-supplier-link/suppliers', async (req, res) => {
+  const search = clean(req.query.search)
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+  const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 20))
+  const offset = (page - 1) * limit
+
+  const params = []
+  let whereSql = ''
+  const keywords = search.split(/\s+/).filter(Boolean)
+  for (const kw of keywords) {
+    params.push(`%${kw}%`)
+    const p = `$${params.length}`
+    whereSql += ` AND (s.code ILIKE ${p} OR COALESCE(s.name_1,'') ILIKE ${p})`
+  }
+
+  try {
+    const [countResult, dataResult] = await Promise.all([
+      posDB.query(
+        `SELECT COUNT(*)::int AS total FROM ap_supplier s WHERE COALESCE(s.code,'') <> ''${whereSql}`,
+        params,
+      ),
+      posDB.query(
+        `SELECT s.code AS ap_code, COALESCE(s.name_1,'') AS ap_name
+         FROM ap_supplier s
+         WHERE COALESCE(s.code,'') <> ''${whereSql}
+         ORDER BY s.name_1, s.code
+         OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+        [...params, offset, limit],
+      ),
+    ])
+    res.json({ data: dataResult.rows, total: countResult.rows[0]?.total || 0, page, limit })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /item-supplier-link/by-supplier/:apCode/linked — สินค้าที่ผูกกับเจ้าหนี้นี้แล้ว
+router.get('/item-supplier-link/by-supplier/:apCode/linked', async (req, res) => {
+  const apCode = clean(req.params.apCode)
+  if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
+  try {
+    const result = await posDB.query(
+      `SELECT lnk.roworder, lnk.ic_code, COALESCE(i.name_1,'') AS ic_name,
+              COALESCE(i.unit_standard,'') AS unit_code, lnk.create_date_time_now
+       FROM ap_item_by_supplier lnk
+       LEFT JOIN ic_inventory i ON i.code = lnk.ic_code
+       WHERE lnk.ap_code = $1::text AND COALESCE(lnk.ic_code,'') <> ''
+       ORDER BY i.name_1, lnk.ic_code`,
+      [apCode],
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// GET /item-supplier-link/by-supplier/:apCode/available?search= — สินค้าที่ยังไม่ผูกกับเจ้าหนี้นี้
+router.get('/item-supplier-link/by-supplier/:apCode/available', async (req, res) => {
+  const apCode = clean(req.params.apCode)
+  const search = clean(req.query.search)
+  if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
+
+  const params = [apCode]
+  let searchSql = ''
+  const keywords = search.split(/\s+/).filter(Boolean)
+  for (const kw of keywords) {
+    params.push(`%${kw}%`)
+    const p = `$${params.length}`
+    searchSql += ` AND (i.code ILIKE ${p} OR COALESCE(i.name_1,'') ILIKE ${p})`
+  }
+
+  try {
+    const result = await posDB.query(
+      `SELECT i.code AS ic_code, COALESCE(i.name_1,'') AS ic_name, COALESCE(i.unit_standard,'') AS unit_code
+       FROM ic_inventory i
+       WHERE COALESCE(i.code,'') <> ''
+         AND COALESCE(i.item_type, 0) NOT IN (1, 3)
+         AND NOT EXISTS (
+           SELECT 1 FROM ap_item_by_supplier lnk
+           WHERE lnk.ap_code = $1::text AND lnk.ic_code = i.code
+         )${searchSql}
+       ORDER BY i.name_1, i.code
+       LIMIT 100`,
+      params,
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// POST /item-supplier-link/by-supplier/:apCode/link — ผูกสินค้ากับเจ้าหนี้ (reverse direction)
+router.post('/item-supplier-link/by-supplier/:apCode/link', async (req, res) => {
+  const apCode = clean(req.params.apCode)
+  const icCode = clean(req.body?.ic_code)
+  if (!apCode || !icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
+
+  try {
+    const exists = await posDB.query(
+      `SELECT 1 FROM ap_item_by_supplier WHERE ic_code = $1::text AND ap_code = $2::text LIMIT 1`,
+      [icCode, apCode],
+    )
+    if (exists.rows.length) return res.status(409).json({ error: 'ผูกไว้แล้ว' })
+
+    await posDB.query(
+      `INSERT INTO ap_item_by_supplier (ap_code, ic_code, remark, status, line_number)
+       VALUES ($1::text, $2::text, '', 0, 0)`,
+      [apCode, icCode],
+    )
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// DELETE /item-supplier-link/by-supplier/:apCode/link/:icCode — ยกเลิกผูก (reverse direction)
+router.delete('/item-supplier-link/by-supplier/:apCode/link/:icCode', async (req, res) => {
+  const apCode = clean(req.params.apCode)
+  const icCode = clean(req.params.icCode)
+  if (!apCode || !icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
+
+  try {
+    const result = await posDB.query(
+      `DELETE FROM ap_item_by_supplier WHERE ic_code = $1::text AND ap_code = $2::text`,
+      [icCode, apCode],
+    )
+    if (result.rowCount === 0) return res.status(404).json({ error: 'ไม่พบรายการที่ผูก' })
+    res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
