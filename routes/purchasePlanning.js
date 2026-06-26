@@ -1958,10 +1958,10 @@ router.get('/report-lazy/:jobId', async (req, res) => {
 // 1 PR ต่อเจ้าหนี้ จากรายการที่จัดกลุ่มแล้ว
 // ─────────────────────────────────────────────────────────────────────────────
 
-// สร้างเลขที่เอกสาร MPR{YYYYMMDD}-{N} โดย N = MAX+1 ของ prefix วันนั้น
+// สร้างเลขที่เอกสาร CRMPR{YYYYMMDD}-{N} โดย N = MAX+1 ของ prefix วันนั้น
 async function generatePRDocNo(client, docDateStr) {
   const dateStr = docDateStr.replaceAll('-', '') // YYYYMMDD
-  const prefix = `MPR${dateStr}-`
+  const prefix = `CRMPR${dateStr}-`
   const result = await client.query(
     `SELECT COALESCE(MAX(CAST(SUBSTRING(doc_no FROM $1::int) AS int)), 0) + 1 AS next_no
      FROM ic_trans
