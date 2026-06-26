@@ -35,7 +35,7 @@ async function runPurchaseAlert({ todayStr, skipDedup = false } = {}) {
           AND lg.sent_at >= $1::date
           AND lg.sent_at <  ($1::date + INTERVAL '1 day')
       )`}
-  `, [todayStr])
+  `, skipDedup ? [] : [todayStr])
 
   if (!usersResult.rows.length) return { sent: 0, itemCount: 0, skipped: true }
 

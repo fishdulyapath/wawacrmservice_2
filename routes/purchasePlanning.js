@@ -1,5 +1,8 @@
 const express = require('express')
 const crypto = require('crypto')
+const path = require('path')
+const multer = require('multer')
+const XLSX = require('xlsx')
 const { posDB } = require('../db')
 const { authMiddleware, requireRole } = require('../middleware/auth')
 
@@ -76,6 +79,27 @@ function searchClause(search, fields, startIndex = 1) {
   return { sql: ` AND ${clauses.join(' AND ')}`, params }
 }
 
+// ค้นหาสินค้าแบบ multi-keyword (AND ระหว่าง keyword) ครบทุก field:
+// รหัสสินค้า (i.code), ชื่อไทย (i.name_1), ชื่ออังกฤษ (i.name_eng_1), บาร์โค้ด (ผ่าน EXISTS)
+// ใช้กับ query ที่มี ic_inventory เป็น alias "i" อยู่แล้ว
+function itemSearchClause(search, startIndex = 1) {
+  const parts = clean(search).split(/\s+/).filter(Boolean)
+  if (!parts.length) return { sql: '', params: [] }
+  const params = []
+  const clauses = parts.map((part) => {
+    params.push(`%${part}%`)
+    const p = `$${startIndex + params.length - 1}`
+    return `(i.code ILIKE ${p}::text
+      OR COALESCE(i.name_1, '') ILIKE ${p}::text
+      OR COALESCE(i.name_eng_1, '') ILIKE ${p}::text
+      OR EXISTS (
+        SELECT 1 FROM ic_inventory_barcode b
+        WHERE b.ic_code = i.code AND b.barcode ILIKE ${p}::text
+      ))`
+  })
+  return { sql: ` AND ${clauses.join(' AND ')}`, params }
+}
+
 async function withPosTransaction(fn) {
   const client = await posDB.connect()
   try {
@@ -90,6 +114,117 @@ async function withPosTransaction(fn) {
     client.release()
   }
 }
+
+// ── Excel export/import helpers ─────────────────────────────────────────────
+// multer: เก็บไฟล์ใน memory (ไฟล์ Excel มักเล็ก < 1MB)
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter(_req, file, cb) {
+    const ok = /\.(xlsx|xls)$/i.test(path.extname(file.originalname))
+    cb(ok ? null : new Error('ไฟล์ต้องเป็น .xlsx หรือ .xls เท่านั้น'), ok)
+  },
+})
+
+// จำกัดจำนวน row ที่ import ได้ต่อครั้ง (ป้องกัน DoS / ความผิดพลาด)
+const IMPORT_MAX_ROWS = 5000
+
+// คอลัมน์ที่ export/import ของแต่ละ tab (key = ฟิลด์ DB, header = ชื่อใน Excel)
+const SUPPLIER_COLUMNS = [
+  { key: 'ap_code', header: 'รหัสเจ้าหนี้', type: 'text', readOnly: true },
+  { key: 'ap_name', header: 'ชื่อเจ้าหนี้', type: 'text', readOnly: true },
+  { key: 'lead_time_days', header: 'Lead', type: 'int' },
+  { key: 'late_buffer_days', header: 'Late', type: 'int' },
+  { key: 'wholesale_buffer_days', header: 'Wholesale', type: 'int' },
+  { key: 'order_cycle_days', header: 'Cycle', type: 'int' },
+  { key: 'planning_enabled', header: 'ใช้', type: 'bool' },
+  { key: 'remark', header: 'หมายเหตุ', type: 'text' },
+]
+
+const ITEM_SUPPLIER_COLUMNS = [
+  { key: 'ic_code', header: 'รหัสสินค้า', type: 'text', readOnly: true },
+  { key: 'ic_name', header: 'ชื่อสินค้า', type: 'text', readOnly: true },
+  { key: 'ap_code', header: 'รหัสเจ้าหนี้', type: 'text', readOnly: true },
+  { key: 'ap_name', header: 'ชื่อเจ้าหนี้', type: 'text', readOnly: true },
+  { key: 'lead_time_days', header: 'Lead', type: 'int' },
+  { key: 'late_buffer_days', header: 'Late', type: 'int' },
+  { key: 'wholesale_buffer_days', header: 'Wholesale', type: 'int' },
+  { key: 'order_cycle_days', header: 'Cycle', type: 'int' },
+  { key: 'min_order_qty', header: 'MOQ', type: 'num' },
+  { key: 'is_preferred', header: 'หลัก', type: 'bool' },
+  { key: 'planning_enabled', header: 'ใช้', type: 'bool' },
+  { key: 'remark', header: 'หมายเหตุ', type: 'text' },
+]
+
+function buildExportSheet(rows, columns) {
+  return rows.map((row) => {
+    const out = {}
+    for (const col of columns) {
+      let value = row[col.key]
+      if (col.type === 'bool') value = Number(value) === 1 ? 1 : 0
+      else if (col.type === 'int') value = value === null || value === undefined ? '' : Number(value)
+      else if (col.type === 'num') value = value === null || value === undefined ? '' : Number(value)
+      out[col.header] = value
+    }
+    return out
+  })
+}
+
+// แปลงค่าจาก Excel cell ให้เป็นค่าที่จะเก็บใน DB ตาม type
+function parseCellValue(rawValue, type) {
+  const text = String(rawValue ?? '').trim()
+  if (type === 'int') {
+    if (text === '') return null
+    const num = Number(text)
+    return Number.isFinite(num) ? Math.max(0, Math.trunc(num)) : null
+  }
+  if (type === 'num') {
+    if (text === '') return 0
+    const num = Number(text)
+    return Number.isFinite(num) ? Math.max(0, num) : 0
+  }
+  if (type === 'bool') {
+    const lower = text.toLowerCase()
+    // หลัก: 0 = ไม่, 1 = ใช่
+    // รองรับค่าอื่นเผื่อไฟล์เก่า: ใช่/yes/true → 1, อื่นๆ → 0
+    if (lower === '1' || lower === 'ใช่' || lower === 'yes' || lower === 'true') return 1
+    return 0
+  }
+  // text
+  return text.slice(0, 255)
+}
+
+// parse เซลล์ตัวเลขที่ Excel อาจเก็บเป็น string (เช่น "00123")
+function parseCellText(rawValue) {
+  return String(rawValue ?? '').trim()
+}
+
+function parseImportRows(buffer, columns) {
+  const workbook = XLSX.read(buffer, { type: 'buffer' })
+  const sheetName = workbook.SheetNames[0]
+  if (!sheetName) throw new Error('ไม่พบ sheet ในไฟล์ Excel')
+  const sheet = workbook.Sheets[sheetName]
+  // header: ใช้ชื่อ header ของเรา ตามตัวอย่างที่ export ออกไป
+  const json = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false })
+
+  const rows = []
+  const errors = []
+  json.forEach((rawRow, idx) => {
+    const lineNo = idx + 2 // +1 header, +1 1-based
+    const parsed = {}
+    for (const col of columns) {
+      const cellValue = rawRow[col.header]
+      if (col.type === 'bool') parsed[col.key] = parseCellValue(cellValue, 'bool')
+      else if (col.type === 'int') parsed[col.key] = parseCellValue(cellValue, 'int')
+      else if (col.type === 'num') parsed[col.key] = parseCellValue(cellValue, 'num')
+      else parsed[col.key] = parseCellText(cellValue)
+    }
+    rows.push({ lineNo, parsed })
+  })
+
+  return { rows, errors }
+}
+
 
 function supplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
   const params = []
@@ -266,6 +401,40 @@ function planningWhere(req, startIndex = 1) {
   return { sql: `WHERE ${whereParts.join(' AND ')}`, params }
 }
 
+// เช็คว่าสินค้ามีจริงในระบบไหม (แยกจาก "ไม่ผ่านเงื่อนไขวางแผน")
+// คืนข้อความ error ที่ชัดเจน หรือ null ถ้าสินค้าผ่านเงื่อนไข (เรียก metric query แล้วเจอ)
+async function resolveItemMissingError(icCode) {
+  if (!icCode) return 'กรุณาระบุรหัสสินค้า'
+  const result = await posDB.query(
+    `SELECT
+       i.code,
+       COALESCE(i.item_type, 0) AS item_type,
+       COALESCE(d.is_hold_sale, 0) AS is_hold_sale,
+       COALESCE(d.is_hold_purchase, 0) AS is_hold_purchase,
+       EXISTS (
+         SELECT 1
+         FROM ap_item_by_supplier link
+         JOIN purchase_planning_item_supplier_resolved r
+           ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
+         WHERE link.ic_code = i.code
+           AND COALESCE(r.planning_enabled, 1) = 1
+       ) AS has_enabled_supplier
+     FROM ic_inventory i
+     LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+     WHERE i.code = $1::text`,
+    [icCode],
+  )
+  if (!result.rows.length) return 'ไม่พบสินค้าในระบบ'
+  const row = result.rows[0]
+  const reasons = []
+  if ([1, 3].includes(Number(row.item_type))) reasons.push('ประเภทสินค้าไม่รองรับการวางแผน')
+  if (Number(row.is_hold_sale) === 1) reasons.push('สินค้าถูก hold sale')
+  if (Number(row.is_hold_purchase) === 1) reasons.push('สินค้าถูก hold purchase')
+  if (!row.has_enabled_supplier) reasons.push('ยังไม่มีเจ้าหนี้ที่เปิดใช้งานในการวางแผน (planning_enabled = 1)')
+  if (!reasons.length) return 'สินค้าไม่ผ่านเงื่อนไขการวางแผนสั่งซื้อ'
+  return `สินค้า "${icCode}" ไม่สามารถแสดงในรายงานวางแผนได้: ${reasons.join(', ')} — กรุณาตรวจสอบที่หน้า "กำหนดข้อมูลวางแผนสั่งซื้อ"`
+}
+
 function buildPlanningMetricsSql({
   whereSql,
   startIndex = 1,
@@ -404,7 +573,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 34
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.wh_code, '') = $2::text
       GROUP BY td.doc_no, td.item_code, td.wh_code
     ),
@@ -414,7 +583,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag IN (36, 44, 39)
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
         AND COALESCE(td.wh_code, '') = $2::text
       GROUP BY td.ref_doc_no, td.item_code, td.wh_code
@@ -434,7 +603,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 36
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.wh_code, '') = $2::text
       GROUP BY td.doc_no, td.item_code, td.wh_code
     ),
@@ -444,7 +613,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag IN (44, 37)
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
         AND COALESCE(td.wh_code, '') = $2::text
       GROUP BY td.ref_doc_no, td.item_code, td.wh_code
@@ -468,7 +637,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 6
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.wh_code, '') = $2::text
       GROUP BY td.doc_no, td.line_number, td.item_code, td.wh_code
     ),
@@ -481,7 +650,7 @@ function buildPlanningMetricsSql({
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag IN (7, 12, 310)
-        AND COALESCE(td.last_status, 0) = 0
+        AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
       GROUP BY td.ref_doc_no, td.ref_row, td.item_code
     ),
@@ -503,11 +672,17 @@ function buildPlanningMetricsSql({
         SUM(CASE WHEN td.trans_flag = 44 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS sale_qty_3m,
         SUM(CASE WHEN td.trans_flag = 12 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS purchase_amount_3m,
         SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS sale_amount_3m,
+        -- กำไรขั้นต้น 90 วัน (ตามมาตรฐาน _stkProfit: JOIN ic_trans + last_status=0, แยก ขาย44/รับคืน48)
+        SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS amount_sale_3m,
+        SUM(CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS amount_sale_return_3m,
+        SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END) AS cost_sale_3m,
+        SUM(CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END) AS cost_sale_return_3m,
         MAX(td.doc_date)::date AS last_doc_date
       FROM ic_trans_detail td
+      JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
       JOIN candidates c ON c.ic_code = td.item_code
-      WHERE td.trans_flag IN (12, 44)
-        AND COALESCE(td.status, 0) = 0
+      WHERE td.trans_flag IN (12, 44, 48)
+        AND COALESCE(t.last_status, 0) = 0
         AND td.doc_date::date BETWEEN ($1::date - interval '90 day')::date AND $1::date
       GROUP BY td.item_code
     ),
@@ -550,8 +725,8 @@ function buildPlanningMetricsSql({
         ROW_NUMBER() OVER (
           PARTITION BY link.ic_code
           ORDER BY
-            COALESCE(lp.price, 999999999999),
             CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+            COALESCE(lp.price, 999999999999),
             lp.doc_date DESC NULLS LAST,
             link.ap_code
         ) AS rn
@@ -587,6 +762,17 @@ function buildPlanningMetricsSql({
         COALESCE(m.sale_qty_3m, 0) AS sale_qty_3m,
         COALESCE(m.purchase_amount_3m, 0) AS purchase_amount_3m,
         COALESCE(m.sale_amount_3m, 0) AS sale_amount_3m,
+        -- กำไรขั้นต้น 90 วัน (ตามมาตรฐาน _stkProfit)
+        COALESCE(m.amount_sale_3m, 0) AS amount_sale_3m,
+        COALESCE(m.amount_sale_return_3m, 0) AS amount_sale_return_3m,
+        COALESCE(m.cost_sale_3m, 0) AS cost_sale_3m,
+        COALESCE(m.cost_sale_return_3m, 0) AS cost_sale_return_3m,
+        -- net = ขาย - รับคืน
+        (COALESCE(m.amount_sale_3m, 0) - COALESCE(m.amount_sale_return_3m, 0)) AS amount_net_3m,
+        (COALESCE(m.cost_sale_3m, 0) - COALESCE(m.cost_sale_return_3m, 0)) AS cost_net_3m,
+        -- profit_lost_amount = amount_net - cost_net
+        ((COALESCE(m.amount_sale_3m, 0) - COALESCE(m.amount_sale_return_3m, 0))
+          - (COALESCE(m.cost_sale_3m, 0) - COALESCE(m.cost_sale_return_3m, 0))) AS profit_lost_amount_3m,
         GREATEST(COALESCE(c.last_movement_date, m.last_doc_date), COALESCE(m.last_doc_date, c.last_movement_date)) AS last_doc_date,
         cs.ap_code,
         cs.ap_name,
@@ -631,7 +817,7 @@ function buildPlanningMetricsSql({
       END AS stock_status,
       CASE
         WHEN d_avg > 0 AND active_stock_days >= $3::int AND available_qty <= min_stock
-          THEN CEIL(GREATEST(max_stock - available_qty, min_order_qty, 0) / NULLIF(pack_size, 0)) * pack_size
+          THEN CEIL(GREATEST(max_stock - available_qty, min_order_qty, 0))
         ELSE 0
       END AS suggest_qty,
       CASE WHEN d_avg > 0 THEN available_qty / d_avg ELSE NULL END AS stock_cover_days
@@ -652,7 +838,9 @@ function summaryFromRows(rows) {
     acc.suggest_qty += Number(row.suggest_qty || 0)
     acc.suggest_amount += suggestAmount
 
-    if (suggestAmount > 0) {
+    // กราฟ supplier: แสดงเฉพาะ supplier ที่มีจำนวนแนะนำซื้อ > 0 (ใช้ suggest_qty แทนยอดเงิน
+    // เพราะยอดเงินต้องมีราคาซื้อล่าสุด ถ้ายังไม่เคยซื้อจาก supplier นี้จะได้ 0)
+    if (Number(row.suggest_qty || 0) > 0) {
       if (!acc.supplier_order_map[apCode]) {
         acc.supplier_order_map[apCode] = {
           ap_code: apCode,
@@ -762,7 +950,7 @@ async function runReportJob(job) {
          FROM ic_trans_detail td
          JOIN candidates c ON c.ic_code = td.item_code
          WHERE td.trans_flag = 6
-           AND COALESCE(td.last_status, 0) = 0
+           AND COALESCE(td.status, 0) = 0
            AND COALESCE(td.wh_code, '') = $3::text
          GROUP BY td.doc_no, td.line_number, td.item_code
        ),
@@ -775,7 +963,7 @@ async function runReportJob(job) {
          FROM ic_trans_detail td
          JOIN candidates c ON c.ic_code = td.item_code
          WHERE td.trans_flag IN (7, 12, 310)
-           AND COALESCE(td.last_status, 0) = 0
+           AND COALESCE(td.status, 0) = 0
            AND COALESCE(td.ref_doc_no, '') <> ''
          GROUP BY td.ref_doc_no, td.ref_row, td.item_code
        ),
@@ -858,6 +1046,8 @@ async function runReportJob(job) {
 router.get('/supplier-settings', async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['s.code', 's.name_1'], 1)
+  const enabledOnly = boolQuery(req.query.enabled_only)
+  const enabledClause = enabledOnly ? ' AND p.planning_enabled = 1' : ''
   const params = [...search.params]
 
   try {
@@ -865,7 +1055,7 @@ router.get('/supplier-settings', async (req, res) => {
       `SELECT COUNT(*)::int AS total
        FROM ap_supplier s
        LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
-       WHERE COALESCE(s.code, '') <> ''${search.sql}`,
+       WHERE COALESCE(s.code, '') <> ''${search.sql}${enabledClause}`,
       params,
     )
 
@@ -882,7 +1072,7 @@ router.get('/supplier-settings', async (req, res) => {
           p.last_update_date_time
        FROM ap_supplier s
        LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
-       WHERE COALESCE(s.code, '') <> ''${search.sql}
+       WHERE COALESCE(s.code, '') <> ''${search.sql}${enabledClause}
        ORDER BY s.code
        OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
       [...params, offset, limit],
@@ -1002,9 +1192,154 @@ router.post('/supplier-settings/sync-from-purchase-history', async (req, res) =>
   }
 })
 
+// ── Supplier: Excel export/import ────────────────────────────────────────────
+router.get('/supplier-settings/export', async (req, res) => {
+  try {
+    const dataResult = await posDB.query(
+      `SELECT
+          s.code AS ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          p.lead_time_days,
+          p.late_buffer_days,
+          p.wholesale_buffer_days,
+          p.order_cycle_days,
+          COALESCE(p.planning_enabled, 0) AS planning_enabled,
+          COALESCE(p.remark, '') AS remark
+       FROM ap_supplier s
+       LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
+       WHERE COALESCE(s.code, '') <> ''
+       ORDER BY s.code`,
+    )
+    const rows = buildExportSheet(dataResult.rows, SUPPLIER_COLUMNS)
+    const sheet = XLSX.utils.json_to_sheet(rows, {
+      header: SUPPLIER_COLUMNS.map((c) => c.header),
+    })
+    // ปรับความกว้างคอลัมน์ให้อ่านง่าย
+    sheet['!cols'] = SUPPLIER_COLUMNS.map((col) => ({ wch: Math.max(col.header.length * 2, 12) }))
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, sheet, 'เจ้าหนี้')
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+    const filename = `supplier-settings-${new Date().toISOString().slice(0, 10)}.xlsx`
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
+    res.send(buffer)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/supplier-settings/import', importUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
+  const commit = boolQuery(req.body.commit)
+  const userCode = clean(req.user?.code)
+
+  try {
+    const { rows } = parseImportRows(req.file.buffer, SUPPLIER_COLUMNS)
+    if (rows.length === 0) return res.json({ success: true, commit: false, total: 0, updated: 0, errors: [], preview: [] })
+    if (rows.length > IMPORT_MAX_ROWS) {
+      return res.status(400).json({ error: `จำนวน row เกินกำหนด (สูงสุด ${IMPORT_MAX_ROWS} รายการ)` })
+    }
+
+    // validate: ap_code ต้องไม่ว่าง, และต้องมีอยู่จริงใน ap_supplier
+    const errors = []
+    const validRows = []
+    for (const { lineNo, parsed } of rows) {
+      const apCode = parsed.ap_code
+      if (!apCode) {
+        errors.push({ line: lineNo, message: 'ไม่ระบุรหัสเจ้าหนี้' })
+        continue
+      }
+      validRows.push(parsed)
+    }
+
+    const codes = [...new Set(validRows.map((r) => r.ap_code))]
+    let existingMap = new Map()
+    if (codes.length) {
+      const existingResult = await posDB.query(
+        `SELECT code FROM ap_supplier WHERE code = ANY($1::text[])`,
+        [codes],
+      )
+      existingMap = new Set(existingResult.rows.map((r) => r.code))
+    }
+    const checkedRows = []
+    for (let i = 0; i < validRows.length; i++) {
+      const parsed = validRows[i]
+      const lineNo = rows[i].lineNo
+      if (!existingMap.has(parsed.ap_code)) {
+        errors.push({ line: lineNo, ap_code: parsed.ap_code, message: 'ไม่พบรหัสเจ้าหนี้ในระบบ' })
+        continue
+      }
+      checkedRows.push(parsed)
+    }
+
+    const preview = checkedRows.slice(0, 10).map((r) => ({
+      ap_code: r.ap_code,
+      lead_time_days: r.lead_time_days,
+      planning_enabled: r.planning_enabled,
+      remark: r.remark,
+    }))
+
+    if (!commit) {
+      return res.json({
+        success: true,
+        commit: false,
+        total: rows.length,
+        updated: checkedRows.length,
+        errors,
+        preview,
+      })
+    }
+
+    // commit: upsert ทั้งหมดใน transaction
+    const result = await withPosTransaction(async (client) => {
+      let updated = 0
+      for (const r of checkedRows) {
+        await client.query(
+          `INSERT INTO purchase_planning_supplier_setting (
+              ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+              planning_enabled, remark, create_code, last_update_code
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+           ON CONFLICT (ap_code) DO UPDATE SET
+              lead_time_days = EXCLUDED.lead_time_days,
+              late_buffer_days = EXCLUDED.late_buffer_days,
+              wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+              order_cycle_days = EXCLUDED.order_cycle_days,
+              planning_enabled = EXCLUDED.planning_enabled,
+              remark = EXCLUDED.remark,
+              last_update_code = EXCLUDED.last_update_code,
+              last_update_date_time = now()`,
+          [
+            r.ap_code,
+            r.lead_time_days,
+            r.late_buffer_days,
+            r.wholesale_buffer_days,
+            r.order_cycle_days,
+            Number(r.planning_enabled) === 0 ? 0 : 1,
+            r.remark,
+            userCode,
+          ],
+        )
+        updated += 1
+      }
+      return { updated }
+    })
+
+    res.json({
+      success: true,
+      commit: true,
+      total: rows.length,
+      updated: result.updated,
+      errors,
+      preview,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 router.get('/item-settings', async (req, res) => {
   const { page, limit, offset } = pageParams(req)
-  const search = searchClause(req.query.search, ['i.code', 'i.name_1', 'i.name_eng_1'], 1)
+  const search = itemSearchClause(req.query.search, 1)
   const params = [...search.params]
 
   try {
@@ -1092,6 +1427,8 @@ router.post('/item-settings/save/:icCode', async (req, res) => {
 router.get('/item-supplier-settings', async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 1)
+  const enabledOnly = boolQuery(req.query.enabled_only)
+  const enabledClause = enabledOnly ? ' AND p.planning_enabled = 1' : ''
   const params = [...search.params]
 
   try {
@@ -1102,8 +1439,10 @@ router.get('/item-supplier-settings', async (req, res) => {
          FROM ap_item_by_supplier link
          LEFT JOIN ic_inventory i ON i.code = link.ic_code
          LEFT JOIN ap_supplier s ON s.code = link.ap_code
+         LEFT JOIN purchase_planning_item_supplier_setting p
+           ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
          WHERE COALESCE(link.ic_code, '') <> ''
-           AND COALESCE(link.ap_code, '') <> ''${search.sql}
+           AND COALESCE(link.ap_code, '') <> ''${search.sql}${enabledClause}
        ) x`,
       params,
     )
@@ -1152,7 +1491,7 @@ router.get('/item-supplier-settings', async (req, res) => {
        LEFT JOIN latest_price lp
          ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
        WHERE COALESCE(link.ic_code, '') <> ''
-         AND COALESCE(link.ap_code, '') <> ''${search.sql}
+         AND COALESCE(link.ap_code, '') <> ''${search.sql}${enabledClause}
        ORDER BY link.ic_code, link.ap_code
        OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
       [...params, offset, limit],
@@ -1290,6 +1629,175 @@ router.post('/item-supplier-settings/sync-from-purchase-history', async (req, re
   }
 })
 
+// ── Item-Supplier: Excel export/import ───────────────────────────────────────
+router.get('/item-supplier-settings/export', async (req, res) => {
+  try {
+    const dataResult = await posDB.query(
+      `SELECT DISTINCT ON (link.ic_code, link.ap_code)
+          link.ic_code,
+          COALESCE(i.name_1, '') AS ic_name,
+          link.ap_code,
+          COALESCE(s.name_1, '') AS ap_name,
+          p.lead_time_days,
+          p.late_buffer_days,
+          p.wholesale_buffer_days,
+          p.order_cycle_days,
+          COALESCE(p.min_order_qty, 0) AS min_order_qty,
+          COALESCE(p.is_preferred, 0) AS is_preferred,
+          COALESCE(p.planning_enabled, 0) AS planning_enabled,
+          COALESCE(p.remark, '') AS remark
+       FROM ap_item_by_supplier link
+       LEFT JOIN ic_inventory i ON i.code = link.ic_code
+       LEFT JOIN ap_supplier s ON s.code = link.ap_code
+       LEFT JOIN purchase_planning_item_supplier_setting p
+         ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
+       WHERE COALESCE(link.ic_code, '') <> ''
+         AND COALESCE(link.ap_code, '') <> ''
+       ORDER BY link.ic_code, link.ap_code`,
+    )
+    const rows = buildExportSheet(dataResult.rows, ITEM_SUPPLIER_COLUMNS)
+    const sheet = XLSX.utils.json_to_sheet(rows, {
+      header: ITEM_SUPPLIER_COLUMNS.map((c) => c.header),
+    })
+    sheet['!cols'] = ITEM_SUPPLIER_COLUMNS.map((col) => ({ wch: Math.max(col.header.length * 2, 12) }))
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, sheet, 'สินค้า+เจ้าหนี้')
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' })
+    const filename = `item-supplier-settings-${new Date().toISOString().slice(0, 10)}.xlsx`
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`)
+    res.send(buffer)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/item-supplier-settings/import', importUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
+  const commit = boolQuery(req.body.commit)
+  const userCode = clean(req.user?.code)
+
+  try {
+    const { rows } = parseImportRows(req.file.buffer, ITEM_SUPPLIER_COLUMNS)
+    if (rows.length === 0) return res.json({ success: true, commit: false, total: 0, updated: 0, errors: [], preview: [] })
+    if (rows.length > IMPORT_MAX_ROWS) {
+      return res.status(400).json({ error: `จำนวน row เกินกำหนด (สูงสุด ${IMPORT_MAX_ROWS} รายการ)` })
+    }
+
+    const errors = []
+    const validRows = []
+    for (const { lineNo, parsed } of rows) {
+      if (!parsed.ic_code || !parsed.ap_code) {
+        errors.push({ line: lineNo, message: 'ไม่ระบุรหัสสินค้าหรือรหัสเจ้าหนี้' })
+        continue
+      }
+      validRows.push(parsed)
+    }
+
+    // validate ว่าคู่ (ic_code, ap_code) มีอยู่จริงใน ap_item_by_supplier
+    let existingPairs = new Set()
+    if (validRows.length) {
+      const pairs = validRows.map((r) => `${r.ic_code}\u0000${r.ap_code}`)
+      const pairRows = await posDB.query(
+        `SELECT ic_code, ap_code FROM ap_item_by_supplier
+         WHERE (ic_code, ap_code) IN (
+           ${validRows.map((_, i) => `($${i * 2 + 1}::text, $${i * 2 + 2}::text)`).join(',')}
+         )`,
+        validRows.flatMap((r) => [r.ic_code, r.ap_code]),
+      )
+      existingPairs = new Set(pairRows.rows.map((r) => `${r.ic_code}\u0000${r.ap_code}`))
+    }
+
+    const checkedRows = []
+    for (let i = 0; i < validRows.length; i++) {
+      const parsed = validRows[i]
+      const lineNo = rows[i].lineNo
+      const pairKey = `${parsed.ic_code}\u0000${parsed.ap_code}`
+      if (!existingPairs.has(pairKey)) {
+        errors.push({
+          line: lineNo,
+          ic_code: parsed.ic_code,
+          ap_code: parsed.ap_code,
+          message: 'ไม่พบคู่สินค้า+เจ้าหนี้ที่ผูกกันในระบบ',
+        })
+        continue
+      }
+      checkedRows.push(parsed)
+    }
+
+    const preview = checkedRows.slice(0, 10).map((r) => ({
+      ic_code: r.ic_code,
+      ap_code: r.ap_code,
+      lead_time_days: r.lead_time_days,
+      min_order_qty: r.min_order_qty,
+      is_preferred: r.is_preferred,
+      planning_enabled: r.planning_enabled,
+    }))
+
+    if (!commit) {
+      return res.json({
+        success: true,
+        commit: false,
+        total: rows.length,
+        updated: checkedRows.length,
+        errors,
+        preview,
+      })
+    }
+
+    // commit: upsert ทั้งหมดใน transaction
+    const result = await withPosTransaction(async (client) => {
+      let updated = 0
+      for (const r of checkedRows) {
+        const minOrderQty = Math.max(0, toNumber(r.min_order_qty, 0))
+        await client.query(
+          `INSERT INTO purchase_planning_item_supplier_setting (
+              ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+              min_order_qty, planning_enabled, is_preferred, remark, create_code, last_update_code
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
+           ON CONFLICT (ic_code, ap_code) DO UPDATE SET
+              lead_time_days = EXCLUDED.lead_time_days,
+              late_buffer_days = EXCLUDED.late_buffer_days,
+              wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+              order_cycle_days = EXCLUDED.order_cycle_days,
+              min_order_qty = EXCLUDED.min_order_qty,
+              planning_enabled = EXCLUDED.planning_enabled,
+              is_preferred = EXCLUDED.is_preferred,
+              remark = EXCLUDED.remark,
+              last_update_code = EXCLUDED.last_update_code,
+              last_update_date_time = now()`,
+          [
+            r.ic_code,
+            r.ap_code,
+            r.lead_time_days,
+            r.late_buffer_days,
+            r.wholesale_buffer_days,
+            r.order_cycle_days,
+            minOrderQty,
+            Number(r.planning_enabled) === 0 ? 0 : 1,
+            Number(r.is_preferred) === 1 ? 1 : 0,
+            r.remark,
+            userCode,
+          ],
+        )
+        updated += 1
+      }
+      return { updated }
+    })
+
+    res.json({
+      success: true,
+      commit: true,
+      total: rows.length,
+      updated: result.updated,
+      errors,
+      preview,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 router.get('/report', async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const options = planningOptions(req)
@@ -1332,17 +1840,10 @@ router.post('/report-lazy', async (req, res) => {
   const key = reportJobKey(req.user?.code, query)
 
   try {
-    const existing = reportJobs.get(key)
-    if (existing && existing.status !== 'failed') {
-      existing.updatedAt = Date.now()
-      return res.json({
-        job_id: existing.id,
-        status: existing.status,
-        total: existing.total,
-        processed: existing.processed,
-        options: existing.options,
-      })
-    }
+    // ไม่ reuse cache จากหน้าจอ — ทุกครั้งที่กดประมวลผลต้องคำนวณใหม่เสมอ
+    // (แก้ปัญหา: เพิ่มสินค้าเข้าแผนแล้วกดประมวลผลซ้ำ แต่สินค้าใหม่ไม่ขึ้น)
+    // ใช้ id ที่ unique ทุกครั้ง (key + timestamp + random) เพื่อไม่ให้ชนกับ job เดิม
+    const id = `${key}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
     const queryReq = { query }
     const countWhere = planningWhere(queryReq, 1)
@@ -1355,7 +1856,6 @@ router.post('/report-lazy', async (req, res) => {
       countWhere.params,
     )
 
-    const id = key
     const job = {
       id,
       query,
@@ -1415,6 +1915,195 @@ router.get('/report-lazy/:jobId', async (req, res) => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /purchase-planning/pr/create — สร้างใบเสนอซื้อ (PR, trans_flag=2)
+// 1 PR ต่อเจ้าหนี้ จากรายการที่จัดกลุ่มแล้ว
+// ─────────────────────────────────────────────────────────────────────────────
+
+// สร้างเลขที่เอกสาร MPR{YYYYMMDD}-{N} โดย N = MAX+1 ของ prefix วันนั้น
+async function generatePRDocNo(client, docDateStr) {
+  const dateStr = docDateStr.replaceAll('-', '') // YYYYMMDD
+  const prefix = `MPR${dateStr}-`
+  const result = await client.query(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(doc_no FROM $1::int) AS int)), 0) + 1 AS next_no
+     FROM ic_trans
+     WHERE trans_flag = 2 AND doc_no LIKE $2::text`,
+    [prefix.length + 1, prefix + '%'],
+  )
+  const nextNo = Number(result.rows[0]?.next_no || 1)
+  return `${prefix}${nextNo}`
+}
+
+// แปลงวันที่ ISO (YYYY-MM-DD) เป็นวันที่ไทย d/M/yyyy (พ.ศ.) สำหรับ logs.data1
+function toThaiDocDate(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00')
+  const day = d.getDate()
+  const month = d.getMonth() + 1
+  const thaiYear = d.getFullYear() + 543
+  return `${day}/${month}/${thaiYear}`
+}
+
+// สร้าง GUID 32 hex ไม่มี dash
+function newPRLogGuid() {
+  return crypto.randomUUID().replace(/-/g, '')
+}
+
+router.post('/pr/create', async (req, res) => {
+  const body = req.body || {}
+  const userCode = clean(req.user?.code) || 'CRM'
+  const docDate = optionalDate(body.doc_date)
+  const docTime = clean(body.doc_time) || new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date())
+  const branchCode = clean(body.branch_code) || '0000'
+  const fallbackRemark = clean(body.remark || '').slice(0, 255) // กรณีเก่าที่ส่ง remark รวม
+  const groups = Array.isArray(body.groups) ? body.groups : []
+
+  // validate
+  if (!docDate) return res.status(400).json({ error: 'กรุณาระบุวันที่เอกสาร' })
+  if (!groups.length) return res.status(400).json({ error: 'กรุณาระบุรายการที่จะสร้าง PR' })
+
+  for (const g of groups) {
+    if (!clean(g.ap_code)) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้ของทุกกลุ่ม' })
+    if (!Array.isArray(g.items) || !g.items.length) return res.status(400).json({ error: 'แต่ละกลุ่มต้องมีสินค้าอย่างน้อย 1 รายการ' })
+    for (const it of g.items) {
+      if (!clean(it.item_code)) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+      if (!(Number(it.qty) > 0)) return res.status(400).json({ error: 'จำนวนต้องมากกว่า 0' })
+      if (Number(it.price) < 0) return res.status(400).json({ error: 'ราคาต้องไม่ติดลบ' })
+    }
+  }
+
+  try {
+    const result = await withPosTransaction(async (client) => {
+      // อ่าน vat_rate จาก erp_option
+      const vatResult = await client.query(`SELECT vat_rate FROM erp_option LIMIT 1`)
+      const vatRate = Number(vatResult.rows[0]?.vat_rate || 7)
+      const divisor = 100 + vatRate
+
+      const prDocs = []
+      for (const g of groups) {
+        const apCode = clean(g.ap_code)
+        // หมายเหตุแยกตามกลุ่ม/PR — ถ้ากลุ่มไม่ส่งมา ใช้ fallbackRemark (backward compatible)
+        const remark = clean(g.remark || fallbackRemark).slice(0, 255)
+
+        // คำนวณยอดต่อ PR
+        let totalValue = 0
+        for (const it of g.items) {
+          totalValue += Number(it.qty) * Number(it.price)
+        }
+        const totalBeforeVat = Math.round((totalValue * 100 / divisor) * 100) / 100
+        const totalVatValue = Math.round((totalValue - totalBeforeVat) * 100) / 100
+        const totalAfterVat = totalValue
+
+        // สร้าง doc_no
+        const docNo = await generatePRDocNo(client, docDate)
+
+        // INSERT ic_trans (header)
+        await client.query(
+          `INSERT INTO ic_trans (
+            trans_type, trans_flag, doc_date, doc_time, doc_no,
+            inquiry_type, vat_type, cust_code, branch_code, vat_rate,
+            total_value, total_before_vat, total_vat_value, total_after_vat, total_except_vat,
+            total_amount, balance_amount, user_request, approve_status,
+            doc_format_code, remark, creator_code, create_datetime
+          ) VALUES (
+            1, 2, $1::date, $2, $3,
+            0, 1, $4, $5, $6,
+            $7, $8, $9, $10, $7,
+            $10, $10, $11, 0,
+            'PR', $12, $11, NOW()
+          )`,
+          [
+            docDate, docTime, docNo,
+            apCode, branchCode, vatRate,
+            totalValue, totalBeforeVat, totalVatValue, totalAfterVat,
+            userCode, remark,
+          ],
+        )
+
+        // INSERT ic_trans_detail (line items, line_number 10,20,...)
+        let lineNo = 10
+        for (const it of g.items) {
+          const itemCode = clean(it.item_code)
+          const itemName = clean(it.item_name).slice(0, 255)
+          const unitCode = clean(it.unit_code)
+          // แปลง qty/price กลับเป็นหน่วยหลักก่อนบันทึก
+          // qty ที่ส่งมาอยู่ในหน่วยที่เลือก → base_qty = qty × ratio
+          // price ที่ส่งมาเป็นราคา/หน่วยที่เลือก → base_price = price / ratio
+          const ratio = Number(it.unit_ratio) || 1
+          const baseQty = Math.round(Number(it.qty) * ratio * 1000000) / 1000000
+          const basePrice = ratio > 0 ? Math.round((Number(it.price) / ratio) * 1000000) / 1000000 : Number(it.price)
+          const sumAmount = Math.round(baseQty * basePrice * 100) / 100
+          // stand_value/divide_value สำหรับหน่วยที่เลือก: เก็บเป็น ratio (เพื่อให้สามารถคำนวณย้อนได้)
+          // ปกติ smlerp เก็บ stand_value=1, divide_value=1 สำหรับหน่วยหลัก
+          const standValue = ratio
+          const divideValue = 1
+          await client.query(
+            `INSERT INTO ic_trans_detail (
+              trans_type, trans_flag, doc_date, doc_time, doc_no, cust_code,
+              item_code, item_name, unit_code, qty, price, sum_amount,
+              line_number, stand_value, divide_value, ratio, calc_flag, vat_type,
+              doc_date_calc, doc_time_calc, branch_code, creator_code, create_datetime
+            ) VALUES (
+              1, 2, $1::date, $2, $3, $4,
+              $5, $6, $7, $8, $9, $10,
+              $11, $12, 1, $13, 1, 1,
+              $1::date, $2, $14, $15, NOW()
+            )`,
+            [
+              docDate, docTime, docNo, apCode,
+              itemCode, itemName, unitCode, baseQty, basePrice, sumAmount,
+              lineNo, standValue, ratio, branchCode, userCode,
+            ],
+          )
+          lineNo += 10
+        }
+
+        // INSERT logs (audit)
+        const thaiDate = toThaiDocDate(docDate)
+        const guid = newPRLogGuid()
+        const xmlData = `<?xml version="1.0" encoding="utf-8"?><top>` +
+          `<d t=2 f=doc_date>${thaiDate}</d>` +
+          `<d t=1 f=doc_time>${docTime}</d>` +
+          `<d t=1 f=doc_no>${docNo}</d>` +
+          `<d t=1 f=doc_format_code>PR</d>` +
+          `<d t=1 f=cust_code>${apCode}</d>` +
+          `<d t=4 f=on_hold>False</d>` +
+          `<d t=5 f=inquiry_type>0</d>` +
+          `<d t=5 f=vat_type>0</d>` +
+          `<d t=1 f=user_request>${userCode}</d>` +
+          `<d t=1 f=approve_code></d>` +
+          `<d t=1 f=remark>${remark}</d>` +
+          `</top>`
+        await client.query(
+          `INSERT INTO logs (
+            function_code, data1, user_code, date_time, screen_code, guid,
+            doc_date, doc_no, doc_amount, function_type, menu_name, doc_qty
+          ) VALUES (1, $1, $2, NOW(), 2, $3, $4::date, $5, $6, 2, 'menu_purchase_requisition', $7)`,
+          [xmlData, userCode, guid, docDate, docNo, totalAfterVat, g.items.length],
+        )
+
+        prDocs.push({
+          ap_code: apCode,
+          ap_name: clean(g.ap_name || ''),
+          doc_no: docNo,
+          total_amount: totalAfterVat,
+          item_count: g.items.length,
+        })
+      }
+      return { prDocs }
+    })
+
+    res.json({
+      success: true,
+      pr_count: result.prDocs.length,
+      pr_docs: result.prDocs,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 router.get('/items/:icCode/suppliers', async (req, res) => {
   const icCode = clean(req.params.icCode)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
@@ -1429,7 +2118,10 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
       metricSql,
       [options.asOfDate, options.warehouse, options.days, ...where.params, icCode],
     )
-    if (!metricResult.rows.length) return res.status(404).json({ error: 'ไม่พบสินค้า' })
+    if (!metricResult.rows.length) {
+      const msg = await resolveItemMissingError(icCode)
+      return res.status(404).json({ error: msg })
+    }
     const metric = metricResult.rows[0]
 
     const supplierResult = await posDB.query(
@@ -1469,8 +2161,8 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          COALESCE(r.is_preferred, 0) AS is_preferred,
          ROW_NUMBER() OVER (
            ORDER BY
-             COALESCE(lp.price, 999999999999),
              CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+             COALESCE(lp.price, 999999999999),
              lp.doc_date DESC NULLS LAST,
              link.ap_code
          ) AS rank_no
@@ -1483,10 +2175,6 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
        WHERE link.ic_code = $1::text
          AND COALESCE(link.ap_code, '') <> ''
          AND COALESCE(r.planning_enabled, 1) = 1
-         AND COALESCE(r.lead_time_days, 0) > 0
-         AND COALESCE(r.late_buffer_days, 0) > 0
-         AND COALESCE(r.wholesale_buffer_days, 0) > 0
-         AND COALESCE(r.order_cycle_days, 0) > 0
        ORDER BY rank_no, link.ap_code`,
       [icCode],
     )
@@ -1500,11 +2188,10 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
       const available = Number(metric.available_qty || 0)
       const minStock = dAvg * (lead + late + wholesale)
       const maxStock = dAvg * (lead + late + wholesale + cycle)
-      const packSize = Math.max(Number(supplier.pack_size || 1), 0.000001)
       const minOrderQty = Math.max(Number(supplier.min_order_qty || 0), 0)
       const hasEnoughSalesDays = Number(metric.active_stock_days || 0) >= Number(options.days || 30)
       const suggestQty = dAvg > 0 && hasEnoughSalesDays && available <= minStock
-        ? Math.ceil(Math.max(maxStock - available, minOrderQty, 0) / packSize) * packSize
+        ? Math.ceil(Math.max(maxStock - available, minOrderQty, 0))
         : 0
       return {
         ...supplier,
@@ -1517,6 +2204,52 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
     })
 
     res.json({ item: metric, data: suppliers, options })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /purchase-planning/items/:icCode/units — ดึงหน่วยนับทั้งหมดของสินค้า
+// ใช้สำหรับแปลงหน่วยสต๊อก/แนะนำซื้อ (ratio = stand_value / divide_value)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/items/:icCode/units', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  try {
+    const unitResult = await posDB.query(
+      `SELECT
+         COALESCE(i.unit_standard, '') AS base_unit,
+         uu.code AS unit_code,
+         COALESCE(NULLIF(uu.stand_value, 0), 1) AS stand_value,
+         COALESCE(NULLIF(uu.divide_value, 0), 1) AS divide_value,
+         COALESCE(NULLIF(uu.stand_value, 0), 1) / COALESCE(NULLIF(uu.divide_value, 0), 1) AS ratio,
+         uu.row_order,
+         uu.line_number
+       FROM ic_inventory i
+       LEFT JOIN ic_unit_use uu ON uu.ic_code = i.code
+       WHERE i.code = $1::text
+       ORDER BY uu.line_number, uu.row_order`,
+      [icCode],
+    )
+
+    const baseUnit = unitResult.rows[0]?.base_unit || ''
+    // กรณีไม่มี ic_unit_use เลย → ใช้แค่หน่วยมาตรฐาน
+    const units = unitResult.rows
+      .filter((r) => r.unit_code)
+      .map((r) => ({
+        unit_code: r.unit_code,
+        stand_value: Number(r.stand_value),
+        divide_value: Number(r.divide_value),
+        ratio: Number(r.ratio),
+        is_base: Number(r.ratio) === 1,
+      }))
+    if (!units.length && baseUnit) {
+      units.push({ unit_code: baseUnit, stand_value: 1, divide_value: 1, ratio: 1, is_base: true })
+    }
+
+    res.json({ base_unit: baseUnit, units })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1572,11 +2305,36 @@ router.get('/items/:icCode/detail', async (req, res) => {
            COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '89 day'), 0) AS qty_90,
            COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '179 day'), 0) AS qty_180,
            COALESCE(SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS qty_365,
-           COALESCE(SUM(td.sum_amount) FILTER (WHERE td.doc_date::date >= $2::date - interval '29 day'), 0) AS amount_30,
-           COALESCE(SUM(td.sum_amount) FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS amount_365
+           -- มูลค่าขายสุทธิ = ขาย44 - รับคืน48 (sum_amount_exclude_vat) แยกตามช่วง
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '29 day'), 0) AS amount_net_30,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '89 day'), 0) AS amount_net_90,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '179 day'), 0) AS amount_net_180,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS amount_net_365,
+           -- ต้นทุนสุทธิ
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '29 day'), 0) AS cost_net_30,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '89 day'), 0) AS cost_net_90,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '179 day'), 0) AS cost_net_180,
+           COALESCE(SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END
+                     - CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_of_cost, 0) ELSE 0 END)
+                     FILTER (WHERE td.doc_date::date >= $2::date - interval '364 day'), 0) AS cost_net_365
          FROM ic_trans_detail td
-         WHERE td.trans_flag = 44
-           AND COALESCE(td.status, 0) = 0
+         JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
+         WHERE td.trans_flag IN (44, 48)
+           AND COALESCE(t.last_status, 0) = 0
            AND td.item_code = $1::text
            AND td.doc_date::date BETWEEN $2::date - interval '364 day' AND $2::date`,
         [icCode, options.asOfDate],
@@ -1584,15 +2342,17 @@ router.get('/items/:icCode/detail', async (req, res) => {
       posDB.query(
         `SELECT
            COALESCE(td.cust_code, '') AS cust_code,
+           COALESCE(c.name_1, '') AS cust_name,
            SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty,
            SUM(td.sum_amount) AS amount,
            MAX(td.doc_date)::date AS last_sale_date
          FROM ic_trans_detail td
+         LEFT JOIN ar_customer c ON c.code = td.cust_code
          WHERE td.trans_flag = 44
            AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
            AND td.doc_date::date BETWEEN $2::date - interval '364 day' AND $2::date
-         GROUP BY td.cust_code
+         GROUP BY td.cust_code, c.name_1
          ORDER BY qty DESC NULLS LAST
          LIMIT 10`,
         [icCode, options.asOfDate],
@@ -1637,7 +2397,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
          FROM ic_trans_detail td
          LEFT JOIN ap_supplier s ON s.code = td.cust_code
          WHERE td.trans_flag = 6
-           AND COALESCE(td.last_status, 0) = 0
+           AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
          ORDER BY td.doc_date DESC, td.doc_time DESC
          LIMIT 20`,
@@ -1680,18 +2440,17 @@ router.get('/items/:icCode/detail', async (req, res) => {
            ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
          WHERE link.ic_code = $1::text
            AND COALESCE(r.planning_enabled, 1) = 1
-           AND COALESCE(r.lead_time_days, 0) > 0
-           AND COALESCE(r.late_buffer_days, 0) > 0
-           AND COALESCE(r.wholesale_buffer_days, 0) > 0
-           AND COALESCE(r.order_cycle_days, 0) > 0
-         ORDER BY COALESCE(lp.price, 999999999999),
-                  CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+         ORDER BY CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+                  COALESCE(lp.price, 999999999999),
                   link.ap_code`,
         [icCode],
       ),
     ])
 
-    if (!metricResult.rows.length) return res.status(404).json({ error: 'ไม่พบสินค้า' })
+    if (!metricResult.rows.length) {
+      const msg = await resolveItemMissingError(icCode)
+      return res.status(404).json({ error: msg })
+    }
 
     const item = metricResult.rows[0]
     res.json({
@@ -1724,7 +2483,10 @@ router.post('/trigger-alert', requireRole('admin', 'manager'), async (req, res) 
 
   try {
     const { runPurchaseAlert } = require('../services/cronJobs')
-    const today = new Date().toISOString().slice(0, 10)
+    // ใช้วันที่ไทย (Asia/Bangkok) ให้ตรงกับ cron จริง ไม่ใช่ UTC
+    const today = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date())
     const result = await runPurchaseAlert({ todayStr: today, skipDedup: true })
     res.json({ success: true, ...result })
   } catch (err) {
@@ -1741,14 +2503,9 @@ router.get('/item-supplier-link/items', async (req, res) => {
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 20))
   const offset = (page - 1) * limit
 
-  const params = []
-  let whereSql = ''
-  const keywords = search.split(/\s+/).filter(Boolean)
-  for (const kw of keywords) {
-    params.push(`%${kw}%`)
-    const p = `$${params.length}`
-    whereSql += ` AND (i.code ILIKE ${p} OR COALESCE(i.name_1,'') ILIKE ${p})`
-  }
+  const searchClauseResult = itemSearchClause(search, 1)
+  const params = [...searchClauseResult.params]
+  const whereSql = searchClauseResult.sql
 
   try {
     const [countResult, dataResult] = await Promise.all([
@@ -1926,17 +2683,12 @@ router.get('/item-supplier-link/by-supplier/:apCode/linked', async (req, res) =>
 // GET /item-supplier-link/by-supplier/:apCode/available?search= — สินค้าที่ยังไม่ผูกกับเจ้าหนี้นี้
 router.get('/item-supplier-link/by-supplier/:apCode/available', async (req, res) => {
   const apCode = clean(req.params.apCode)
-  const search = clean(req.query.search)
   if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
 
   const params = [apCode]
-  let searchSql = ''
-  const keywords = search.split(/\s+/).filter(Boolean)
-  for (const kw of keywords) {
-    params.push(`%${kw}%`)
-    const p = `$${params.length}`
-    searchSql += ` AND (i.code ILIKE ${p} OR COALESCE(i.name_1,'') ILIKE ${p})`
-  }
+  const searchClauseResult = itemSearchClause(clean(req.query.search), 2)
+  params.push(...searchClauseResult.params)
+  const searchSql = searchClauseResult.sql
 
   try {
     const result = await posDB.query(

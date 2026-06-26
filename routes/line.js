@@ -305,10 +305,11 @@ router.get('/status', authMiddleware, async (req, res) => {
       SELECT line_user_id, line_display_name, line_picture_url,
              line_linked_at, line_notify_enabled, line_notify_time,
              overdue_notify_time, due_tomorrow_notify_time,
-             purchase_alert_notify_enabled, purchase_alert_notify_time
+             purchase_alert_notify_enabled
       FROM crm_users WHERE id=$1
     `, [req.user.id])
     const u = result.rows[0]
+    if (!u) return res.status(404).json({ error: 'ไม่พบข้อมูลผู้ใช้' })
     res.json({
       linked:           !!u.line_user_id,
       line_display_name: u.line_display_name,
@@ -319,7 +320,6 @@ router.get('/status', authMiddleware, async (req, res) => {
       overdue_notify_time:      u.overdue_notify_time,
       due_tomorrow_notify_time: u.due_tomorrow_notify_time,
       purchase_alert_notify_enabled: u.purchase_alert_notify_enabled,
-      purchase_alert_notify_time: u.purchase_alert_notify_time,
       can_configure_purchase_alerts: isAdminUp(req.user)
     })
   } catch (err) {
@@ -337,13 +337,11 @@ router.put('/settings', authMiddleware, async (req, res) => {
     overdue_notify_time,
     due_tomorrow_notify_time,
     purchase_alert_notify_enabled,
-    purchase_alert_notify_time,
   } = req.body
   const dailyTime = normalizeHHMM(notify_time, '08:00')
   const overdueTime = normalizeHHMM(overdue_notify_time, '08:00')
   const dueTomorrowTime = normalizeHHMM(due_tomorrow_notify_time, '17:00')
-  const purchaseAlertTime = normalizeHHMM(purchase_alert_notify_time, '08:00')
-  if (!dailyTime || !overdueTime || !dueTomorrowTime || !purchaseAlertTime) {
+  if (!dailyTime || !overdueTime || !dueTomorrowTime) {
     return res.status(400).json({ error: 'เวลาแจ้งเตือนไม่ถูกต้อง' })
   }
 
@@ -355,16 +353,14 @@ router.put('/settings', authMiddleware, async (req, res) => {
             line_notify_time=$2,
             overdue_notify_time=$3,
             due_tomorrow_notify_time=$4,
-            purchase_alert_notify_enabled=$5,
-            purchase_alert_notify_time=$6
-        WHERE id=$7
+            purchase_alert_notify_enabled=$5
+        WHERE id=$6
       `, [
         notify_enabled,
         dailyTime,
         overdueTime,
         dueTomorrowTime,
         purchase_alert_notify_enabled,
-        purchaseAlertTime,
         req.user.id,
       ])
     } else {
