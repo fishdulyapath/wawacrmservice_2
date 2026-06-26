@@ -59,6 +59,8 @@ function supplierPayload(body) {
     branch_code: normalizeText(body.branch_code),
     branch_type: normalizeInt(body.branch_type),
     credit_day: normalizeInt(body.credit_day),
+    // tax_type: '0'=ภาษีแยกนอก, '1'=ภาษีรวมใน, '2'=ภาษีศูนย์ (''=ไม่มี)
+    tax_type: ['0', '1', '2'].includes(String(body.tax_type)) ? String(body.tax_type) : '',
   }
 }
 
@@ -128,7 +130,8 @@ router.get('/', async (req, res) => {
               COALESCE(d.tax_id,'') AS tax_id,
               COALESCE(d.branch_code,'') AS branch_code,
               COALESCE(d.branch_type,0) AS branch_type,
-              COALESCE(d.credit_day,0) AS credit_day
+              COALESCE(d.credit_day,0) AS credit_day,
+              COALESCE(d.tax_type,'') AS tax_type
        FROM ap_supplier s
        LEFT JOIN ap_supplier_detail d ON d.ap_code = s.code
        ${whereSql}
@@ -170,7 +173,8 @@ router.get('/:code', async (req, res) => {
               COALESCE(d.tax_id,'') AS tax_id,
               COALESCE(d.branch_code,'') AS branch_code,
               COALESCE(d.branch_type,0) AS branch_type,
-              COALESCE(d.credit_day,0) AS credit_day
+              COALESCE(d.credit_day,0) AS credit_day,
+              COALESCE(d.tax_type,'') AS tax_type
        FROM ap_supplier s
        LEFT JOIN ap_supplier_detail d ON d.ap_code = s.code
        WHERE s.code = $1::text
@@ -228,14 +232,15 @@ router.post('/', async (req, res) => {
       )
 
       await client.query(
-        `INSERT INTO ap_supplier_detail (ap_code, tax_id, branch_code, branch_type, credit_day)
-         VALUES ($1::text,$2::text,$3::text,$4::integer,$5::integer)
+        `INSERT INTO ap_supplier_detail (ap_code, tax_id, branch_code, branch_type, credit_day, tax_type)
+         VALUES ($1::text,$2::text,$3::text,$4::integer,$5::integer,$6::text)
          ON CONFLICT (ap_code) DO UPDATE SET
            tax_id = EXCLUDED.tax_id,
            branch_code = EXCLUDED.branch_code,
            branch_type = EXCLUDED.branch_type,
-           credit_day = EXCLUDED.credit_day`,
-        [payload.code, payload.tax_id, payload.branch_code, payload.branch_type, payload.credit_day],
+           credit_day = EXCLUDED.credit_day,
+           tax_type = EXCLUDED.tax_type`,
+        [payload.code, payload.tax_id, payload.branch_code, payload.branch_type, payload.credit_day, payload.tax_type],
       )
     })
     res.status(201).json({ success: true, code: payload.code })
@@ -290,14 +295,15 @@ router.put('/:code', async (req, res) => {
       if (result.rowCount === 0) throw httpError('ไม่พบเจ้าหนี้', 404)
 
       await client.query(
-        `INSERT INTO ap_supplier_detail (ap_code, tax_id, branch_code, branch_type, credit_day)
-         VALUES ($1::text,$2::text,$3::text,$4::integer,$5::integer)
+        `INSERT INTO ap_supplier_detail (ap_code, tax_id, branch_code, branch_type, credit_day, tax_type)
+         VALUES ($1::text,$2::text,$3::text,$4::integer,$5::integer,$6::text)
          ON CONFLICT (ap_code) DO UPDATE SET
            tax_id = EXCLUDED.tax_id,
            branch_code = EXCLUDED.branch_code,
            branch_type = EXCLUDED.branch_type,
-           credit_day = EXCLUDED.credit_day`,
-        [payload.code, payload.tax_id, payload.branch_code, payload.branch_type, payload.credit_day],
+           credit_day = EXCLUDED.credit_day,
+           tax_type = EXCLUDED.tax_type`,
+        [payload.code, payload.tax_id, payload.branch_code, payload.branch_type, payload.credit_day, payload.tax_type],
       )
     })
     res.json({ success: true, code: payload.code })

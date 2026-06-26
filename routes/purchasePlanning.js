@@ -709,6 +709,7 @@ function buildPlanningMetricsSql({
         link.ic_code,
         link.ap_code,
         COALESCE(s.name_1, '') AS ap_name,
+        COALESCE(sd.tax_type, '') AS tax_type,
         lp.price AS last_purchase_price,
         lp.price_exclude_vat AS last_purchase_price_exclude_vat,
         COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
@@ -733,6 +734,7 @@ function buildPlanningMetricsSql({
       FROM ap_item_by_supplier link
       JOIN candidates c ON c.ic_code = link.ic_code
       LEFT JOIN ap_supplier s ON s.code = link.ap_code
+      LEFT JOIN ap_supplier_detail sd ON sd.ap_code = link.ap_code AND COALESCE(sd.tax_type, '') <> ''
       LEFT JOIN purchase_planning_item_supplier_resolved r
         ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
       LEFT JOIN latest_purchase lp
@@ -788,7 +790,8 @@ function buildPlanningMetricsSql({
         COALESCE(NULLIF(cs.pack_size, 0), 1) AS pack_size,
         COALESCE(cs.purchase_unit_code, '') AS purchase_unit_code,
         COALESCE(cs.is_preferred, 0) AS is_preferred,
-        COALESCE(cs.supplier_count, 0) AS supplier_count
+        COALESCE(cs.supplier_count, 0) AS supplier_count,
+        COALESCE(cs.tax_type, '') AS tax_type
       FROM candidates c
       LEFT JOIN stock_balance sb ON sb.ic_code = c.ic_code AND sb.warehouse = $2::text
       LEFT JOIN davg dv ON dv.ic_code = c.ic_code
@@ -824,6 +827,29 @@ function buildPlanningMetricsSql({
     FROM final_rows
     ORDER BY suggest_qty DESC NULLS LAST, ic_code
   `
+}
+
+// นับใบเสนอซื้อ (PR, trans_flag=2) ที่ยังไม่ถูกดึงไปทำซื้อ (doc_success=0)
+// แยกตามเจ้าหนี้ (ap_code) และรวมทั้งหมด
+async function getPendingPRCount() {
+  const result = await posDB.query(
+    `SELECT
+       t.cust_code AS ap_code,
+       COUNT(DISTINCT t.doc_no)::int AS pr_count
+     FROM ic_trans t
+     WHERE t.trans_flag = 2
+       AND COALESCE(t.doc_success, 0) = 0
+       AND COALESCE(t.last_status, 0) = 0
+       AND COALESCE(t.cust_code, '') <> ''
+     GROUP BY t.cust_code`,
+  )
+  const byAp = {}
+  let total = 0
+  for (const row of result.rows) {
+    byAp[row.ap_code] = Number(row.pr_count)
+    total += Number(row.pr_count)
+  }
+  return { total, byAp }
 }
 
 function summaryFromRows(rows) {
@@ -1033,6 +1059,11 @@ async function runReportJob(job) {
 
     sortPlanningRows(job.rows)
     job.summary = summaryFromRows(job.rows)
+    try {
+      job.pending_pr = await getPendingPRCount()
+    } catch {
+      job.pending_pr = { total: 0, byAp: {} }
+    }
     job.status = 'complete'
     job.processed = job.total
     job.updatedAt = Date.now()
@@ -1063,6 +1094,7 @@ router.get('/supplier-settings', async (req, res) => {
       `SELECT
           s.code AS ap_code,
           COALESCE(s.name_1, '') AS ap_name,
+          COALESCE(sd.tax_type, '') AS tax_type,
           p.lead_time_days,
           p.late_buffer_days,
           p.wholesale_buffer_days,
@@ -1071,6 +1103,7 @@ router.get('/supplier-settings', async (req, res) => {
           COALESCE(p.remark, '') AS remark,
           p.last_update_date_time
        FROM ap_supplier s
+       LEFT JOIN ap_supplier_detail sd ON sd.ap_code = s.code AND COALESCE(sd.tax_type, '') <> ''
        LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
        WHERE COALESCE(s.code, '') <> ''${search.sql}${enabledClause}
        ORDER BY s.code
@@ -1122,6 +1155,7 @@ router.post('/supplier-settings/save/:apCode', async (req, res) => {
         userCode,
       ],
     )
+
     res.json({ success: true, data: result.rows[0] })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -1199,6 +1233,7 @@ router.get('/supplier-settings/export', async (req, res) => {
       `SELECT
           s.code AS ap_code,
           COALESCE(s.name_1, '') AS ap_name,
+          COALESCE(sd.tax_type, '') AS tax_type,
           p.lead_time_days,
           p.late_buffer_days,
           p.wholesale_buffer_days,
@@ -1206,6 +1241,7 @@ router.get('/supplier-settings/export', async (req, res) => {
           COALESCE(p.planning_enabled, 0) AS planning_enabled,
           COALESCE(p.remark, '') AS remark
        FROM ap_supplier s
+       LEFT JOIN ap_supplier_detail sd ON sd.ap_code = s.code AND COALESCE(sd.tax_type, '') <> ''
        LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
        WHERE COALESCE(s.code, '') <> ''
        ORDER BY s.code`,
@@ -1826,6 +1862,7 @@ router.get('/report', async (req, res) => {
       limit,
       options,
       summary: summaryFromRows(rowsResult.rows),
+      pending_pr: await getPendingPRCount(),
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
@@ -1911,6 +1948,7 @@ router.get('/report-lazy/:jobId', async (req, res) => {
     has_more: job.status === 'complete' ? offset + rows.length < job.rows.length : true,
     summary: job.status === 'complete' ? job.summary : null,
     partial_summary: job.partialSummary,
+    pending_pr: job.pending_pr || { total: 0, byAp: {} },
     options: job.options,
   })
 })
@@ -2146,6 +2184,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          link.ic_code,
          link.ap_code,
          COALESCE(s.name_1, '') AS ap_name,
+         COALESCE(sd.tax_type, '') AS tax_type,
          lp.price AS last_purchase_price,
          lp.price_exclude_vat AS last_purchase_price_exclude_vat,
          COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
@@ -2168,6 +2207,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          ) AS rank_no
        FROM ap_item_by_supplier link
        LEFT JOIN ap_supplier s ON s.code = link.ap_code
+       LEFT JOIN ap_supplier_detail sd ON sd.ap_code = link.ap_code AND COALESCE(sd.tax_type, '') <> ''
        LEFT JOIN purchase_planning_item_supplier_resolved r
          ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
        LEFT JOIN latest_purchase lp
@@ -2282,6 +2322,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
            td.doc_no,
            td.cust_code AS ap_code,
            COALESCE(s.name_1, '') AS ap_name,
+           COALESCE(sd.tax_type, '') AS tax_type,
            td.barcode,
            td.unit_code,
            td.qty,
@@ -2292,6 +2333,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
            td.average_cost
          FROM ic_trans_detail td
          LEFT JOIN ap_supplier s ON s.code = td.cust_code
+         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = td.cust_code AND COALESCE(sd.tax_type, '') <> ''
          WHERE td.trans_flag = 12
            AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
@@ -2390,14 +2432,18 @@ router.get('/items/:icCode/detail', async (req, res) => {
            td.doc_no,
            td.cust_code AS ap_code,
            COALESCE(s.name_1, '') AS ap_name,
+           COALESCE(sd.tax_type, '') AS tax_type,
            td.qty,
            td.unit_code,
            td.ref_doc_no,
            GREATEST(($2::date - td.doc_date::date), 0)::int AS waiting_days
          FROM ic_trans_detail td
+         JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
          LEFT JOIN ap_supplier s ON s.code = td.cust_code
+         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = td.cust_code AND COALESCE(sd.tax_type, '') <> ''
          WHERE td.trans_flag = 6
            AND COALESCE(td.status, 0) = 0
+           AND COALESCE(t.doc_success, 0) = 0
            AND td.item_code = $1::text
          ORDER BY td.doc_date DESC, td.doc_time DESC
          LIMIT 20`,
@@ -2422,6 +2468,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
          SELECT
            link.ap_code,
            COALESCE(s.name_1, '') AS ap_name,
+           COALESCE(sd.tax_type, '') AS tax_type,
            lp.price AS last_purchase_price,
            lp.unit_code AS last_purchase_unit_code,
            lp.doc_date AS last_purchase_date,
@@ -2434,6 +2481,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
            COALESCE(r.is_preferred, 0) AS is_preferred
          FROM ap_item_by_supplier link
          LEFT JOIN ap_supplier s ON s.code = link.ap_code
+         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = link.ap_code AND COALESCE(sd.tax_type, '') <> ''
          LEFT JOIN purchase_planning_item_supplier_resolved r
            ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
          LEFT JOIN latest_purchase lp
