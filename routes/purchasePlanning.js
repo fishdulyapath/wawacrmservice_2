@@ -2444,6 +2444,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
          WHERE td.trans_flag = 6
            AND COALESCE(td.status, 0) = 0
            AND COALESCE(t.doc_success, 0) = 0
+           AND COALESCE(t.last_status, 0) = 0
            AND td.item_code = $1::text
          ORDER BY td.doc_date DESC, td.doc_time DESC
          LIMIT 20`,

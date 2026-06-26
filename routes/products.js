@@ -8,7 +8,17 @@ const router = express.Router()
 const PRODUCT_CODE_PATTERN = /^[A-Z0-9_-]+$/
 const PRODUCT_IMAGE_CACHE_CONTROL = 'private, max-age=0, must-revalidate'
 
-router.use(authMiddleware, requireRole('admin'))
+// Public: รูปภาพสินค้า (GET /images/primary, GET /images/:guid) ใช้แสดงผลใน <img>
+// ซึ่ง browser ส่ง Authorization header ไม่ได้ จึงยกเว้น auth/role เฉพาะทางนี้
+// ส่วน /images/list (JSON metadata) และทุก write route ยังต้องมีสิทธิ์ admin เหมือนเดิม
+const PUBLIC_IMAGE_GET_RE = /^\/images\/(?!list$|order$)[^/]+$/
+router.use((req, res, next) => {
+  if (req.method === 'GET' && PUBLIC_IMAGE_GET_RE.test(req.path)) return next()
+  authMiddleware(req, res, next)
+}, (req, res, next) => {
+  if (req.method === 'GET' && PUBLIC_IMAGE_GET_RE.test(req.path)) return next()
+  requireRole('admin')(req, res, next)
+})
 
 function activeProductCondition(alias = 'd') {
   return `COALESCE(${alias}.is_hold_sale,0) <> 1 AND COALESCE(${alias}.is_hold_purchase,0) <> 1`
