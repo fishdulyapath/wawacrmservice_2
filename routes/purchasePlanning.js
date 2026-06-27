@@ -2305,7 +2305,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
   const metricSql = buildPlanningMetricsSql({ whereSql: where.sql, startIndex: 4 + where.params.length, includePagination: false, singleItem: true })
 
   try {
-    const [metricResult, barcodeResult, purchaseResult, salesTotalResult, topCustomerResult, chartResult, pendingResult, supplierResult] = await Promise.all([
+    const [metricResult, barcodeResult, purchaseResult, salesTotalResult, topCustomerResult, chartResult, pendingResult, supplierResult, billReceiveResult] = await Promise.all([
       posDB.query(metricSql, [options.asOfDate, options.warehouse, options.days, ...where.params, icCode]),
       posDB.query(
         `SELECT barcode, COALESCE(unit_code, '') AS unit_code
@@ -2494,6 +2494,23 @@ router.get('/items/:icCode/detail', async (req, res) => {
                   link.ap_code`,
         [icCode],
       ),
+      // ทยอยรับ (trans_flag=310, status=0) — 5 ใบล่าสุด
+      posDB.query(
+        `SELECT
+           td.doc_date::date AS doc_date,
+           td.doc_time,
+           td.doc_no,
+           td.qty,
+           td.unit_code,
+           td.price_exclude_vat
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 310
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = $1::text
+         ORDER BY td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         LIMIT 10`,
+        [icCode],
+      ),
     ])
 
     if (!metricResult.rows.length) {
@@ -2514,6 +2531,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
       movement_chart: chartResult.rows,
       pending_receive: pendingResult.rows,
       suppliers: supplierResult.rows,
+      bill_receive: billReceiveResult.rows,
       options,
     })
   } catch (err) {
