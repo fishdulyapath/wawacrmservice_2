@@ -1,12 +1,21 @@
 const express = require('express')
 const router = express.Router()
+const multer = require('multer')
+const sharp  = require('sharp')
+const fs     = require('fs')
+const nodePath = require('path')
 const { posDB, crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 const { logAudit } = require('../middleware/audit')
 const { ensureCustomerFollowupPolicy, normalizeFollowupInterval } = require('../services/followupPolicy')
 
+const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } })
+
 // ทุก endpoint ต้อง Login ก่อน
 router.use(authMiddleware)
+
+// Migration: เพิ่ม column shop_image ถ้ายังไม่มี
+crmDB.query(`ALTER TABLE crm_customer_profile ADD COLUMN IF NOT EXISTS shop_image TEXT`).catch(() => {})
 
 const canManageFollowup = u => u?.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u?.role)
 let customerStoreLinkReady = false
@@ -766,6 +775,69 @@ router.post('/', async (req, res) => {
 })
 
 // ─────────────────────────────────────────────
+// POST /api/customers/:code/shop-image  — อัปโหลดรูปร้านค้า
+// ─────────────────────────────────────────────
+router.post('/:code/shop-image', uploadMem.single('image'), async (req, res) => {
+  const { code } = req.params
+  if (!req.file) return res.status(400).json({ error: 'ไม่พบไฟล์รูป' })
+  try {
+    // ลบรูปเก่าก่อน
+    const existing = await crmDB.query(
+      `SELECT shop_image FROM crm_customer_profile WHERE ar_code = $1`, [code]
+    )
+    const oldRel = existing.rows[0]?.shop_image
+    if (oldRel) {
+      const absOld = nodePath.join(__dirname, '../uploads', oldRel)
+      if (fs.existsSync(absOld)) fs.unlinkSync(absOld)
+    }
+
+    const dir = nodePath.join(__dirname, '../uploads/customers', code)
+    fs.mkdirSync(dir, { recursive: true })
+
+    const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.webp`
+    const relPath  = `customers/${code}/${filename}`
+    const absPath  = nodePath.join(dir, filename)
+
+    await sharp(req.file.buffer)
+      .rotate()
+      .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
+      .webp({ quality: 85 })
+      .toFile(absPath)
+
+    await crmDB.query(`
+      INSERT INTO crm_customer_profile (ar_code, shop_image)
+      VALUES ($1, $2)
+      ON CONFLICT (ar_code) DO UPDATE SET shop_image = EXCLUDED.shop_image, updated_at = NOW()
+    `, [code, relPath])
+
+    res.json({ success: true, shop_image: relPath })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// DELETE /api/customers/:code/shop-image  — ลบรูปร้านค้า
+// ─────────────────────────────────────────────
+router.delete('/:code/shop-image', async (req, res) => {
+  const { code } = req.params
+  try {
+    const existing = await crmDB.query(
+      `SELECT shop_image FROM crm_customer_profile WHERE ar_code = $1`, [code]
+    )
+    const oldRel = existing.rows[0]?.shop_image
+    if (oldRel) {
+      const absOld = nodePath.join(__dirname, '../uploads', oldRel)
+      if (fs.existsSync(absOld)) fs.unlinkSync(absOld)
+    }
+    await crmDB.query(
+      `UPDATE crm_customer_profile SET shop_image = NULL, updated_at = NOW() WHERE ar_code = $1`, [code]
+    )
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 // PUT /api/customers/:code  — แก้ไขลูกค้า
 // ─────────────────────────────────────────────
 router.put('/:code', async (req, res) => {
