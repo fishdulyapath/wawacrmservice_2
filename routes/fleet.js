@@ -1222,6 +1222,168 @@ router.get('/stores/:storeId/report', managerOnly, async (req, res) => {
   }
 })
 
+// ---------------------------------------------------------------------------
+// GET /api/fleet/customer/:ar_code/timeline
+// ประวัติการขนส่ง TMS ของลูกค้า (by ar_code via crm_customer_store_link)
+// query: from, to, bill, page (default 1), limit (default 20)
+// ---------------------------------------------------------------------------
+router.get('/customer/:ar_code/timeline', managerOnly, async (req, res) => {
+  try {
+    await ensureCustomerStoreLinkTable()
+    const { ar_code } = req.params
+    const { from, to, bill = '', page = 1, limit = 20 } = req.query
+    const limitVal  = parseLimit(limit, 20, 100)
+    const pageVal   = Math.max(1, parseInt(page) || 1)
+    const offsetVal = (pageVal - 1) * limitVal
+
+    // หา store_ids ที่ link กับ ar_code นี้
+    const linkResult = await crmDB.query(
+      `SELECT store_id FROM crm_customer_store_link
+       WHERE ar_code = $1 AND deleted_at IS NULL
+       ORDER BY CASE WHEN link_type = 'manual' THEN 0 ELSE 1 END, confidence DESC NULLS LAST`,
+      [ar_code]
+    )
+    const storeIds = linkResult.rows.length
+      ? linkResult.rows.map(r => r.store_id)
+      : [ar_code]  // fallback: ใช้ ar_code เป็น store_id ตรงๆ
+
+    const baseDateCol = `COALESCE(co.date_time_check_out, ci.date_time_check_in, ls.created_at)`
+    const conds = ['ls.deleted_at IS NULL', 'ls.store_id = ANY($1)']
+    const vals  = [storeIds]
+
+    pushDateFilter(conds, vals, from, to, baseDateCol)
+
+    const billQuery = String(bill || '').trim()
+    if (billQuery) {
+      vals.push(`%${billQuery}%`)
+      conds.push(`(
+        ls.data_store_no ILIKE $${vals.length}
+        OR ls.store_name_result ILIKE $${vals.length}
+        OR cr.car_release_code ILIKE $${vals.length}
+      )`)
+    }
+
+    const where = conds.join(' AND ')
+
+    const countResult = await crmDB.query(
+      `SELECT COUNT(DISTINCT ls.list_id)::int AS total
+       FROM fleet_list_stores ls
+       LEFT JOIN fleet_check_ins ci ON ci.list_id = ls.list_id AND ci.deleted_at IS NULL
+       LEFT JOIN fleet_check_outs co ON co.list_id = ls.list_id AND co.deleted_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT car_release_code
+         FROM fleet_car_releases cr
+         WHERE cr.group_store_id = ls.group_store_id AND cr.deleted_at IS NULL
+         ORDER BY cr.trip_date DESC NULLS LAST, cr.created_at DESC NULLS LAST, cr.car_release_id
+         LIMIT 1
+       ) cr ON TRUE
+       WHERE ${where}`,
+      vals
+    )
+    const total = countResult.rows[0]?.total || 0
+
+    const dataVals = [...vals, limitVal, offsetVal]
+    const dataResult = await crmDB.query(
+      `SELECT
+         ls.list_id, ls.sequence_no, ls.store_id, ls.store_name_result, ls.data_store_no,
+         ls.off_site, ls.bypass, ls.group_store_id,
+         ci.check_in_id, ci.date_time_check_in, ci.image_check_in, ci.latitude, ci.longitude,
+         co.check_out_id, co.date_time_check_out, co.amount, co.cash, co.transfer,
+         co.image_bill, co.payment_id, co.visit, co.visit_note,
+         pay.payment_name,
+         COALESCE(v.visit_name, co.visit) AS visit_name,
+         cr.car_release_id, cr.car_release_code, cr.trip_date, cr.description AS trip_description,
+         u.name AS driver_name, c.car_name, c.license_plate,
+         COALESCE(prob.problem_count, 0)::int AS problem_count,
+         COALESCE(prob.problem_types, '') AS problem_types
+       FROM fleet_list_stores ls
+       LEFT JOIN fleet_check_ins ci ON ci.list_id = ls.list_id AND ci.deleted_at IS NULL
+       LEFT JOIN fleet_check_outs co ON co.list_id = ls.list_id AND co.deleted_at IS NULL
+       LEFT JOIN fleet_payments pay ON pay.payment_id = co.payment_id AND pay.deleted_at IS NULL
+       LEFT JOIN fleet_visits v ON v.visit_id = co.visit AND v.deleted_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT car_release_id, car_release_code, trip_date, description, user_id, car_id
+         FROM fleet_car_releases cr
+         WHERE cr.group_store_id = ls.group_store_id AND cr.deleted_at IS NULL
+         ORDER BY cr.trip_date DESC NULLS LAST, cr.created_at DESC NULLS LAST, cr.car_release_id
+         LIMIT 1
+       ) cr ON TRUE
+       LEFT JOIN fleet_users u ON u.user_id = cr.user_id
+       LEFT JOIN fleet_cars c ON c.car_id = cr.car_id
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS problem_count, STRING_AGG(DISTINCT COALESCE(problem_type, 'ไม่ระบุ'), ', ') AS problem_types
+         FROM fleet_problems p
+         WHERE p.deleted_at IS NULL AND p.list_id = ls.list_id
+       ) prob ON TRUE
+       WHERE ${where}
+       ORDER BY ${baseDateCol} DESC NULLS LAST, ls.created_at DESC NULLS LAST
+       LIMIT $${dataVals.length - 1} OFFSET $${dataVals.length}`,
+      dataVals
+    )
+
+    const rows = dataResult.rows
+
+    // batch fetch check-out images
+    const checkOutIds = rows.map(r => r.check_out_id).filter(Boolean)
+    let checkOutImagesById = {}
+    if (checkOutIds.length) {
+      const imgResult = await crmDB.query(
+        `SELECT image_check_out_id, check_out_id, image_path, note
+         FROM fleet_check_out_images
+         WHERE deleted_at IS NULL AND check_out_id = ANY($1)
+         ORDER BY created_at NULLS LAST, image_check_out_id`,
+        [checkOutIds]
+      )
+      checkOutImagesById = imgResult.rows.reduce((acc, img) => {
+        if (!acc[img.check_out_id]) acc[img.check_out_id] = []
+        acc[img.check_out_id].push(img)
+        return acc
+      }, {})
+    }
+
+    // batch fetch problems
+    const listIds = rows.map(r => r.list_id).filter(Boolean)
+    let problemsByList = {}
+    if (listIds.length) {
+      const probResult = await crmDB.query(
+        `SELECT problem_id, list_id, problem_type, description, image_problem, is_resolved, created_at
+         FROM fleet_problems
+         WHERE deleted_at IS NULL AND list_id = ANY($1)
+         ORDER BY created_at DESC NULLS LAST`,
+        [listIds]
+      )
+      problemsByList = probResult.rows.reduce((acc, p) => {
+        if (!acc[p.list_id]) acc[p.list_id] = []
+        acc[p.list_id].push(p)
+        return acc
+      }, {})
+    }
+
+    const timeline = rows.map(r => ({
+      ...r,
+      amount:           toNumber(r.amount),
+      cash:             toNumber(r.cash),
+      transfer:         toNumber(r.transfer),
+      check_out_images: checkOutImagesById[r.check_out_id] || [],
+      problems:         problemsByList[r.list_id] || [],
+    }))
+
+    res.json({
+      store_ids: storeIds,
+      timeline,
+      pagination: {
+        total,
+        page:  pageVal,
+        limit: limitVal,
+        pages: Math.ceil(total / limitVal),
+      },
+    })
+  } catch (err) {
+    console.error('[fleet/customer/:ar_code/timeline]', err.message)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
 router.get('/image', managerOnly, async (req, res) => {
   try {
     const imagePath = String(req.query.path || '').trim()
