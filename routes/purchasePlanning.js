@@ -349,12 +349,9 @@ function planningWhere(req, startIndex = 1) {
     'COALESCE(d.is_hold_purchase, 0) <> 1',
     `EXISTS (
       SELECT 1
-      FROM ap_item_by_supplier config_link
-      JOIN purchase_planning_item_supplier_resolved config_resolved
-        ON config_resolved.ic_code = config_link.ic_code
-       AND config_resolved.ap_code = config_link.ap_code
-      WHERE config_link.ic_code = i.code
-        AND COALESCE(config_resolved.planning_enabled, 0) = 1
+      FROM purchase_planning_item_supplier_setting pss
+      WHERE pss.ic_code = i.code
+        AND pss.planning_enabled = 1
     )`,
   ]
 
