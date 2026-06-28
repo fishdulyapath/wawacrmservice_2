@@ -450,17 +450,33 @@ router.get('/by-customer/:arCode', async (req, res) => {
       // close_note เก็บใน crm_activity_owners ไม่มี → ใช้ a.outcome แทน
     }
 
-    // ดึง amper จาก POS DB
+    // ดึง amper + logistic_area_name จาก POS DB
     let amperVal = null
+    let logisticAreaName = null
+    let logisticArea = null
+    let priceLevel = null
     try {
-      const posRes = await posDB.query(`SELECT amper FROM ar_customer WHERE code = $1 LIMIT 1`, [arCode])
+      const posRes = await posDB.query(`
+        SELECT amper, COALESCE(price_level, 0) AS price_level,
+               COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
+               COALESCE((SELECT name_1 FROM ar_logistic_area
+                         WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                         LIMIT 1), '') AS logistic_area_name
+        FROM ar_customer arc WHERE code = $1 LIMIT 1
+      `, [arCode])
       amperVal = posRes.rows[0]?.amper || null
+      logisticAreaName = posRes.rows[0]?.logistic_area_name || null
+      logisticArea = posRes.rows[0]?.logistic_area || null
+      priceLevel = posRes.rows[0]?.price_level ?? null
     } catch (_) {}
 
     const activities = dataRes.rows.map(a => ({
       ...a,
       status: a.derived_status || a.status,
       customer_amper: amperVal,
+      logistic_area_name: logisticAreaName,
+      logistic_area: logisticArea,
+      price_level: priceLevel,
       owners: (ownersMap[a.id] || []).map(o => ({
         user_id: o.user_id,
         name: o.name,
@@ -967,9 +983,14 @@ router.get('/', async (req, res) => {
     if (arCodes.length > 0) {
       const placeholders = arCodes.map((_, i) => `$${i + 1}`).join(',')
       const posResult = await posDB.query(
-        `SELECT code, name_1, amper FROM ar_customer WHERE code IN (${placeholders})`, arCodes
+        `SELECT arc.code, arc.name_1, arc.amper, COALESCE(arc.price_level, 0) AS price_level,
+                COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
+                COALESCE((SELECT name_1 FROM ar_logistic_area
+                          WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                          LIMIT 1), '') AS logistic_area_name
+         FROM ar_customer arc WHERE arc.code IN (${placeholders})`, arCodes
       )
-      posResult.rows.forEach(r => { customerMap[r.code] = { name: r.name_1, amper: r.amper } })
+      posResult.rows.forEach(r => { customerMap[r.code] = { name: r.name_1, amper: r.amper, price_level: r.price_level, logistic_area: r.logistic_area, logistic_area_name: r.logistic_area_name } })
     }
 
     const pageInt  = parseInt(page)
@@ -980,6 +1001,9 @@ router.get('/', async (req, res) => {
         status: r.my_status || r.derived_status || 'open',
         customer_name: customerMap[r.ar_code]?.name || null,
         customer_amper: customerMap[r.ar_code]?.amper || null,
+        price_level: customerMap[r.ar_code]?.price_level ?? null,
+        logistic_area: customerMap[r.ar_code]?.logistic_area || null,
+        logistic_area_name: customerMap[r.ar_code]?.logistic_area_name || null,
       })),
       pagination: {
         total,
@@ -1019,14 +1043,22 @@ router.get('/:id', async (req, res) => {
     activity.derived_status = deriveActivityStatus(owners)
     activity.my_status = activity.owners.find(o => o.user_id === req.user.id)?.status || null
 
-    // ดึง customer_name + amper จาก POS
+    // ดึง customer_name + amper + price_level + logistic จาก POS
     if (activity.ar_code) {
       try {
         const cusRes = await posDB.query(
-          `SELECT name_1, amper FROM ar_customer WHERE code = $1`, [activity.ar_code]
+          `SELECT name_1, amper, COALESCE(price_level, 0) AS price_level,
+                  COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
+                  COALESCE((SELECT name_1 FROM ar_logistic_area
+                            WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                            LIMIT 1), '') AS logistic_area_name
+           FROM ar_customer arc WHERE code = $1`, [activity.ar_code]
         )
-        activity.customer_name  = cusRes.rows[0]?.name_1 || null
-        activity.customer_amper = cusRes.rows[0]?.amper  || null
+        activity.customer_name      = cusRes.rows[0]?.name_1 || null
+        activity.customer_amper     = cusRes.rows[0]?.amper  || null
+        activity.price_level        = cusRes.rows[0]?.price_level ?? null
+        activity.logistic_area      = cusRes.rows[0]?.logistic_area || null
+        activity.logistic_area_name = cusRes.rows[0]?.logistic_area_name || null
       } catch {}
     }
 
