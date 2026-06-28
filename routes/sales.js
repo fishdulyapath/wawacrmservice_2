@@ -359,16 +359,17 @@ router.get('/transactions/:doc_no', requireRole('admin', 'manager'), async (req,
 router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const { cust_code } = req.params
-    const { date_from, date_to, doc_no, sale_code, page = 1, limit = 10 } = req.query
+    const { date_from, date_to, doc_no, sale_code, quote_no, page = 1, limit = 10 } = req.query
     const offset = (parseInt(page) - 1) * parseInt(limit)
 
     const params = [cust_code]
     const conds  = ['t.trans_flag = 44', 't.last_status = 0', `t.cust_code = $1`]
 
-    if (date_from)  { params.push(date_from);        conds.push(`t.doc_date >= $${params.length}::date`) }
-    if (date_to)    { params.push(date_to);          conds.push(`t.doc_date <= $${params.length}::date`) }
-    if (doc_no)     { params.push(`%${doc_no}%`);    conds.push(`t.doc_no ILIKE $${params.length}`) }
-    if (sale_code)  { params.push(`%${sale_code}%`); conds.push(`t.sale_code ILIKE $${params.length}`) }
+    if (date_from)  { params.push(date_from);         conds.push(`t.doc_date >= $${params.length}::date`) }
+    if (date_to)    { params.push(date_to);           conds.push(`t.doc_date <= $${params.length}::date`) }
+    if (doc_no)     { params.push(`%${doc_no}%`);     conds.push(`t.doc_no ILIKE $${params.length}`) }
+    if (sale_code)  { params.push(`%${sale_code}%`);  conds.push(`t.sale_code ILIKE $${params.length}`) }
+    if (quote_no)   { params.push(`%${quote_no}%`);   conds.push(`t.doc_ref ILIKE $${params.length}`) }
 
     const where = 'WHERE ' + conds.join(' AND ')
 
@@ -385,9 +386,11 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, 
         t.sale_code, e.name_1                            AS sale_name,
         ROUND(t.total_amount::numeric, 2)                AS total_amount,
         ROUND(t.total_discount::numeric, 2)              AS total_discount,
-        t.vat_type, t.remark
+        t.vat_type, t.remark,
+        CASE WHEN ref.trans_flag = 36 THEN t.doc_ref ELSE NULL END AS quote_no
       FROM ic_trans t
       LEFT JOIN erp_user e ON e.code = t.sale_code
+      LEFT JOIN ic_trans ref ON ref.doc_no = t.doc_ref AND ref.trans_flag = 36
       ${where}
       ORDER BY t.doc_date DESC, t.doc_time DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -398,6 +401,7 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, 
         ...r,
         total_amount:   parseFloat(r.total_amount),
         total_discount: parseFloat(r.total_discount),
+        quote_no: r.quote_no || null,
       })),
       pagination: {
         total,
