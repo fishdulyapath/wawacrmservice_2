@@ -327,7 +327,7 @@ function start() {
       for (const task of result.rows) {
         const dueDate = task.due_date || task.start_datetime
         const daysDiff = Math.floor((Date.now() - new Date(dueDate).getTime()) / 86400000)
-        const typeLabel = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
+        const typeLabel = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : task.activity_type === 'visit' ? 'เข้าเยี่ยม' : 'งาน'
         if (!task.has_notification_today) {
           await notify({
             userId: task.user_id,
@@ -395,7 +395,7 @@ function start() {
       `, [hhmm, todayStr])
 
       for (const task of result.rows) {
-        const typeLabel2 = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : 'งาน'
+        const typeLabel2 = task.activity_type === 'call' ? 'งานโทร' : task.activity_type === 'meeting' ? 'นัดประชุม' : task.activity_type === 'visit' ? 'เข้าเยี่ยม' : 'งาน'
         if (!task.has_notification_today) {
           await notify({
             userId: task.user_id,
@@ -432,7 +432,7 @@ function start() {
         FROM crm_activities a
         JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
         JOIN crm_users u ON u.id = ao.user_id
-        WHERE a.activity_type = 'meeting'
+        WHERE a.activity_type IN ('meeting', 'visit')
           AND ao.status NOT IN ('done','cancelled')
           AND a.start_datetime BETWEEN NOW() AND NOW() + INTERVAL '30 minutes'
           AND u.is_active = TRUE
@@ -449,11 +449,12 @@ function start() {
 
       for (const meeting of result.rows) {
         const startText = new Date(meeting.start_datetime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: TZ })
+        const isVisit = meeting.activity_type === 'visit'
 
         await notify({
           userId: meeting.user_id,
           notiType: 'meeting_remind',
-          title: `Meeting เริ่มใน 30 นาที`,
+          title: isVisit ? `เข้าเยี่ยมลูกค้าใน 30 นาที` : `Meeting เริ่มใน 30 นาที`,
           message: `${meeting.subject} — ${startText}${meeting.location ? ' @ ' + meeting.location : ''}`,
           refType: 'activity',
           refId: meeting.id,
@@ -466,7 +467,7 @@ function start() {
             : meeting.location ? `📍 ${meeting.location}` : ''
           await lineService.sendMessage(meeting.line_user_id, [{
             type: 'text',
-            text: `📅 แจ้งเตือน Meeting!\n` +
+            text: (isVisit ? `🤝 แจ้งเตือน เข้าเยี่ยมลูกค้า!\n` : `📅 แจ้งเตือน Meeting!\n`) +
                   `"${meeting.subject}"\n` +
                   `⏰ เริ่ม: ${startText} น.\n` +
                   `${locationLine}\n\n` +
@@ -476,7 +477,7 @@ function start() {
       }
 
       if (result.rows.length > 0) {
-        console.log(`[Cron Meeting] แจ้งเตือน ${result.rows.length} owner-meeting`)
+        console.log(`[Cron Meeting/Visit] แจ้งเตือน ${result.rows.length} owner-activity`)
       }
     } catch (err) {
       console.error('[Cron Meeting Error]', err.message)

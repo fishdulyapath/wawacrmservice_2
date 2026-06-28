@@ -515,7 +515,7 @@ router.post('/quick-activity', async (req, res) => {
       ar_code, userId, activity_type, subject, description || null,
       status, priority,
       due_date || null,
-      start_datetime || (activity_type === 'call' ? new Date() : null),
+      start_datetime || (activity_type === 'call' || activity_type === 'visit' ? new Date() : null),
       call_direction || null, call_result || null,
       call_phone || null, duration_sec || null,
       followup_type || null,

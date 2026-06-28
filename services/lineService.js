@@ -248,7 +248,7 @@ async function sendTaskReminder(lineUserId, userId, activity) {
     ...(activity.start_datetime && !activity.due_date ? { hour: '2-digit', minute: '2-digit' } : {})
   }) : 'ไม่ระบุ'
 
-  const typeLabel = activity.activity_type === 'call' ? '📞 โทร' : activity.activity_type === 'meeting' ? '📅 นัดประชุม' : '✅ งาน'
+  const typeLabel = activity.activity_type === 'call' ? '📞 โทร' : activity.activity_type === 'meeting' ? '📅 นัดประชุม' : activity.activity_type === 'visit' ? '🤝 เข้าเยี่ยม' : '✅ งาน'
   const isOverdue = dueDate && new Date(dueDate) < new Date()
   const headerColor = isOverdue ? '#dc2626' : '#d97706'
   const headerText  = isOverdue ? `⚠️ ${typeLabel} เลยกำหนดแล้ว!` : `🔔 ${typeLabel} ใกล้ครบกำหนด`

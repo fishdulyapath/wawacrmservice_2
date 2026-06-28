@@ -7,6 +7,14 @@ const { notify, notifyMany } = require('../services/notifyService')
 
 router.use(authMiddleware)
 
+// inline migration: visit activity columns
+crmDB.query(`
+  ALTER TABLE crm_activities
+    ADD COLUMN IF NOT EXISTS visit_met           BOOLEAN,
+    ADD COLUMN IF NOT EXISTS visit_order         BOOLEAN,
+    ADD COLUMN IF NOT EXISTS visit_order_amount  NUMERIC(15,2)
+`).catch(() => {})
+
 // ── Helper: สิทธิ์สูงกว่า sales_rep ──────────────────────────
 const isSA       = u => u.code?.toUpperCase() === 'SUPERADMIN' || ['admin','manager','supervisor'].includes(u.role)
 const canCreate  = u => isSA(u)   // supervisor ขึ้นไป
@@ -15,7 +23,7 @@ const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.c
 // ── Helper: สร้างรหัสกิจกรรม act_no ─────────────────────────
 // รูปแบบ: C-yyyymmdd-0001 (call), M-yyyymmdd-0001 (meeting), W-yyyymmdd-0001 (task)
 // running number แยกต่อวัน + แยกตาม prefix
-const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
+const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O', visit: 'V' }
 async function generateActNo(activityType) {
   // ใช้ session-level advisory lock + connection แยก (นอก outer transaction)
   // เพื่อให้ COUNT เห็น committed rows และป้องกัน race condition
@@ -306,11 +314,11 @@ router.get('/stats', async (req, res) => {
       SELECT
         COUNT(*) FILTER (WHERE (
           (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
-          OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
+          OR (a.activity_type IN ('call','meeting','visit') AND a.start_datetime < NOW())
         ) AND ${openSub}) AS overdue,
         COUNT(*) FILTER (WHERE (
           (a.activity_type IN ('task','transfer') AND DATE(a.due_date) = CURRENT_DATE)
-          OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
+          OR (a.activity_type IN ('call','meeting','visit') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE AT TIME ZONE 'Asia/Bangkok')
         ) AND ${openSub}) AS today,
         COUNT(*) FILTER (WHERE ${openSub}) AS open,
         COUNT(*) FILTER (WHERE a.activity_type = 'meeting' AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = CURRENT_DATE AT TIME ZONE 'Asia/Bangkok' AND ${openSub}) AS meetings_today
@@ -388,10 +396,13 @@ router.get('/by-customer/:arCode', async (req, res) => {
              a.due_date, a.start_datetime, a.end_datetime,
              a.description, a.outcome, a.group_id,
              a.call_direction, a.call_result,
+             a.visit_met, a.visit_order, a.visit_order_amount,
              a.system_created, a.followup_type, a.requires_owner_assignment,
              a.retry_due_at, a.attempt_no, a.retry_of_activity_id,
-             a.created_at, a.created_by,
+             a.created_at, a.created_by, a.ar_code, a.act_no,
              cu.name AS created_by_name,
+             arc.name_1 AS customer_name,
+             arc.amper  AS customer_amper,
              CASE
                WHEN a.requires_owner_assignment = TRUE THEN 'open'
                WHEN EXISTS (
@@ -410,6 +421,7 @@ router.get('/by-customer/:arCode', async (req, res) => {
              END AS derived_status
       FROM crm_activities a
       LEFT JOIN crm_users cu ON cu.id = a.created_by
+      LEFT JOIN ar_customer arc ON arc.code = a.ar_code
       ${where}
       ORDER BY a.updated_at DESC NULLS LAST, a.created_at DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -438,9 +450,17 @@ router.get('/by-customer/:arCode', async (req, res) => {
       // close_note เก็บใน crm_activity_owners ไม่มี → ใช้ a.outcome แทน
     }
 
+    // ดึง amper จาก POS DB
+    let amperVal = null
+    try {
+      const posRes = await posDB.query(`SELECT amper FROM ar_customer WHERE code = $1 LIMIT 1`, [arCode])
+      amperVal = posRes.rows[0]?.amper || null
+    } catch (_) {}
+
     const activities = dataRes.rows.map(a => ({
       ...a,
       status: a.derived_status || a.status,
+      customer_amper: amperVal,
       owners: (ownersMap[a.id] || []).map(o => ({
         user_id: o.user_id,
         name: o.name,
@@ -502,7 +522,7 @@ router.get('/groups', async (req, res) => {
     } else if (status === 'overdue') {
       conditions.push(`(
         (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
-        OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
+        OR (a.activity_type IN ('call','meeting','visit') AND a.start_datetime < NOW())
       )`)
       havingClause = `HAVING COUNT(*) FILTER (WHERE ao_s.status = 'open' AND ao_s.removed_at IS NULL) > 0`
     }
@@ -847,19 +867,19 @@ router.get('/', async (req, res) => {
     if (due === 'overdue') {
       conditions.push(`(
         (a.activity_type IN ('task','transfer') AND a.due_date < CURRENT_DATE)
-        OR (a.activity_type IN ('call','meeting') AND a.start_datetime < NOW())
+        OR (a.activity_type IN ('call','meeting','visit') AND a.start_datetime < NOW())
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'today') {
       conditions.push(`(
         (a.activity_type IN ('task','transfer') AND DATE(a.due_date) = CURRENT_DATE)
-        OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok'))
+        OR (a.activity_type IN ('call','meeting','visit') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') = (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok'))
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (due === 'week') {
       conditions.push(`(
         (a.activity_type IN ('task','transfer') AND a.due_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
-        OR (a.activity_type IN ('call','meeting') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') BETWEEN (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') AND (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') + INTERVAL '7 days')
+        OR (a.activity_type IN ('call','meeting','visit') AND DATE(a.start_datetime AT TIME ZONE 'Asia/Bangkok') BETWEEN (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') AND (CURRENT_DATE AT TIME ZONE 'Asia/Bangkok') + INTERVAL '7 days')
       )`)
       conditions.push(`(a.requires_owner_assignment = TRUE OR EXISTS (SELECT 1 FROM crm_activity_owners ax WHERE ax.activity_id=a.id AND ax.removed_at IS NULL AND ax.status NOT IN ('done','cancelled')))`)
     } else if (status) {
@@ -947,9 +967,9 @@ router.get('/', async (req, res) => {
     if (arCodes.length > 0) {
       const placeholders = arCodes.map((_, i) => `$${i + 1}`).join(',')
       const posResult = await posDB.query(
-        `SELECT code, name_1 FROM ar_customer WHERE code IN (${placeholders})`, arCodes
+        `SELECT code, name_1, amper FROM ar_customer WHERE code IN (${placeholders})`, arCodes
       )
-      posResult.rows.forEach(r => { customerMap[r.code] = r.name_1 })
+      posResult.rows.forEach(r => { customerMap[r.code] = { name: r.name_1, amper: r.amper } })
     }
 
     const pageInt  = parseInt(page)
@@ -958,7 +978,8 @@ router.get('/', async (req, res) => {
       data: dataResult.rows.map(r => ({
         ...r,
         status: r.my_status || r.derived_status || 'open',
-        customer_name: customerMap[r.ar_code] || null,
+        customer_name: customerMap[r.ar_code]?.name || null,
+        customer_amper: customerMap[r.ar_code]?.amper || null,
       })),
       pagination: {
         total,
@@ -998,13 +1019,14 @@ router.get('/:id', async (req, res) => {
     activity.derived_status = deriveActivityStatus(owners)
     activity.my_status = activity.owners.find(o => o.user_id === req.user.id)?.status || null
 
-    // ดึง customer_name จาก POS
+    // ดึง customer_name + amper จาก POS
     if (activity.ar_code) {
       try {
         const cusRes = await posDB.query(
-          `SELECT name_1 FROM ar_customer WHERE code = $1`, [activity.ar_code]
+          `SELECT name_1, amper FROM ar_customer WHERE code = $1`, [activity.ar_code]
         )
-        activity.customer_name = cusRes.rows[0]?.name_1 || null
+        activity.customer_name  = cusRes.rows[0]?.name_1 || null
+        activity.customer_amper = cusRes.rows[0]?.amper  || null
       } catch {}
     }
 
@@ -1118,6 +1140,8 @@ router.post('/', async (req, res) => {
     meeting_url, outcome, all_day = false,
     external_invitees = [],
     group_id,
+    // visit-specific
+    visit_met, visit_order, visit_order_amount,
     // backward compat: รับ owner_id scalar ด้วย
     owner_id,
   } = req.body
@@ -1147,14 +1171,18 @@ router.post('/', async (req, res) => {
         (ar_code, owner_id, created_by, activity_type, subject, description, status, priority,
          due_date, start_datetime, end_datetime, location,
          call_direction, call_result, call_phone, duration_sec,
-         meeting_url, outcome, all_day, group_id, act_no)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         meeting_url, outcome, all_day, group_id, act_no,
+         visit_met, visit_order, visit_order_amount)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       RETURNING *`,
       [ar_code || null, primaryId, req.user.id,
        activity_type, subject, description, status, priority,
        due_date || null, start_datetime || null, end_datetime || null, location || null,
        call_direction || null, call_result || null, call_phone || null, duration_sec || null,
-       meeting_url || null, outcome || null, all_day, group_id || null, act_no]
+       meeting_url || null, outcome || null, all_day, group_id || null, act_no,
+       activity_type === 'visit' ? (visit_met ?? null) : null,
+       activity_type === 'visit' ? (visit_order ?? null) : null,
+       activity_type === 'visit' && visit_order && visit_order_amount ? parseFloat(visit_order_amount) : null]
     )
     const activity = result.rows[0]
 
@@ -1258,6 +1286,8 @@ router.put('/:id', async (req, res) => {
     primary_owner_id,
     external_invitees,
     group_update,    // { add_ar_codes, remove_activity_ids, owners, primary_owner_id }
+    // visit-specific
+    visit_met, visit_order, visit_order_amount,
     // backward compat
     owner_id, invitees,
   } = req.body
@@ -1277,8 +1307,9 @@ router.put('/:id', async (req, res) => {
         due_date=$4, start_datetime=$5, end_datetime=$6, location=$7,
         call_direction=$8, call_result=$9, call_phone=$10, duration_sec=$11,
         meeting_url=$12, outcome=$13, all_day=$14, ar_code=$15,
+        visit_met=$16, visit_order=$17, visit_order_amount=$18,
         updated_at=NOW()
-      WHERE id=$16 RETURNING *`,
+      WHERE id=$19 RETURNING *`,
       [
         subject        ?? old.subject,
         description    ?? old.description,
@@ -1295,6 +1326,11 @@ router.put('/:id', async (req, res) => {
         outcome        !== undefined ? (outcome || null)        : old.outcome,
         all_day        !== undefined ? all_day                  : old.all_day,
         ar_code        !== undefined ? (ar_code || null)        : old.ar_code,
+        visit_met      !== undefined ? visit_met                : old.visit_met,
+        visit_order    !== undefined ? visit_order              : old.visit_order,
+        visit_order    !== undefined
+          ? (visit_order && visit_order_amount ? parseFloat(visit_order_amount) : null)
+          : old.visit_order_amount,
         req.params.id,
       ]
     )
@@ -1792,9 +1828,15 @@ router.patch('/:id/done', async (req, res) => {
 
     const { outcome, call_phone, call_result, call_direction, duration_sec,
             cdr_uuid, cdr_recording_url, cdr_start_stamp, cdr_end_stamp,
-            skip_retry_today } = req.body
+            skip_retry_today,
+            visit_met, visit_order, visit_order_amount } = req.body
 
-    // update shared outcome/call fields บน activity row
+    // visit validation
+    if (oldActivity.activity_type === 'visit' && visit_met === undefined) {
+      return res.status(400).json({ error: 'กรุณาระบุสถานะการพบลูกค้า' })
+    }
+
+    // update shared outcome/call/visit fields บน activity row
     const result = await crmDB.query(`
       UPDATE crm_activities SET
         outcome           = COALESCE($2, outcome),
@@ -1807,11 +1849,17 @@ router.patch('/:id/done', async (req, res) => {
         cdr_start_stamp   = COALESCE($9::timestamptz, cdr_start_stamp),
         cdr_end_stamp     = COALESCE($10::timestamptz, cdr_end_stamp),
         call_result_at    = CASE WHEN $4 IS NOT NULL THEN COALESCE($10::timestamptz, $9::timestamptz, NOW()) ELSE call_result_at END,
+        visit_met         = COALESCE($11, visit_met),
+        visit_order       = COALESCE($12, visit_order),
+        visit_order_amount= COALESCE($13, visit_order_amount),
         updated_at        = NOW()
       WHERE id=$1 RETURNING *`,
       [req.params.id,
        outcome||null, call_phone||null, call_result||null, call_direction||null, duration_sec||null,
-       cdr_uuid||null, cdr_recording_url||null, cdr_start_stamp||null, cdr_end_stamp||null]
+       cdr_uuid||null, cdr_recording_url||null, cdr_start_stamp||null, cdr_end_stamp||null,
+       visit_met !== undefined ? visit_met : null,
+       visit_order !== undefined ? visit_order : null,
+       visit_order !== undefined && visit_order && visit_order_amount ? parseFloat(visit_order_amount) : (visit_order === false ? null : null)]
     )
 
     // update status: meeting หรือ admin/manager → ปิดทุก owner; call/task ของ sales_rep → เฉพาะ user นี้
