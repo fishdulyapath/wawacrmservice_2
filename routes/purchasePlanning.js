@@ -354,7 +354,7 @@ function planningWhere(req, startIndex = 1) {
         ON config_resolved.ic_code = config_link.ic_code
        AND config_resolved.ap_code = config_link.ap_code
       WHERE config_link.ic_code = i.code
-        AND COALESCE(config_resolved.planning_enabled, 1) = 1
+        AND COALESCE(config_resolved.planning_enabled, 0) = 1
     )`,
   ]
 
@@ -417,7 +417,7 @@ async function resolveItemMissingError(icCode) {
          JOIN purchase_planning_item_supplier_resolved r
            ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
          WHERE link.ic_code = i.code
-           AND COALESCE(r.planning_enabled, 1) = 1
+           AND COALESCE(r.planning_enabled, 0) = 1
        ) AS has_enabled_supplier
      FROM ic_inventory i
      LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
@@ -741,7 +741,7 @@ function buildPlanningMetricsSql({
         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
       WHERE COALESCE(link.ic_code, '') <> ''
         AND COALESCE(link.ap_code, '') <> ''
-        AND COALESCE(r.planning_enabled, 1) = 1
+        AND COALESCE(r.planning_enabled, 0) = 1
     ),
     chosen_supplier AS (
       SELECT *
@@ -2214,7 +2214,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
        WHERE link.ic_code = $1::text
          AND COALESCE(link.ap_code, '') <> ''
-         AND COALESCE(r.planning_enabled, 1) = 1
+         AND COALESCE(r.planning_enabled, 0) = 1
        ORDER BY rank_no, link.ap_code`,
       [icCode],
     )
@@ -2488,7 +2488,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
          LEFT JOIN latest_purchase lp
            ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
          WHERE link.ic_code = $1::text
-           AND COALESCE(r.planning_enabled, 1) = 1
+           AND COALESCE(r.planning_enabled, 0) = 1
          ORDER BY CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
                   COALESCE(lp.price, 999999999999),
                   link.ap_code`,
