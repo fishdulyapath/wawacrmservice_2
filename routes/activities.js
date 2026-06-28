@@ -295,6 +295,177 @@ async function createNoAnswerRetryActivity(actRow, reqUserId, options = {}) {
   }
 }
 
+async function createNoMetRetryActivity(actRow, reqUserId, options = {}) {
+  if (actRow.activity_type !== 'visit' || actRow.visit_met !== false || !actRow.ar_code) {
+    return null
+  }
+  if (options.skipRetryToday) {
+    return { skipped: true, reason: 'skip_today' }
+  }
+
+  const settingsRes = await crmDB.query(`
+    SELECT * FROM crm_followup_settings
+    WHERE id = 1 AND visit_enabled = TRUE
+  `)
+  const settings = settingsRes.rows[0]
+  if (!settings) return null
+
+  const customerPolicyRes = await crmDB.query(`
+    SELECT visit_followup_enabled, visit_followup_pause_until
+    FROM crm_customer_profile
+    WHERE ar_code = $1
+  `, [actRow.ar_code])
+  const customerPolicy = customerPolicyRes.rows[0]
+  if (customerPolicy?.visit_followup_pause_until) {
+    const pauseRes = await crmDB.query(
+      `SELECT ($1::date >= (NOW() AT TIME ZONE 'Asia/Bangkok')::date) AS active`,
+      [customerPolicy.visit_followup_pause_until]
+    )
+    if (pauseRes.rows[0]?.active) {
+      return { skipped: true, reason: 'customer_paused', pause_until: customerPolicy.visit_followup_pause_until }
+    }
+  }
+
+  const retryGroupKey = actRow.retry_group_key || `no-met:${actRow.id}`
+  const retryRootId = Number(String(retryGroupKey).match(/^no-met:(\d+)$/)?.[1]) || actRow.retry_of_activity_id || actRow.id
+
+  const countRes = await crmDB.query(`
+    SELECT COUNT(*)::int AS attempts
+    FROM crm_activities
+    WHERE activity_type = 'visit'
+      AND visit_met = FALSE
+      AND DATE(COALESCE(updated_at, created_at) AT TIME ZONE 'Asia/Bangkok') = (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+      AND (
+        id = $1
+        OR retry_of_activity_id = $1
+        OR retry_group_key = $2
+      )
+  `, [retryRootId, retryGroupKey])
+  const attemptsToday = Number(countRes.rows[0]?.attempts || 0)
+  const maxAttempts = Number(settings.no_met_max_attempts_per_day || 3)
+  if (attemptsToday >= maxAttempts) {
+    return { skipped: true, reason: 'max_attempts', attempts_today: attemptsToday, max_attempts: maxAttempts }
+  }
+
+  const ownersRes = await crmDB.query(`
+    SELECT user_id, is_primary
+    FROM crm_activity_owners
+    WHERE activity_id = $1 AND removed_at IS NULL
+    ORDER BY is_primary DESC, assigned_at ASC
+  `, [actRow.id])
+  const ownerIds = ownersRes.rows.map(r => Number(r.user_id)).filter(Boolean)
+  const primaryOwnerId = ownerIds[0] || actRow.owner_id || reqUserId
+  const nextAttemptNo = attemptsToday + 1
+  const retryDueAt = await adjustedRetryDueAt(
+    Number(settings.no_met_retry_minutes || 60),
+    String(settings.business_start_time || '08:30').slice(0, 5),
+    String(settings.business_end_time || '17:30').slice(0, 5),
+  )
+  const followupKey = `no-met-retry:${actRow.id}:${nextAttemptNo}`
+
+  const client = await crmDB.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [retryGroupKey])
+
+    const duplicateRes = await client.query(`
+      SELECT id FROM crm_activities
+      WHERE (
+          retry_of_activity_id = $1
+          OR retry_group_key = $2
+        )
+        AND status NOT IN ('done','cancelled','deleted')
+      LIMIT 1
+    `, [actRow.id, retryGroupKey])
+    if (duplicateRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists', activity_id: duplicateRes.rows[0].id }
+    }
+
+    const act_no_retry = await generateActNo('visit')
+    const insertRes = await client.query(`
+      INSERT INTO crm_activities (
+        ar_code, owner_id, created_by, activity_type, subject, description,
+        status, priority, due_date, start_datetime, system_created,
+        followup_type, followup_policy_id, followup_key,
+        retry_of_activity_id, attempt_no, retry_due_at, retry_group_key,
+        requires_owner_assignment, owner_assignment_note, act_no
+      )
+      VALUES ($1,$2,$3,'visit',$4,$5,'open',$6,$7::timestamptz::date,$7,TRUE,
+              'no_met_retry',1,$8,$9,$10,$7,$11,$12,$13,$14)
+      ON CONFLICT (followup_key) WHERE followup_key IS NOT NULL DO NOTHING
+      RETURNING *
+    `, [
+      actRow.ar_code,
+      primaryOwnerId,
+      reqUserId,
+      `เยี่ยมซ้ำลูกค้า ${actRow.ar_code} ครั้งที่ ${nextAttemptNo}/${maxAttempts}`,
+      `สร้างโดยระบบหลังบันทึกผลเยี่ยมว่าไม่พบลูกค้า\nอ้างอิงงานเดิม #${actRow.id}`,
+      actRow.priority || 'normal',
+      retryDueAt,
+      followupKey,
+      actRow.id,
+      nextAttemptNo,
+      retryGroupKey,
+      ownerIds.length === 0,
+      ownerIds.length === 0 ? 'งานเยี่ยมซ้ำนี้ไม่มี owner จากงานเดิม' : null,
+      act_no_retry,
+    ])
+    if (!insertRes.rows.length) {
+      await client.query('ROLLBACK')
+      return { skipped: true, reason: 'already_exists' }
+    }
+
+    const retry = insertRes.rows[0]
+    for (const uid of ownerIds) {
+      await client.query(`
+        INSERT INTO crm_activity_owners (activity_id, user_id, is_primary, status, assigned_by)
+        VALUES ($1,$2,$3,'open',$4)
+        ON CONFLICT (activity_id, user_id) DO NOTHING
+      `, [retry.id, uid, uid === primaryOwnerId, reqUserId])
+    }
+
+    await client.query('COMMIT')
+
+    if (ownerIds.length) {
+      const dueText = new Date(retryDueAt).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' })
+      await notifyMany(ownerIds, {
+        notiType: 'activity_update',
+        title: `ตั้งงานเยี่ยมซ้ำ ${nextAttemptNo}/${maxAttempts}`,
+        message: `${retry.subject} เวลา ${dueText} น.`,
+        refType: 'activity',
+        refId: retry.id,
+        arCode: retry.ar_code,
+      })
+    } else {
+      const queueNotifyIds = await getFollowupQueueNotifyIds()
+      if (queueNotifyIds.length) {
+        await notifyMany(queueNotifyIds, {
+          notiType: 'activity_update',
+          title: 'มีงานเยี่ยมซ้ำที่ยังไม่มีผู้รับผิดชอบ',
+          message: retry.subject,
+          refType: 'activity',
+          refId: retry.id,
+          arCode: retry.ar_code,
+        })
+      }
+    }
+
+    return {
+      created: true,
+      activity_id: retry.id,
+      retry_due_at: retry.retry_due_at,
+      attempt_no: retry.attempt_no,
+      max_attempts: maxAttempts,
+    }
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // GET /api/activities/stats — KPI สรุปตัวเลข (รองรับ multi-owner)
 // ─────────────────────────────────────────────────────────────
@@ -1938,6 +2109,25 @@ router.patch('/:id/done', async (req, res) => {
                   + (COALESCE(p.followup_interval_days, s.default_call_interval_days) * INTERVAL '1 day')
                 )::date
               ELSE p.next_followup
+            END
+        FROM crm_followup_settings s
+        WHERE p.ar_code = $1 AND s.id = 1
+      `, [latestAct.ar_code])
+    } else if (latestAct.activity_type === 'visit' && latestAct.visit_met === false && latestAct.ar_code) {
+      retry = await createNoMetRetryActivity(latestAct, req.user.id, {
+        skipRetryToday: !!skip_retry_today,
+      })
+    } else if (latestAct.activity_type === 'visit' && latestAct.visit_met === true && latestAct.ar_code) {
+      await crmDB.query(`
+        UPDATE crm_customer_profile p
+        SET last_visited = NOW(),
+            next_visit_followup = CASE
+              WHEN s.visit_enabled = TRUE AND p.visit_followup_enabled = TRUE
+                THEN (
+                  (NOW() AT TIME ZONE 'Asia/Bangkok')::date
+                  + (COALESCE(p.visit_followup_interval_days, s.default_visit_interval_days) * INTERVAL '1 day')
+                )::date
+              ELSE p.next_visit_followup
             END
         FROM crm_followup_settings s
         WHERE p.ar_code = $1 AND s.id = 1

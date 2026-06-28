@@ -494,6 +494,8 @@ router.get('/:code', async (req, res) => {
         p.status AS crm_status,
         p.next_followup::text AS next_followup,
         p.followup_pause_until::text AS followup_pause_until,
+        p.next_visit_followup::text AS next_visit_followup,
+        p.visit_followup_pause_until::text AS visit_followup_pause_until,
         o.user_id AS owner_user_id,
         u.code    AS owner_code,
         u.name    AS owner_name
@@ -607,6 +609,12 @@ router.patch('/:code/followup', async (req, res) => {
     followup_pause_reason,
     next_followup,
     followup_interval_days,
+    // visit follow-up
+    visit_followup_enabled,
+    visit_followup_pause_until,
+    visit_followup_pause_reason,
+    next_visit_followup,
+    visit_followup_interval_days,
   } = req.body
 
   try {
@@ -620,12 +628,23 @@ router.patch('/:code/followup', async (req, res) => {
       ? normalizeFollowupInterval(followup_interval_days)
       : null
 
+    // visit
+    const hasVisitFollowupEnabled = Object.prototype.hasOwnProperty.call(req.body, 'visit_followup_enabled')
+    const hasVisitPauseUntil = Object.prototype.hasOwnProperty.call(req.body, 'visit_followup_pause_until')
+    const hasVisitPauseReason = Object.prototype.hasOwnProperty.call(req.body, 'visit_followup_pause_reason')
+    let hasNextVisitFollowup = Object.prototype.hasOwnProperty.call(req.body, 'next_visit_followup')
+    const hasVisitInterval = Object.prototype.hasOwnProperty.call(req.body, 'visit_followup_interval_days')
+    const normalizedVisitInterval = hasVisitInterval
+      ? normalizeFollowupInterval(visit_followup_interval_days)
+      : null
+
     // ถ้ากำลังเปิด followup_enabled = true และ next_followup ไม่ได้ถูก set ใน request นี้
     // ให้ตรวจค่าปัจจุบันใน DB — ถ้าว่างหรือเลยวันนี้ ให้ default เป็น today+1 (Asia/Bangkok)
     let resolvedNextFollowup = next_followup || null
+    let resolvedNextVisitFollowup = next_visit_followup || null
     if (hasFollowupEnabled && followup_enabled === true && !hasNextFollowup) {
       const cur = await crmDB.query(
-        `SELECT next_followup FROM crm_customer_profile WHERE ar_code = $1`, [code]
+        `SELECT next_followup, next_visit_followup FROM crm_customer_profile WHERE ar_code = $1`, [code]
       )
       const existingDate = cur.rows[0]?.next_followup
       // คำนวณวันที่ใน Asia/Bangkok โดยใช้ Intl เพื่อหลีกเลี่ยง UTC offset
@@ -641,6 +660,22 @@ router.patch('/:code/followup', async (req, res) => {
         hasNextFollowup = true
       }
     }
+    if (hasVisitFollowupEnabled && visit_followup_enabled === true && !hasNextVisitFollowup) {
+      const cur = await crmDB.query(
+        `SELECT next_visit_followup FROM crm_customer_profile WHERE ar_code = $1`, [code]
+      )
+      const existingDate = cur.rows[0]?.next_visit_followup
+      const bkkNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Bangkok' }))
+      const todayStr = `${bkkNow.getFullYear()}-${String(bkkNow.getMonth() + 1).padStart(2, '0')}-${String(bkkNow.getDate()).padStart(2, '0')}`
+      const tomorrowBkk = new Date(bkkNow)
+      tomorrowBkk.setDate(tomorrowBkk.getDate() + 1)
+      const tomorrowStr = `${tomorrowBkk.getFullYear()}-${String(tomorrowBkk.getMonth() + 1).padStart(2, '0')}-${String(tomorrowBkk.getDate()).padStart(2, '0')}`
+      const existingStr = existingDate ? existingDate.toISOString?.().slice(0, 10) ?? String(existingDate).slice(0, 10) : null
+      if (!existingStr || existingStr <= todayStr) {
+        resolvedNextVisitFollowup = tomorrowStr
+        hasNextVisitFollowup = true
+      }
+    }
 
     const result = await crmDB.query(`
       UPDATE crm_customer_profile SET
@@ -651,13 +686,26 @@ router.patch('/:code/followup', async (req, res) => {
         followup_interval_days = CASE WHEN $10::boolean THEN $11::integer ELSE followup_interval_days END,
         followup_interval_updated_by = CASE WHEN $10::boolean THEN $12::integer ELSE followup_interval_updated_by END,
         followup_interval_updated_at = CASE WHEN $10::boolean THEN NOW() ELSE followup_interval_updated_at END,
+        visit_followup_enabled = CASE WHEN $13::boolean THEN $14::boolean ELSE visit_followup_enabled END,
+        visit_followup_pause_until = CASE WHEN $15::boolean THEN $16::date ELSE visit_followup_pause_until END,
+        visit_followup_pause_reason = CASE WHEN $17::boolean THEN $18::text ELSE visit_followup_pause_reason END,
+        next_visit_followup = CASE WHEN $19::boolean THEN $20::date ELSE next_visit_followup END,
+        visit_followup_interval_days = CASE WHEN $21::boolean THEN $22::integer ELSE visit_followup_interval_days END,
+        visit_followup_interval_updated_by = CASE WHEN $21::boolean THEN $12::integer ELSE visit_followup_interval_updated_by END,
+        visit_followup_interval_updated_at = CASE WHEN $21::boolean THEN NOW() ELSE visit_followup_interval_updated_at END,
         updated_at = NOW()
       WHERE ar_code = $1
-      RETURNING ar_code, followup_enabled,
+      RETURNING ar_code,
+                followup_enabled,
                 followup_pause_until::text AS followup_pause_until,
                 followup_pause_reason,
                 next_followup::text AS next_followup,
-                followup_interval_days, followup_interval_updated_by, followup_interval_updated_at
+                followup_interval_days, followup_interval_updated_by, followup_interval_updated_at,
+                visit_followup_enabled,
+                visit_followup_pause_until::text AS visit_followup_pause_until,
+                visit_followup_pause_reason,
+                next_visit_followup::text AS next_visit_followup,
+                visit_followup_interval_days, visit_followup_interval_updated_by, visit_followup_interval_updated_at
     `, [
       code,
       hasFollowupEnabled,
@@ -671,6 +719,16 @@ router.patch('/:code/followup', async (req, res) => {
       hasFollowupInterval,
       normalizedInterval,
       req.user.id,
+      hasVisitFollowupEnabled,
+      typeof visit_followup_enabled === 'boolean' ? visit_followup_enabled : null,
+      hasVisitPauseUntil,
+      visit_followup_pause_until || null,
+      hasVisitPauseReason,
+      visit_followup_pause_reason || null,
+      hasNextVisitFollowup,
+      resolvedNextVisitFollowup,
+      hasVisitInterval,
+      normalizedVisitInterval,
     ])
 
     if (!result.rows.length) {

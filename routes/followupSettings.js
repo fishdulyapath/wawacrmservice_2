@@ -2,7 +2,7 @@ const express = require('express')
 const router = express.Router()
 const { crmDB } = require('../db')
 const { authMiddleware, requireRole } = require('../middleware/auth')
-const { runDueFollowups, bangkokDate } = require('../services/followupRunner')
+const { runDueFollowups, runDueVisitFollowups, bangkokDate } = require('../services/followupRunner')
 
 router.use(authMiddleware)
 
@@ -18,6 +18,14 @@ const DEFAULT_SETTINGS = {
   no_answer_retry_minutes: 30,
   business_start_time: '08:30',
   business_end_time: '17:30',
+  // visit follow-up
+  visit_enabled: false,
+  visit_auto_create_enabled: true,
+  default_visit_interval_days: 30,
+  visit_auto_create_time: '08:00',
+  visit_assignment_mode: 'primary',
+  no_met_max_attempts_per_day: 3,
+  no_met_retry_minutes: 60,
 }
 
 function toBool(value, fallback) {
@@ -57,6 +65,18 @@ function normalizeSettings(row = {}) {
     last_auto_create_error: row.last_auto_create_error || null,
     updated_at: row.updated_at || null,
     updated_by: row.updated_by || null,
+    // visit follow-up
+    visit_enabled: row.visit_enabled ?? DEFAULT_SETTINGS.visit_enabled,
+    visit_auto_create_enabled: row.visit_auto_create_enabled ?? DEFAULT_SETTINGS.visit_auto_create_enabled,
+    default_visit_interval_days: row.default_visit_interval_days || DEFAULT_SETTINGS.default_visit_interval_days,
+    visit_auto_create_time: String(row.visit_auto_create_time || DEFAULT_SETTINGS.visit_auto_create_time).slice(0, 5),
+    visit_assignment_mode: row.visit_assignment_mode || DEFAULT_SETTINGS.visit_assignment_mode,
+    no_met_max_attempts_per_day: row.no_met_max_attempts_per_day || DEFAULT_SETTINGS.no_met_max_attempts_per_day,
+    no_met_retry_minutes: row.no_met_retry_minutes || DEFAULT_SETTINGS.no_met_retry_minutes,
+    last_visit_create_checked_at: row.last_visit_create_checked_at || null,
+    last_visit_create_created_count: row.last_visit_create_created_count || 0,
+    last_visit_create_unassigned_count: row.last_visit_create_unassigned_count || 0,
+    last_visit_create_error: row.last_visit_create_error || null,
   }
 }
 
@@ -156,6 +176,11 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
       ? req.body.no_owner_action
       : DEFAULT_SETTINGS.no_owner_action
 
+    const visitAutoCreateTime = normalizeTime(req.body.visit_auto_create_time, DEFAULT_SETTINGS.visit_auto_create_time)
+    const visitAssignmentMode = ['primary', 'all'].includes(req.body.visit_assignment_mode)
+      ? req.body.visit_assignment_mode
+      : DEFAULT_SETTINGS.visit_assignment_mode
+
     const payload = {
       enabled: toBool(req.body.enabled, DEFAULT_SETTINGS.enabled),
       auto_create_enabled: toBool(req.body.auto_create_enabled, DEFAULT_SETTINGS.auto_create_enabled),
@@ -167,6 +192,14 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
       no_answer_retry_minutes: toInt(req.body.no_answer_retry_minutes, DEFAULT_SETTINGS.no_answer_retry_minutes, 5, 480),
       business_start_time: businessStartTime,
       business_end_time: businessEndTime,
+      // visit
+      visit_enabled: toBool(req.body.visit_enabled, DEFAULT_SETTINGS.visit_enabled),
+      visit_auto_create_enabled: toBool(req.body.visit_auto_create_enabled, DEFAULT_SETTINGS.visit_auto_create_enabled),
+      default_visit_interval_days: toInt(req.body.default_visit_interval_days, DEFAULT_SETTINGS.default_visit_interval_days, 1, 365),
+      visit_auto_create_time: visitAutoCreateTime || DEFAULT_SETTINGS.visit_auto_create_time,
+      visit_assignment_mode: visitAssignmentMode,
+      no_met_max_attempts_per_day: toInt(req.body.no_met_max_attempts_per_day, DEFAULT_SETTINGS.no_met_max_attempts_per_day, 1, 10),
+      no_met_retry_minutes: toInt(req.body.no_met_retry_minutes, DEFAULT_SETTINGS.no_met_retry_minutes, 5, 480),
     }
 
     const result = await crmDB.query(`
@@ -174,9 +207,11 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
         id, enabled, auto_create_enabled, default_call_interval_days, auto_create_time,
         assignment_mode, no_owner_action, no_answer_max_attempts_per_day, no_answer_retry_minutes,
         business_start_time, business_end_time,
+        visit_enabled, visit_auto_create_enabled, default_visit_interval_days, visit_auto_create_time,
+        visit_assignment_mode, no_met_max_attempts_per_day, no_met_retry_minutes,
         updated_by, updated_at
       )
-      VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
       ON CONFLICT (id) DO UPDATE SET
         enabled = EXCLUDED.enabled,
         auto_create_enabled = EXCLUDED.auto_create_enabled,
@@ -188,6 +223,13 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
         no_answer_retry_minutes = EXCLUDED.no_answer_retry_minutes,
         business_start_time = EXCLUDED.business_start_time,
         business_end_time = EXCLUDED.business_end_time,
+        visit_enabled = EXCLUDED.visit_enabled,
+        visit_auto_create_enabled = EXCLUDED.visit_auto_create_enabled,
+        default_visit_interval_days = EXCLUDED.default_visit_interval_days,
+        visit_auto_create_time = EXCLUDED.visit_auto_create_time,
+        visit_assignment_mode = EXCLUDED.visit_assignment_mode,
+        no_met_max_attempts_per_day = EXCLUDED.no_met_max_attempts_per_day,
+        no_met_retry_minutes = EXCLUDED.no_met_retry_minutes,
         updated_by = EXCLUDED.updated_by,
         updated_at = NOW()
       RETURNING *
@@ -202,6 +244,13 @@ router.put('/', requireRole('admin', 'manager'), async (req, res) => {
       payload.no_answer_retry_minutes,
       payload.business_start_time,
       payload.business_end_time,
+      payload.visit_enabled,
+      payload.visit_auto_create_enabled,
+      payload.default_visit_interval_days,
+      payload.visit_auto_create_time,
+      payload.visit_assignment_mode,
+      payload.no_met_max_attempts_per_day,
+      payload.no_met_retry_minutes,
       req.user.id,
     ])
 
@@ -215,6 +264,26 @@ router.post('/run-now', requireRole('admin', 'manager'), async (req, res) => {
   try {
     const settings = await ensureSettings()
     const result = await runDueFollowups({
+      settings,
+      actorUserId: req.user.id,
+      todayStr: bangkokDate(),
+      source: 'manual',
+    })
+    const refreshed = await crmDB.query(`SELECT * FROM crm_followup_settings WHERE id = 1`)
+    res.json({
+      success: true,
+      ...result,
+      settings: await withAutomationMeta(normalizeSettings(refreshed.rows[0] || settings)),
+    })
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
+  }
+})
+
+router.post('/run-now-visit', requireRole('admin', 'manager'), async (req, res) => {
+  try {
+    const settings = await ensureSettings()
+    const result = await runDueVisitFollowups({
       settings,
       actorUserId: req.user.id,
       todayStr: bangkokDate(),

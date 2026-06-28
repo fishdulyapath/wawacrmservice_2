@@ -3,7 +3,7 @@ const { crmDB } = require('../db')
 const lineService = require('./lineService')
 const { notify } = require('./notifyService')
 const { syncAllFleetSheets } = require('./fleetSync')
-const { runDueFollowups } = require('./followupRunner')
+const { runDueFollowups, runDueVisitFollowups } = require('./followupRunner')
 const purchasePlanningRoute = require('../routes/purchasePlanning')
 
 const PURCHASE_ALERT_WAREHOUSE = process.env.PURCHASE_ALERT_WAREHOUSE || 'MMA01'
@@ -122,6 +122,7 @@ function start() {
   // ป้องกัน cron 2 tick ภายใน 1 นาทีเดียวกัน
   let lastDailySentRunKey = ''
   let lastAutoFollowupRunKey = ''
+  let lastAutoVisitFollowupRunKey = ''
   let purchaseAlertRunning = false
 
   // ── 1. Daily Summary: ทุกนาที ตรวจว่าถึงเวลาส่งไหม ──
@@ -281,6 +282,107 @@ function start() {
       }
     } catch (err) {
       console.error('[Cron RetryDue Error]', err.message)
+    }
+  }, cronOpts)
+
+  // ── 1.7 Auto Visit Follow-up: สร้างงานเยี่ยมอัตโนมัติ ──
+  cron.schedule('* * * * *', async () => {
+    try {
+      const hhmm = bangkokHHMM()
+      const todayStr = bangkokDate()
+      const runKey = `visit:${todayStr} ${hhmm}`
+
+      if (lastAutoVisitFollowupRunKey === runKey) return
+
+      const settingsRes = await crmDB.query(`
+        SELECT * FROM crm_followup_settings
+        WHERE id = 1
+          AND visit_enabled = TRUE
+          AND visit_auto_create_enabled = TRUE
+          AND to_char(visit_auto_create_time, 'HH24:MI') = $1
+      `, [hhmm])
+      if (!settingsRes.rows.length) return
+
+      lastAutoVisitFollowupRunKey = runKey
+      const settings = settingsRes.rows[0]
+      const result = await runDueVisitFollowups({
+        settings,
+        todayStr,
+        limit: 100,
+        source: 'cron',
+      })
+
+      if (result.created_count > 0 || result.unassigned_count > 0 || result.error) {
+        console.log(
+          `[Cron AutoVisitFollowup] created ${result.created_count} activities, ` +
+          `unassigned ${result.unassigned_count} (${hhmm})` +
+          (result.error ? ` error=${result.error}` : '')
+        )
+      }
+    } catch (err) {
+      console.error('[Cron AutoVisitFollowup Error]', err.message)
+    }
+  }, cronOpts)
+
+  // ── 1.8 Visit No-Met Retry Due Alert: แจ้งเมื่อถึงเวลาเยี่ยมซ้ำ ──
+  cron.schedule('* * * * *', async () => {
+    try {
+      const todayStr = bangkokDate()
+      const result = await crmDB.query(`
+        SELECT a.id, a.subject, a.activity_type, a.start_datetime, a.retry_due_at, a.priority, a.ar_code,
+               a.attempt_no,
+               u.id AS user_id, u.line_user_id, u.line_notify_enabled,
+               EXISTS (
+                 SELECT 1 FROM crm_line_message_log lg
+                 WHERE lg.user_id = u.id
+                   AND lg.ref_type = 'activity'
+                   AND lg.ref_id = a.id
+                   AND lg.message_type IN ('task_reminder','task_overdue')
+                   AND lg.success = TRUE
+                   AND lg.sent_at >= $1::date
+                   AND lg.sent_at <  ($1::date + INTERVAL '1 day')
+               ) AS has_line_success_today
+        FROM crm_activities a
+        JOIN crm_activity_owners ao ON ao.activity_id = a.id AND ao.removed_at IS NULL
+        JOIN crm_users u ON u.id = ao.user_id
+        WHERE a.followup_type = 'no_met_retry'
+          AND COALESCE(a.retry_due_at, a.start_datetime) <= NOW()
+          AND a.status NOT IN ('done','cancelled','deleted')
+          AND ao.status NOT IN ('done','cancelled')
+          AND u.is_active = TRUE
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_notifications n
+            WHERE n.user_id = u.id
+              AND n.ref_type = 'activity'
+              AND n.ref_id = a.id
+              AND n.noti_type = 'task_due'
+              AND n.created_at >= $1::date
+              AND n.created_at < ($1::date + INTERVAL '1 day')
+          )
+      `, [todayStr])
+
+      for (const task of result.rows) {
+        await notify({
+          userId: task.user_id,
+          notiType: 'task_due',
+          title: `ถึงเวลาเยี่ยมซ้ำ${task.attempt_no ? ` ครั้งที่ ${task.attempt_no}` : ''}`,
+          message: task.subject,
+          refType: 'activity',
+          refId: task.id,
+          arCode: task.ar_code,
+        })
+
+        if (task.line_user_id && task.line_notify_enabled && !task.has_line_success_today) {
+          await lineService.sendTaskReminder(task.line_user_id, task.user_id, task)
+            .catch(e => console.error(`[Cron NoMetRetryDue] task ${task.id}`, e.message))
+        }
+      }
+
+      if (result.rows.length > 0) {
+        console.log(`[Cron NoMetRetryDue] แจ้งเตือนเยี่ยมซ้ำ ${result.rows.length} owner-task`)
+      }
+    } catch (err) {
+      console.error('[Cron NoMetRetryDue Error]', err.message)
     }
   }, cronOpts)
 
