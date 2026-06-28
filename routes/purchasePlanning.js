@@ -229,7 +229,7 @@ function parseImportRows(buffer, columns) {
 function supplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
   const params = []
   const whereParts = [
-    'd.trans_flag = 12',
+    'd.trans_flag = 310',
     'COALESCE(d.status, 0) = 0',
     "COALESCE(d.cust_code, '') <> ''",
   ]
@@ -275,7 +275,7 @@ function supplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
 function itemSupplierHistoryCte({ fromDate, toDate, startIndex = 1 }) {
   const params = []
   const whereParts = [
-    'd.trans_flag = 12',
+    'd.trans_flag = 310',
     'COALESCE(d.status, 0) = 0',
     "COALESCE(d.item_code, '') <> ''",
     "COALESCE(d.cust_code, '') <> ''",
