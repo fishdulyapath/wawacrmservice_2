@@ -387,10 +387,17 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, 
         ROUND(t.total_amount::numeric, 2)                AS total_amount,
         ROUND(t.total_discount::numeric, 2)              AS total_discount,
         t.vat_type, t.remark,
-        CASE WHEN ref.trans_flag = 36 THEN t.doc_ref ELSE NULL END AS quote_no
+        CASE WHEN ref.trans_flag = 36 THEN t.doc_ref ELSE NULL END AS quote_no,
+        qt.qt_doc
       FROM ic_trans t
       LEFT JOIN erp_user e ON e.code = t.sale_code
       LEFT JOIN ic_trans ref ON ref.doc_no = t.doc_ref AND ref.trans_flag = 36
+      LEFT JOIN LATERAL (
+        SELECT STRING_AGG(DISTINCT NULLIF(TRIM(d.billing_no), ''), ', ' ORDER BY NULLIF(TRIM(d.billing_no), '')) AS qt_doc
+        FROM ap_ar_trans_detail d
+        WHERE d.doc_no = t.doc_ref
+          AND d.trans_flag = 36
+      ) qt ON TRUE
       ${where}
       ORDER BY t.doc_date DESC, t.doc_time DESC
       LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -402,6 +409,7 @@ router.get('/customer/:cust_code', requireRole('admin', 'manager'), async (req, 
         total_amount:   parseFloat(r.total_amount),
         total_discount: parseFloat(r.total_discount),
         quote_no: r.quote_no || null,
+        qt_doc: r.qt_doc || null,
       })),
       pagination: {
         total,

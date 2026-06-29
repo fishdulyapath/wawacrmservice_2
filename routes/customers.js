@@ -853,8 +853,8 @@ router.post('/', async (req, res) => {
 
     // Insert CRM profile
     await crmClient.query(`
-      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, followup_enabled)
-      VALUES ($1,$2,$3,$4,$5,$6,FALSE)
+      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, next_followup, next_visit_followup, followup_enabled)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)
       ON CONFLICT (ar_code) DO NOTHING
     `, [
       code,
@@ -862,7 +862,9 @@ router.post('/', async (req, res) => {
       crm.status || 'active',
       crm.priority || 'normal',
       crm.source || null,
-      crm.crm_remark || null
+      crm.crm_remark || null,
+      crm.next_followup || null,
+      crm.next_visit_followup || null
     ])
 
     // Assign CRM owners (1 primary + co-owners)
@@ -1012,8 +1014,8 @@ router.put('/:code', async (req, res) => {
 
     // Upsert CRM profile
     await crmClient.query(`
-      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, next_followup, followup_enabled)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
+      INSERT INTO crm_customer_profile (ar_code, customer_type, status, priority, source, crm_remark, next_followup, next_visit_followup, followup_enabled)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)
       ON CONFLICT (ar_code) DO UPDATE SET
         customer_type = EXCLUDED.customer_type,
         status        = EXCLUDED.status,
@@ -1021,6 +1023,7 @@ router.put('/:code', async (req, res) => {
         source        = EXCLUDED.source,
         crm_remark    = EXCLUDED.crm_remark,
         next_followup = EXCLUDED.next_followup,
+        next_visit_followup = EXCLUDED.next_visit_followup,
         updated_at    = NOW()
     `, [
       code,
@@ -1029,7 +1032,8 @@ router.put('/:code', async (req, res) => {
       crm.priority || 'normal',
       crm.source || null,
       crm.crm_remark || null,
-      crm.next_followup || null
+      crm.next_followup || null,
+      crm.next_visit_followup || null
     ])
 
     // Update CRM owners (clear + replace เพื่อให้ลบ/เพิ่ม co-owner ได้ตรง UI)
