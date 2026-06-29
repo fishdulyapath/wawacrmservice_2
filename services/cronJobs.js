@@ -185,20 +185,19 @@ function start() {
     try {
       const hhmm = bangkokHHMM()
       const todayStr = bangkokDate()
-      const runKey = `${todayStr} ${hhmm}`
 
-      if (lastAutoFollowupRunKey === runKey) return
+      if (lastAutoFollowupRunKey === todayStr) return
 
       const settingsRes = await crmDB.query(`
         SELECT * FROM crm_followup_settings
         WHERE id = 1
           AND enabled = TRUE
           AND auto_create_enabled = TRUE
-          AND to_char(auto_create_time, 'HH24:MI') = $1
+          AND to_char(auto_create_time, 'HH24:MI') <= $1
       `, [hhmm])
       if (!settingsRes.rows.length) return
 
-      lastAutoFollowupRunKey = runKey
+      lastAutoFollowupRunKey = todayStr
       const settings = settingsRes.rows[0]
       const result = await runDueFollowups({
         settings,
@@ -290,20 +289,19 @@ function start() {
     try {
       const hhmm = bangkokHHMM()
       const todayStr = bangkokDate()
-      const runKey = `visit:${todayStr} ${hhmm}`
 
-      if (lastAutoVisitFollowupRunKey === runKey) return
+      if (lastAutoVisitFollowupRunKey === todayStr) return
 
       const settingsRes = await crmDB.query(`
         SELECT * FROM crm_followup_settings
         WHERE id = 1
           AND visit_enabled = TRUE
           AND visit_auto_create_enabled = TRUE
-          AND to_char(visit_auto_create_time, 'HH24:MI') = $1
+          AND to_char(visit_auto_create_time, 'HH24:MI') <= $1
       `, [hhmm])
       if (!settingsRes.rows.length) return
 
-      lastAutoVisitFollowupRunKey = runKey
+      lastAutoVisitFollowupRunKey = todayStr
       const settings = settingsRes.rows[0]
       const result = await runDueVisitFollowups({
         settings,
