@@ -7,7 +7,11 @@ const nodePath = require('path')
 const { posDB, crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
 const { logAudit } = require('../middleware/audit')
-const { ensureCustomerFollowupPolicy, normalizeFollowupInterval } = require('../services/followupPolicy')
+const {
+  ensureCustomerFollowupPolicy,
+  ensureCustomerVisitOwnerTable,
+  normalizeFollowupInterval,
+} = require('../services/followupPolicy')
 
 const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } })
 
@@ -21,11 +25,7 @@ const canManageFollowup = u => u?.code?.toUpperCase() === 'SUPERADMIN' || ['admi
 let customerStoreLinkReady = false
 const CALL_RETRY_RESULTS = ['no_answer', 'busy', 'left_voicemail']
 
-function normalizeCustomerOwners(crm = {}) {
-  const source = Array.isArray(crm.owners)
-    ? crm.owners
-    : (crm.owner_user_id ? [{ user_id: crm.owner_user_id, is_primary: true }] : [])
-
+function normalizeOwnerAssignments(source = []) {
   const seen = new Set()
   const owners = []
   for (const item of source) {
@@ -51,11 +51,40 @@ function normalizeCustomerOwners(crm = {}) {
   return owners
 }
 
+function normalizeCustomerOwners(crm = {}) {
+  const source = Array.isArray(crm.owners)
+    ? crm.owners
+    : (crm.owner_user_id ? [{ user_id: crm.owner_user_id, is_primary: true }] : [])
+  return normalizeOwnerAssignments(source)
+}
+
+function normalizeVisitOwners(crm = {}) {
+  const source = Array.isArray(crm.visit_owners)
+    ? crm.visit_owners
+    : (crm.visit_owner_user_id ? [{ user_id: crm.visit_owner_user_id, is_primary: true }] : [])
+  return normalizeOwnerAssignments(source)
+}
+
 async function replaceCustomerOwners(client, arCode, owners, assignedBy) {
   await client.query(`DELETE FROM crm_customer_owner WHERE ar_code = $1`, [arCode])
   for (const owner of owners) {
     await client.query(`
       INSERT INTO crm_customer_owner (ar_code, user_id, is_primary, assigned_by)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (ar_code, user_id) DO UPDATE SET
+        is_primary = EXCLUDED.is_primary,
+        assigned_by = EXCLUDED.assigned_by,
+        assigned_at = NOW()
+    `, [arCode, owner.user_id, owner.is_primary, assignedBy || null])
+  }
+}
+
+async function replaceCustomerVisitOwners(client, arCode, owners, assignedBy) {
+  await ensureCustomerVisitOwnerTable(client)
+  await client.query(`DELETE FROM crm_customer_visit_owner WHERE ar_code = $1`, [arCode])
+  for (const owner of owners) {
+    await client.query(`
+      INSERT INTO crm_customer_visit_owner (ar_code, user_id, is_primary, assigned_by)
       VALUES ($1,$2,$3,$4)
       ON CONFLICT (ar_code, user_id) DO UPDATE SET
         is_primary = EXCLUDED.is_primary,
@@ -516,6 +545,7 @@ router.get('/:code', async (req, res) => {
     let crm = crmResult.rows[0] || null
 
     if (crm) {
+      await ensureCustomerVisitOwnerTable()
       const ownersResult = await crmDB.query(`
         SELECT o.user_id, o.is_primary, u.code, u.name
         FROM crm_customer_owner o
@@ -524,6 +554,15 @@ router.get('/:code', async (req, res) => {
         ORDER BY o.is_primary DESC, o.assigned_at ASC
       `, [code])
       crm.owners = ownersResult.rows
+
+      const visitOwnersResult = await crmDB.query(`
+        SELECT o.user_id, o.is_primary, u.code, u.name
+        FROM crm_customer_visit_owner o
+        JOIN crm_users u ON u.id = o.user_id
+        WHERE o.ar_code = $1
+        ORDER BY o.is_primary DESC, o.assigned_at ASC
+      `, [code])
+      crm.visit_owners = visitOwnersResult.rows
     }
 
     const followupSummaryRes = await crmDB.query(`
@@ -828,6 +867,7 @@ router.post('/', async (req, res) => {
 
     // Assign CRM owners (1 primary + co-owners)
     await replaceCustomerOwners(crmClient, code, normalizeCustomerOwners(crm), req.user?.id)
+    await replaceCustomerVisitOwners(crmClient, code, normalizeVisitOwners(crm), req.user?.id)
 
     await posClient.query('COMMIT')
     await crmClient.query('COMMIT')
@@ -994,6 +1034,12 @@ router.put('/:code', async (req, res) => {
 
     // Update CRM owners (clear + replace เพื่อให้ลบ/เพิ่ม co-owner ได้ตรง UI)
     await replaceCustomerOwners(crmClient, code, normalizeCustomerOwners(crm), req.user?.id)
+    if (
+      Object.prototype.hasOwnProperty.call(crm, 'visit_owners') ||
+      Object.prototype.hasOwnProperty.call(crm, 'visit_owner_user_id')
+    ) {
+      await replaceCustomerVisitOwners(crmClient, code, normalizeVisitOwners(crm), req.user?.id)
+    }
 
     await posClient.query('COMMIT')
     await crmClient.query('COMMIT')
@@ -1031,6 +1077,8 @@ router.delete('/:code', async (req, res) => {
     await posClient.query(`DELETE FROM ar_customer         WHERE code = $1`, [code])
 
     // ลบ CRM tables
+    await ensureCustomerVisitOwnerTable(crmClient)
+    await crmClient.query(`DELETE FROM crm_customer_visit_owner WHERE ar_code = $1`, [code])
     await crmClient.query(`DELETE FROM crm_customer_owner   WHERE ar_code = $1`, [code])
     await crmClient.query(`DELETE FROM crm_customer_profile WHERE ar_code = $1`, [code])
 

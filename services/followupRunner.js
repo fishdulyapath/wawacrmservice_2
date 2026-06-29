@@ -1,6 +1,6 @@
 const { crmDB } = require('../db')
 const { notifyMany } = require('./notifyService')
-const { ensureCustomerFollowupPolicy } = require('./followupPolicy')
+const { ensureCustomerFollowupPolicy, ensureCustomerVisitOwnerTable } = require('./followupPolicy')
 
 const ACT_PREFIX = { call: 'C', meeting: 'M', task: 'W', transfer: 'O' }
 async function generateActNo(activityType) {
@@ -332,6 +332,7 @@ async function runDueVisitFollowups({
     err.statusCode = 400
     throw err
   }
+  await ensureCustomerVisitOwnerTable()
 
   const fallbackUserId = actorUserId || await loadFallbackUserId()
   if (!fallbackUserId) {
@@ -432,7 +433,7 @@ async function runDueVisitFollowups({
 
       const ownerRes = await client.query(`
         SELECT o.user_id, o.is_primary
-        FROM crm_customer_owner o
+        FROM crm_customer_visit_owner o
         JOIN crm_users u ON u.id = o.user_id
         WHERE o.ar_code = $1
           AND u.is_active = TRUE
@@ -440,9 +441,7 @@ async function runDueVisitFollowups({
       `, [customer.ar_code])
 
       const allOwnerIds = [...new Set(ownerRes.rows.map(row => Number(row.user_id)).filter(Boolean))]
-      const selectedOwnerIds = settings.visit_assignment_mode === 'all'
-        ? allOwnerIds
-        : (allOwnerIds.length ? [allOwnerIds[0]] : [])
+      const selectedOwnerIds = allOwnerIds
       const primaryOwnerId = selectedOwnerIds[0] || fallbackUserId
       const requiresOwnerAssignment = selectedOwnerIds.length === 0
       const followupDateText = customer.next_visit_followup_text || String(customer.next_visit_followup).slice(0, 10)

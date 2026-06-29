@@ -1248,7 +1248,11 @@ router.get('/customer/:ar_code/timeline', managerOnly, async (req, res) => {
       : [ar_code]  // fallback: ใช้ ar_code เป็น store_id ตรงๆ
 
     const baseDateCol = `COALESCE(co.date_time_check_out, ci.date_time_check_in, ls.created_at)`
-    const conds = ['ls.deleted_at IS NULL', 'ls.store_id = ANY($1)']
+    const conds = [
+      'ls.deleted_at IS NULL',
+      'ls.store_id = ANY($1)',
+      "COALESCE(UPPER(TRIM(co.visit::text)), '') <> 'TRUE'",
+    ]
     const vals  = [storeIds]
 
     pushDateFilter(conds, vals, from, to, baseDateCol)
