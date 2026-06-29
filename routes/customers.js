@@ -420,7 +420,15 @@ router.get('/', async (req, res) => {
 // GET /api/customers/provinces
 // GET /api/customers/ampers?province=xx
 // GET /api/customers/tambons?province=xx&amper=yy
+// GET /api/customers/logistic-areas
 // ─────────────────────────────────────────────
+router.get('/logistic-areas', async (req, res) => {
+  try {
+    const r = await posDB.query(`SELECT code, name_1 FROM ar_logistic_area ORDER BY code`)
+    res.json(r.rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
 router.get('/provinces', async (req, res) => {
   try {
     const r = await posDB.query(`SELECT code, name_1 FROM erp_province ORDER BY name_1`)
@@ -460,7 +468,7 @@ router.get('/:code', async (req, res) => {
     // ข้อมูลหลักจาก POS
     const [cusResult, contactResult, detailResult, transportResult] = await Promise.all([
       posDB.query(`
-        SELECT c.*, d.sale_code, u.name_1 AS sale_name
+        SELECT c.*, c.price_level, d.sale_code, d.logistic_area, u.name_1 AS sale_name
         FROM ar_customer c
         LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
         LEFT JOIN erp_user u           ON u.code = d.sale_code
@@ -583,7 +591,14 @@ router.get('/:code', async (req, res) => {
     res.json({
       customer: cus,
       contactors: contactResult.rows,
-      detail: detailResult.rows[0] || null,
+      detail: detailResult.rows[0]
+        ? { ...detailResult.rows[0], price_level: cus.price_level ?? null }
+        : {
+            sale_code: cusResult.rows[0]?.sale_code || null,
+            logistic_area: cusResult.rows[0]?.logistic_area || null,
+            sale_name: cusResult.rows[0]?.sale_name || null,
+            price_level: cus.price_level ?? null,
+          },
       transport_labels: transportResult.rows,
       crm,
       followup_summary: followupSummaryRes.rows[0] || null,
@@ -909,7 +924,7 @@ router.put('/:code', async (req, res) => {
     const {
       name_1, country, address, province, amper, tambon, zip_code, remark,
       latitude, longitude,
-      sale_code,
+      sale_code, price_level, logistic_area,
       contactors = [],
       transport_labels = [],
       crm = {}
@@ -922,17 +937,19 @@ router.put('/:code', async (req, res) => {
     await posClient.query(`
       UPDATE ar_customer
       SET name_1=$1, country=$2, address=$3, province=$4, amper=$5,
-          tambon=$6, zip_code=$7, remark=$8, website=$9
-      WHERE code=$10
-    `, [name_1, country, address, province, amper, tambon, zip_code, remark, geoWebsite, code])
+          tambon=$6, zip_code=$7, remark=$8, website=$9, price_level=$10
+      WHERE code=$11
+    `, [name_1, country, address, province, amper, tambon, zip_code, remark, geoWebsite, price_level ?? null, code])
 
-    // Upsert ar_customer_detail (sale_code)
-    if (sale_code !== undefined) {
+    // Upsert ar_customer_detail (sale_code, logistic_area)
+    if (sale_code !== undefined || logistic_area !== undefined) {
       await posClient.query(`
-        INSERT INTO ar_customer_detail (ar_code, sale_code)
-        VALUES ($1, $2)
-        ON CONFLICT (ar_code) DO UPDATE SET sale_code = EXCLUDED.sale_code
-      `, [code, sale_code])
+        INSERT INTO ar_customer_detail (ar_code, sale_code, logistic_area)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (ar_code) DO UPDATE SET
+          sale_code     = EXCLUDED.sale_code,
+          logistic_area = EXCLUDED.logistic_area
+      `, [code, sale_code ?? null, logistic_area ?? null])
     }
 
     // Replace ar_contactor (ลบเก่า + เพิ่มใหม่)
