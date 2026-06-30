@@ -1231,7 +1231,7 @@ router.get('/customer/:ar_code/timeline', managerOnly, async (req, res) => {
   try {
     await ensureCustomerStoreLinkTable()
     const { ar_code } = req.params
-    const { from, to, bill = '', page = 1, limit = 20 } = req.query
+    const { from, to, bill = '', page = 1, limit = 20, kind = 'delivery' } = req.query
     const limitVal  = parseLimit(limit, 20, 100)
     const pageVal   = Math.max(1, parseInt(page) || 1)
     const offsetVal = (pageVal - 1) * limitVal
@@ -1251,8 +1251,12 @@ router.get('/customer/:ar_code/timeline', managerOnly, async (req, res) => {
     const conds = [
       'ls.deleted_at IS NULL',
       'ls.store_id = ANY($1)',
-      "COALESCE(UPPER(TRIM(co.visit::text)), '') <> 'TRUE'",
     ]
+    if (String(kind).toLowerCase() === 'visit') {
+      conds.push("COALESCE(UPPER(TRIM(co.visit::text)), '') = 'TRUE'")
+    } else {
+      conds.push("COALESCE(UPPER(TRIM(co.visit::text)), '') <> 'TRUE'")
+    }
     const vals  = [storeIds]
 
     pushDateFilter(conds, vals, from, to, baseDateCol)

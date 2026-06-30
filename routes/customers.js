@@ -407,7 +407,8 @@ router.get('/', async (req, res) => {
       const crmResult = await crmDB.query(`
         SELECT
           p.ar_code, p.customer_type, p.status AS crm_status,
-          p.priority, p.last_contacted, p.next_followup, p.crm_remark, p.tags,
+          p.priority, p.last_contacted, p.last_visited,
+          p.next_followup, p.next_visit_followup, p.crm_remark, p.tags,
           o.user_id AS owner_user_id, u.code AS owner_code, u.name AS owner_name
         FROM crm_customer_profile p
         LEFT JOIN crm_customer_owner o ON o.ar_code = p.ar_code AND o.is_primary = TRUE
@@ -458,6 +459,13 @@ router.get('/logistic-areas', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+router.get('/sale-areas', async (req, res) => {
+  try {
+    const r = await posDB.query(`SELECT code, name_1 FROM ar_sale_area ORDER BY code`)
+    res.json(r.rows)
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
 router.get('/provinces', async (req, res) => {
   try {
     const r = await posDB.query(`SELECT code, name_1 FROM erp_province ORDER BY name_1`)
@@ -497,7 +505,7 @@ router.get('/:code', async (req, res) => {
     // ข้อมูลหลักจาก POS
     const [cusResult, contactResult, detailResult, transportResult] = await Promise.all([
       posDB.query(`
-        SELECT c.*, c.price_level, d.sale_code, d.logistic_area, u.name_1 AS sale_name
+        SELECT c.*, c.price_level, d.sale_code, d.logistic_area, d.area_code, u.name_1 AS sale_name
         FROM ar_customer c
         LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
         LEFT JOIN erp_user u           ON u.code = d.sale_code
@@ -807,7 +815,7 @@ router.post('/', async (req, res) => {
     const {
       code, name_1, country, address, province, amper, tambon, zip_code, remark,
       latitude, longitude,
-      sale_code,
+      sale_code, logistic_area, area_code,
       contactors = [],
       transport_labels = [],
       crm = {}
@@ -826,13 +834,16 @@ router.post('/', async (req, res) => {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     `, [code, name_1, country, address, province, amper, tambon, zip_code, remark, geoWebsite])
 
-    // Insert ar_customer_detail (sale owner)
-    if (sale_code) {
+    // Insert ar_customer_detail (sale owner / logistic / sale area)
+    if (sale_code || logistic_area || area_code) {
       await posClient.query(`
-        INSERT INTO ar_customer_detail (ar_code, sale_code)
-        VALUES ($1, $2)
-        ON CONFLICT (ar_code) DO UPDATE SET sale_code = EXCLUDED.sale_code
-      `, [code, sale_code])
+        INSERT INTO ar_customer_detail (ar_code, sale_code, logistic_area, area_code)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (ar_code) DO UPDATE SET
+          sale_code     = EXCLUDED.sale_code,
+          logistic_area = EXCLUDED.logistic_area,
+          area_code     = EXCLUDED.area_code
+      `, [code, sale_code ?? null, logistic_area ?? null, area_code ?? null])
     }
 
     // Insert ar_contactor (ผู้ติดต่อ)
@@ -966,7 +977,7 @@ router.put('/:code', async (req, res) => {
     const {
       name_1, country, address, province, amper, tambon, zip_code, remark,
       latitude, longitude,
-      sale_code, price_level, logistic_area,
+      sale_code, price_level, logistic_area, area_code,
       contactors = [],
       transport_labels = [],
       crm = {}
@@ -983,15 +994,16 @@ router.put('/:code', async (req, res) => {
       WHERE code=$11
     `, [name_1, country, address, province, amper, tambon, zip_code, remark, geoWebsite, price_level ?? null, code])
 
-    // Upsert ar_customer_detail (sale_code, logistic_area)
-    if (sale_code !== undefined || logistic_area !== undefined) {
+    // Upsert ar_customer_detail (sale_code, logistic_area, area_code)
+    if (sale_code !== undefined || logistic_area !== undefined || area_code !== undefined) {
       await posClient.query(`
-        INSERT INTO ar_customer_detail (ar_code, sale_code, logistic_area)
-        VALUES ($1, $2, $3)
+        INSERT INTO ar_customer_detail (ar_code, sale_code, logistic_area, area_code)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (ar_code) DO UPDATE SET
           sale_code     = EXCLUDED.sale_code,
-          logistic_area = EXCLUDED.logistic_area
-      `, [code, sale_code ?? null, logistic_area ?? null])
+          logistic_area = EXCLUDED.logistic_area,
+          area_code     = EXCLUDED.area_code
+      `, [code, sale_code ?? null, logistic_area ?? null, area_code ?? null])
     }
 
     // Replace ar_contactor (ลบเก่า + เพิ่มใหม่)

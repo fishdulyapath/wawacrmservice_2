@@ -456,23 +456,23 @@ router.get('/by-customer/:arCode', async (req, res) => {
       // close_note เก็บใน crm_activity_owners ไม่มี → ใช้ a.outcome แทน
     }
 
-    // ดึง amper + logistic_area_name จาก POS DB
+    // ดึง amper + sale_area_name จาก POS DB
     let amperVal = null
-    let logisticAreaName = null
-    let logisticArea = null
+    let saleAreaName = null
+    let saleArea = null
     let priceLevel = null
     try {
       const posRes = await posDB.query(`
         SELECT amper, COALESCE(price_level, 0) AS price_level,
-               COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
-               COALESCE((SELECT name_1 FROM ar_logistic_area
-                         WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
-                         LIMIT 1), '') AS logistic_area_name
+               COALESCE((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS sale_area,
+               COALESCE((SELECT name_1 FROM ar_sale_area
+                         WHERE UPPER(code) = UPPER((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                         LIMIT 1), '') AS sale_area_name
         FROM ar_customer arc WHERE code = $1 LIMIT 1
       `, [arCode])
       amperVal = posRes.rows[0]?.amper || null
-      logisticAreaName = posRes.rows[0]?.logistic_area_name || null
-      logisticArea = posRes.rows[0]?.logistic_area || null
+      saleAreaName = posRes.rows[0]?.sale_area_name || null
+      saleArea = posRes.rows[0]?.sale_area || null
       priceLevel = posRes.rows[0]?.price_level ?? null
     } catch (_) {}
 
@@ -480,8 +480,8 @@ router.get('/by-customer/:arCode', async (req, res) => {
       ...a,
       status: a.derived_status || a.status,
       customer_amper: amperVal,
-      logistic_area_name: logisticAreaName,
-      logistic_area: logisticArea,
+      sale_area_name: saleAreaName,
+      sale_area: saleArea,
       price_level: priceLevel,
       owners: (ownersMap[a.id] || []).map(o => ({
         user_id: o.user_id,
@@ -849,7 +849,7 @@ router.patch('/groups/:groupKey/bulk-close', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, page = 1, limit = 20,
+    const { type, status, ar_code, owner_id, due, search, unassigned, date_from, date_to, call_result, sale_area, page = 1, limit = 20,
             sort_by = 'updated_at', sort_dir = 'desc' } = req.query
 
     const SORT_WHITELIST = {
@@ -866,6 +866,21 @@ router.get('/', async (req, res) => {
 
     if (type)    { params.push(type);    conditions.push(`a.activity_type = $${params.length}`) }
     if (ar_code) { params.push(ar_code); conditions.push(`a.ar_code = $${params.length}`) }
+    if (sale_area) {
+      const areaRes = await posDB.query(
+        `SELECT ar_code FROM ar_customer_detail WHERE area_code = $1`,
+        [sale_area]
+      )
+      const areaArCodes = areaRes.rows.map(r => r.ar_code).filter(Boolean)
+      if (areaArCodes.length === 0) {
+        return res.json({
+          data: [],
+          pagination: { total: 0, page: parseInt(page), limit: parseInt(limit), pages: 0 },
+        })
+      }
+      params.push(areaArCodes)
+      conditions.push(`a.ar_code = ANY($${params.length})`)
+    }
     if (date_from) { params.push(date_from); conditions.push(`a.created_at >= $${params.length}::date`) }
     if (date_to)   { params.push(date_to);   conditions.push(`a.created_at <  ($${params.length}::date + INTERVAL '1 day')`) }
     if (call_result) {
@@ -990,13 +1005,13 @@ router.get('/', async (req, res) => {
       const placeholders = arCodes.map((_, i) => `$${i + 1}`).join(',')
       const posResult = await posDB.query(
         `SELECT arc.code, arc.name_1, arc.amper, COALESCE(arc.price_level, 0) AS price_level,
-                COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
-                COALESCE((SELECT name_1 FROM ar_logistic_area
-                          WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
-                          LIMIT 1), '') AS logistic_area_name
+                COALESCE((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS sale_area,
+                COALESCE((SELECT name_1 FROM ar_sale_area
+                          WHERE UPPER(code) = UPPER((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                          LIMIT 1), '') AS sale_area_name
          FROM ar_customer arc WHERE arc.code IN (${placeholders})`, arCodes
       )
-      posResult.rows.forEach(r => { customerMap[r.code] = { name: r.name_1, amper: r.amper, price_level: r.price_level, logistic_area: r.logistic_area, logistic_area_name: r.logistic_area_name } })
+      posResult.rows.forEach(r => { customerMap[r.code] = { name: r.name_1, amper: r.amper, price_level: r.price_level, sale_area: r.sale_area, sale_area_name: r.sale_area_name } })
     }
 
     const pageInt  = parseInt(page)
@@ -1008,8 +1023,8 @@ router.get('/', async (req, res) => {
         customer_name: customerMap[r.ar_code]?.name || null,
         customer_amper: customerMap[r.ar_code]?.amper || null,
         price_level: customerMap[r.ar_code]?.price_level ?? null,
-        logistic_area: customerMap[r.ar_code]?.logistic_area || null,
-        logistic_area_name: customerMap[r.ar_code]?.logistic_area_name || null,
+        sale_area: customerMap[r.ar_code]?.sale_area || null,
+        sale_area_name: customerMap[r.ar_code]?.sale_area_name || null,
       })),
       pagination: {
         total,
@@ -1049,22 +1064,22 @@ router.get('/:id', async (req, res) => {
     activity.derived_status = deriveActivityStatus(owners)
     activity.my_status = activity.owners.find(o => o.user_id === req.user.id)?.status || null
 
-    // ดึง customer_name + amper + price_level + logistic จาก POS
+    // ดึง customer_name + amper + price_level + sale area จาก POS
     if (activity.ar_code) {
       try {
         const cusRes = await posDB.query(
           `SELECT name_1, amper, COALESCE(price_level, 0) AS price_level,
-                  COALESCE((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS logistic_area,
-                  COALESCE((SELECT name_1 FROM ar_logistic_area
-                            WHERE UPPER(code) = UPPER((SELECT logistic_area FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
-                            LIMIT 1), '') AS logistic_area_name
+                  COALESCE((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1), '') AS sale_area,
+                  COALESCE((SELECT name_1 FROM ar_sale_area
+                            WHERE UPPER(code) = UPPER((SELECT area_code FROM ar_customer_detail WHERE ar_code = arc.code LIMIT 1))
+                            LIMIT 1), '') AS sale_area_name
            FROM ar_customer arc WHERE code = $1`, [activity.ar_code]
         )
         activity.customer_name      = cusRes.rows[0]?.name_1 || null
         activity.customer_amper     = cusRes.rows[0]?.amper  || null
         activity.price_level        = cusRes.rows[0]?.price_level ?? null
-        activity.logistic_area      = cusRes.rows[0]?.logistic_area || null
-        activity.logistic_area_name = cusRes.rows[0]?.logistic_area_name || null
+        activity.sale_area          = cusRes.rows[0]?.sale_area || null
+        activity.sale_area_name     = cusRes.rows[0]?.sale_area_name || null
       } catch {}
     }
 

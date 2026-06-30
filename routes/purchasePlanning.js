@@ -27,8 +27,7 @@ function linkableItemWhere(itemAlias = 'i', detailAlias = 'd') {
 
 function activeSupplierWhere(alias = 's') {
   return `COALESCE(${alias}.code, '') <> ''
-    AND COALESCE(${alias}.status, 0) = 0
-    AND COALESCE(${alias}.ap_status, 0) = 0`
+    AND COALESCE(${alias}.status, 0) = 0`
 }
 
 function enabledPlanningSupplierWhere(alias = 's') {
@@ -656,100 +655,126 @@ function buildPlanningMetricsSql({
     ),
     ${davgSql},
     reserve_add AS (
-      SELECT td.doc_no, td.item_code AS ic_code, td.wh_code,
+      SELECT td.doc_no, td.item_code AS ic_code,
              SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 34
-        AND COALESCE(td.status, 0) = 0
-        AND COALESCE(td.wh_code, '') = $2::text
-      GROUP BY td.doc_no, td.item_code, td.wh_code
+        AND COALESCE(td.last_status, 0) = 0
+      GROUP BY td.doc_no, td.item_code
     ),
     reserve_reduce AS (
-      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code, td.wh_code,
+      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code,
              SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
-      WHERE td.trans_flag IN (36, 44, 39)
-        AND COALESCE(td.status, 0) = 0
+      WHERE (
+          (td.trans_flag = 44 AND COALESCE(td.doc_ref_type, 0) = 2)
+          OR (td.trans_flag = 36 AND COALESCE(td.doc_ref_type, 0) = 2)
+          OR (
+            td.trans_flag = 39
+            AND EXISTS (
+              SELECT 1
+              FROM ic_trans t_cancel
+              WHERE t_cancel.doc_no = td.doc_no
+                AND t_cancel.trans_flag = td.trans_flag
+                AND COALESCE(t_cancel.cancel_type, 0) = 2
+            )
+          )
+        )
+        AND COALESCE(td.last_status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
-        AND COALESCE(td.wh_code, '') = $2::text
-      GROUP BY td.ref_doc_no, td.item_code, td.wh_code
+      GROUP BY td.ref_doc_no, td.item_code
     ),
     book_out AS (
-      SELECT a.ic_code, SUM(GREATEST(a.qty - COALESCE(r.qty, 0), 0)) AS book_out_qty
+      SELECT a.ic_code, SUM(a.qty - COALESCE(r.qty, 0)) FILTER (WHERE a.qty - COALESCE(r.qty, 0) <> 0) AS book_out_qty
       FROM reserve_add a
       LEFT JOIN reserve_reduce r
         ON r.doc_no = a.doc_no
        AND r.ic_code = a.ic_code
-       AND r.wh_code = a.wh_code
       GROUP BY a.ic_code
     ),
     sale_order_add AS (
-      SELECT td.doc_no, td.item_code AS ic_code, td.wh_code,
+      SELECT td.doc_no, td.item_code AS ic_code,
              SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 36
-        AND COALESCE(td.status, 0) = 0
-        AND COALESCE(td.wh_code, '') = $2::text
-      GROUP BY td.doc_no, td.item_code, td.wh_code
+        AND COALESCE(td.last_status, 0) = 0
+      GROUP BY td.doc_no, td.item_code
     ),
     sale_order_reduce AS (
-      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code, td.wh_code,
+      SELECT td.ref_doc_no AS doc_no, td.item_code AS ic_code,
              SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
-      WHERE td.trans_flag IN (44, 37)
-        AND COALESCE(td.status, 0) = 0
+      WHERE (
+          (td.trans_flag = 44 AND COALESCE(td.doc_ref_type, 0) = 3)
+          OR (
+            td.trans_flag = 37
+            AND EXISTS (
+              SELECT 1
+              FROM ic_trans t_cancel
+              WHERE t_cancel.doc_no = td.doc_no
+                AND t_cancel.trans_flag = td.trans_flag
+                AND COALESCE(t_cancel.cancel_type, 0) = 2
+            )
+          )
+        )
+        AND COALESCE(td.last_status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
-        AND COALESCE(td.wh_code, '') = $2::text
-      GROUP BY td.ref_doc_no, td.item_code, td.wh_code
+      GROUP BY td.ref_doc_no, td.item_code
     ),
     accrued_out AS (
-      SELECT a.ic_code, SUM(GREATEST(a.qty - COALESCE(r.qty, 0), 0)) AS accrued_out_qty
+      SELECT a.ic_code, SUM(a.qty - COALESCE(r.qty, 0)) FILTER (WHERE a.qty - COALESCE(r.qty, 0) <> 0) AS accrued_out_qty
       FROM sale_order_add a
       LEFT JOIN sale_order_reduce r
         ON r.doc_no = a.doc_no
        AND r.ic_code = a.ic_code
-       AND r.wh_code = a.wh_code
       GROUP BY a.ic_code
     ),
     po_lines AS (
       SELECT
         td.doc_no,
-        td.line_number,
         td.item_code AS ic_code,
-        td.wh_code,
         SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 6
-        AND COALESCE(td.status, 0) = 0
-        AND COALESCE(td.wh_code, '') = $2::text
-      GROUP BY td.doc_no, td.line_number, td.item_code, td.wh_code
+        AND COALESCE(td.last_status, 0) = 0
+      GROUP BY td.doc_no, td.item_code
     ),
     po_reduce AS (
       SELECT
         td.ref_doc_no AS doc_no,
-        td.ref_row AS line_number,
         td.item_code AS ic_code,
         SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
       FROM ic_trans_detail td
       JOIN candidates c ON c.ic_code = td.item_code
-      WHERE td.trans_flag IN (12, 310, 7)
-        AND COALESCE(td.status, 0) = 0
+      WHERE (
+          td.trans_flag IN (12, 310)
+          OR (
+            td.trans_flag = 7
+            AND EXISTS (
+              SELECT 1
+              FROM ic_trans t_cancel
+              WHERE t_cancel.doc_no = td.doc_no
+                AND t_cancel.trans_flag = td.trans_flag
+                AND COALESCE(t_cancel.cancel_type, 0) = 2
+            )
+          )
+        )
+        AND COALESCE(td.last_status, 0) = 0
         AND COALESCE(td.ref_doc_no, '') <> ''
-      GROUP BY td.ref_doc_no, td.ref_row, td.item_code
+      GROUP BY td.ref_doc_no, td.item_code
     ),
     accrued_in AS (
       SELECT
         p.ic_code,
-        SUM(GREATEST(p.qty - COALESCE(r.qty, 0), 0)) AS accrued_in_qty
+        SUM(p.qty - COALESCE(r.qty, 0)) FILTER (WHERE p.qty - COALESCE(r.qty, 0) <> 0) AS accrued_in_qty
       FROM po_lines p
       LEFT JOIN po_reduce r
         ON r.doc_no = p.doc_no
-       AND r.line_number = p.line_number
        AND r.ic_code = p.ic_code
       GROUP BY p.ic_code
     ),
@@ -758,8 +783,8 @@ function buildPlanningMetricsSql({
         td.item_code AS ic_code,
         SUM(CASE WHEN td.trans_flag = 310 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS purchase_qty_3m,
         SUM(CASE WHEN td.trans_flag = 44 THEN td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1) ELSE 0 END) AS sale_qty_3m,
-        SUM(CASE WHEN td.trans_flag = 310 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS purchase_amount_3m,
-        SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount, 0) ELSE 0 END) AS sale_amount_3m,
+        SUM(CASE WHEN td.trans_flag = 310 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS purchase_amount_3m,
+        SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS sale_amount_3m,
         -- กำไรขั้นต้น 90 วัน (ตามมาตรฐาน _stkProfit: JOIN ic_trans + last_status=0, แยก ขาย44/รับคืน48)
         SUM(CASE WHEN td.trans_flag = 44 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS amount_sale_3m,
         SUM(CASE WHEN td.trans_flag = 48 THEN COALESCE(td.sum_amount_exclude_vat, 0) ELSE 0 END) AS amount_sale_return_3m,
@@ -778,7 +803,7 @@ function buildPlanningMetricsSql({
       SELECT DISTINCT ON (td.item_code, td.cust_code)
         td.item_code AS ic_code,
         td.cust_code AS ap_code,
-        td.price,
+        td.price_exclude_vat AS price,
         td.price_exclude_vat,
         td.unit_code,
         td.doc_no,
@@ -798,7 +823,7 @@ function buildPlanningMetricsSql({
         link.ap_code,
         COALESCE(s.name_1, '') AS ap_name,
         COALESCE(sd.tax_type, '') AS tax_type,
-        lp.price AS last_purchase_price,
+        lp.price_exclude_vat AS last_purchase_price,
         lp.price_exclude_vat AS last_purchase_price_exclude_vat,
         COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
         lp.doc_date AS last_purchase_date,
@@ -815,7 +840,7 @@ function buildPlanningMetricsSql({
           PARTITION BY link.ic_code
           ORDER BY
             CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-            COALESCE(lp.price, 999999999999),
+            COALESCE(lp.price_exclude_vat, 999999999999),
             lp.doc_date DESC NULLS LAST,
             link.ap_code
         ) AS rn
@@ -1089,37 +1114,45 @@ async function runReportJob(job) {
        po_lines AS (
          SELECT
            td.doc_no,
-           td.line_number,
            td.item_code AS ic_code,
            SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
          FROM ic_trans_detail td
          JOIN candidates c ON c.ic_code = td.item_code
          WHERE td.trans_flag = 6
-           AND COALESCE(td.status, 0) = 0
-           AND COALESCE(td.wh_code, '') = $3::text
-         GROUP BY td.doc_no, td.line_number, td.item_code
+           AND COALESCE(td.last_status, 0) = 0
+         GROUP BY td.doc_no, td.item_code
        ),
        po_reduce AS (
          SELECT
            td.ref_doc_no AS doc_no,
-           td.ref_row AS line_number,
            td.item_code AS ic_code,
            SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
          FROM ic_trans_detail td
          JOIN candidates c ON c.ic_code = td.item_code
-         WHERE td.trans_flag IN (12, 310, 7)
-           AND COALESCE(td.status, 0) = 0
+         WHERE (
+             td.trans_flag IN (12, 310)
+             OR (
+               td.trans_flag = 7
+               AND EXISTS (
+                 SELECT 1
+                 FROM ic_trans t_cancel
+                 WHERE t_cancel.doc_no = td.doc_no
+                   AND t_cancel.trans_flag = td.trans_flag
+                   AND COALESCE(t_cancel.cancel_type, 0) = 2
+               )
+             )
+           )
+           AND COALESCE(td.last_status, 0) = 0
            AND COALESCE(td.ref_doc_no, '') <> ''
-         GROUP BY td.ref_doc_no, td.ref_row, td.item_code
+         GROUP BY td.ref_doc_no, td.item_code
        ),
        accrued_in AS (
          SELECT
            p.ic_code,
-           SUM(GREATEST(p.qty - COALESCE(r.qty, 0), 0)) AS accrued_in_qty
+           SUM(p.qty - COALESCE(r.qty, 0)) FILTER (WHERE p.qty - COALESCE(r.qty, 0) <> 0) AS accrued_in_qty
          FROM po_lines p
          LEFT JOIN po_reduce r
            ON r.doc_no = p.doc_no
-          AND r.line_number = p.line_number
           AND r.ic_code = p.ic_code
          GROUP BY p.ic_code
        ),
@@ -1613,7 +1646,7 @@ router.get('/item-supplier-settings', async (req, res) => {
          SELECT DISTINCT ON (item_code, cust_code)
            item_code AS ic_code,
            cust_code AS ap_code,
-           price,
+           price_exclude_vat AS price,
            unit_code,
            doc_date,
            doc_time
@@ -2309,7 +2342,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          SELECT DISTINCT ON (td.item_code, td.cust_code)
            td.item_code AS ic_code,
            td.cust_code AS ap_code,
-           td.price,
+           td.price_exclude_vat AS price,
            td.price_exclude_vat,
            td.unit_code,
            td.doc_no,
@@ -2327,7 +2360,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          link.ap_code,
          COALESCE(s.name_1, '') AS ap_name,
          COALESCE(sd.tax_type, '') AS tax_type,
-         lp.price AS last_purchase_price,
+         lp.price_exclude_vat AS last_purchase_price,
          lp.price_exclude_vat AS last_purchase_price_exclude_vat,
          COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
          lp.doc_no AS last_purchase_doc_no,
@@ -2343,7 +2376,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          ROW_NUMBER() OVER (
            ORDER BY
              CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-             COALESCE(lp.price, 999999999999),
+             COALESCE(lp.price_exclude_vat, 999999999999),
              lp.doc_date DESC NULLS LAST,
              link.ap_code
          ) AS rank_no
@@ -2470,9 +2503,9 @@ router.get('/items/:icCode/detail', async (req, res) => {
            td.barcode,
            td.unit_code,
            td.qty,
-           td.price,
+           td.price_exclude_vat AS price,
            td.price_exclude_vat,
-           td.sum_amount,
+           td.sum_amount_exclude_vat AS sum_amount,
            td.sum_amount_exclude_vat,
            td.average_cost
          FROM ic_trans_detail td
@@ -2530,7 +2563,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
            COALESCE(td.cust_code, '') AS cust_code,
            COALESCE(c.name_1, '') AS cust_name,
            SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty,
-           SUM(td.sum_amount) AS amount,
+           SUM(COALESCE(td.sum_amount_exclude_vat, 0)) AS amount,
            MAX(td.doc_date)::date AS last_sale_date
          FROM ic_trans_detail td
          LEFT JOIN ar_customer c ON c.code = td.cust_code
@@ -2575,26 +2608,70 @@ router.get('/items/:icCode/detail', async (req, res) => {
         [icCode, options.asOfDate],
       ),
       posDB.query(
-        `SELECT
-           td.doc_date::date AS doc_date,
-           td.doc_no,
-           td.cust_code AS ap_code,
+        `WITH po_lines AS (
+           SELECT
+             td.doc_no,
+             td.cust_code,
+             td.item_code,
+             COALESCE(td.item_name, '') AS item_name,
+             td.unit_code,
+             MIN(td.doc_date)::date AS doc_date,
+             MAX(td.doc_time) AS doc_time,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+           FROM ic_trans_detail td
+           WHERE td.trans_flag = 6
+             AND COALESCE(td.last_status, 0) = 0
+             AND td.item_code = $1::text
+           GROUP BY td.doc_no, td.cust_code, td.item_code, COALESCE(td.item_name, ''), td.unit_code
+         ),
+         po_reduce AS (
+           SELECT
+             td.ref_doc_no AS doc_no,
+             td.item_code,
+             SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS qty
+           FROM ic_trans_detail td
+           WHERE (
+               td.trans_flag IN (12, 310)
+               OR (
+                 td.trans_flag = 7
+                 AND EXISTS (
+                   SELECT 1
+                   FROM ic_trans t_cancel
+                   WHERE t_cancel.doc_no = td.doc_no
+                     AND t_cancel.trans_flag = td.trans_flag
+                     AND COALESCE(t_cancel.cancel_type, 0) = 2
+                 )
+               )
+             )
+             AND COALESCE(td.last_status, 0) = 0
+             AND COALESCE(td.ref_doc_no, '') <> ''
+             AND td.item_code = $1::text
+           GROUP BY td.ref_doc_no, td.item_code
+         ),
+         pending AS (
+           SELECT
+             p.*,
+             p.qty - COALESCE(r.qty, 0) AS acc_in_balance
+           FROM po_lines p
+           LEFT JOIN po_reduce r
+             ON r.doc_no = p.doc_no
+            AND r.item_code = p.item_code
+         )
+         SELECT
+           p.doc_date,
+           p.doc_time,
+           p.doc_no,
+           p.cust_code AS ap_code,
            COALESCE(s.name_1, '') AS ap_name,
            COALESCE(sd.tax_type, '') AS tax_type,
-           td.qty,
-           td.unit_code,
-           td.ref_doc_no,
-           GREATEST(($2::date - td.doc_date::date), 0)::int AS waiting_days
-         FROM ic_trans_detail td
-         JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
-         LEFT JOIN ap_supplier s ON s.code = td.cust_code
-         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = td.cust_code AND COALESCE(sd.tax_type, '') <> ''
-         WHERE td.trans_flag = 6
-           AND COALESCE(td.status, 0) = 0
-           AND COALESCE(t.doc_success, 0) = 0
-           AND COALESCE(t.last_status, 0) = 0
-           AND td.item_code = $1::text
-         ORDER BY td.doc_date DESC, td.doc_time DESC
+           p.acc_in_balance AS qty,
+           p.unit_code,
+           GREATEST(($2::date - p.doc_date), 0)::int AS waiting_days
+         FROM pending p
+         LEFT JOIN ap_supplier s ON s.code = p.cust_code
+         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = p.cust_code AND COALESCE(sd.tax_type, '') <> ''
+         WHERE p.acc_in_balance <> 0
+         ORDER BY p.acc_in_balance, p.doc_date DESC, p.doc_time DESC
          LIMIT 20`,
         [icCode, options.asOfDate],
       ),
@@ -2603,7 +2680,8 @@ router.get('/items/:icCode/detail', async (req, res) => {
            SELECT DISTINCT ON (td.item_code, td.cust_code)
              td.item_code AS ic_code,
              td.cust_code AS ap_code,
-             td.price,
+             td.price_exclude_vat AS price,
+             td.price_exclude_vat,
              td.unit_code,
              td.doc_date::date AS doc_date,
              td.doc_time
@@ -2618,7 +2696,8 @@ router.get('/items/:icCode/detail', async (req, res) => {
            link.ap_code,
            COALESCE(s.name_1, '') AS ap_name,
            COALESCE(sd.tax_type, '') AS tax_type,
-           lp.price AS last_purchase_price,
+           lp.price_exclude_vat AS last_purchase_price,
+           lp.price_exclude_vat AS last_purchase_price_exclude_vat,
            lp.unit_code AS last_purchase_unit_code,
            lp.doc_date AS last_purchase_date,
            COALESCE(r.lead_time_days, 0) AS lead_time_days,
@@ -2638,7 +2717,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
          WHERE link.ic_code = $1::text
            AND COALESCE(r.planning_enabled, 0) = 1
          ORDER BY CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-                  COALESCE(lp.price, 999999999999),
+                  COALESCE(lp.price_exclude_vat, 999999999999),
                   link.ap_code`,
         [icCode],
       ),
@@ -2648,10 +2727,15 @@ router.get('/items/:icCode/detail', async (req, res) => {
            td.doc_date::date AS doc_date,
            td.doc_time,
            td.doc_no,
+           td.cust_code AS ap_code,
+           COALESCE(s.name_1, '') AS ap_name,
+           COALESCE(sd.tax_type, '') AS tax_type,
            td.qty,
            td.unit_code,
            td.price_exclude_vat
          FROM ic_trans_detail td
+         LEFT JOIN ap_supplier s ON s.code = td.cust_code
+         LEFT JOIN ap_supplier_detail sd ON sd.ap_code = td.cust_code AND COALESCE(sd.tax_type, '') <> ''
          WHERE td.trans_flag = 310
            AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
@@ -2759,7 +2843,6 @@ router.get('/item-supplier-link/:icCode/linked', async (req, res) => {
        JOIN ap_supplier s ON s.code = lnk.ap_code
        WHERE lnk.ic_code = $1::text
          AND ${activeSupplierWhere('s')}
-         AND ${enabledPlanningSupplierWhere('s')}
          AND EXISTS (
            SELECT 1
            FROM ic_inventory i
@@ -2796,7 +2879,6 @@ router.get('/item-supplier-link/:icCode/available', async (req, res) => {
       `SELECT s.code AS ap_code, COALESCE(s.name_1,'') AS ap_name
        FROM ap_supplier s
        WHERE ${activeSupplierWhere('s')}
-         AND ${enabledPlanningSupplierWhere('s')}
          AND EXISTS (
            SELECT 1
            FROM ic_inventory i
@@ -2841,7 +2923,6 @@ router.post('/item-supplier-link/:icCode/link', async (req, res) => {
        FROM ap_supplier s
        WHERE s.code = $1::text
          AND ${activeSupplierWhere('s')}
-         AND ${enabledPlanningSupplierWhere('s')}
        LIMIT 1`,
       [apCode],
     )
@@ -2899,7 +2980,7 @@ router.get('/item-supplier-link/suppliers', async (req, res) => {
   }
 
   try {
-    const supplierWhereSql = `${activeSupplierWhere('s')} AND ${enabledPlanningSupplierWhere('s')}`
+    const supplierWhereSql = activeSupplierWhere('s')
     const [countResult, dataResult] = await Promise.all([
       posDB.query(
         `SELECT COUNT(*)::int AS total FROM ap_supplier s WHERE ${supplierWhereSql}${whereSql}`,
@@ -2934,7 +3015,6 @@ router.get('/item-supplier-link/by-supplier/:apCode/linked', async (req, res) =>
        LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
        WHERE lnk.ap_code = $1::text
          AND ${activeSupplierWhere('s')}
-         AND ${enabledPlanningSupplierWhere('s')}
          AND ${linkableItemWhere('i', 'd')}
        ORDER BY i.name_1, lnk.ic_code`,
       [apCode],
@@ -2966,7 +3046,6 @@ router.get('/item-supplier-link/by-supplier/:apCode/available', async (req, res)
            FROM ap_supplier s
            WHERE s.code = $1::text
              AND ${activeSupplierWhere('s')}
-             AND ${enabledPlanningSupplierWhere('s')}
          )
          AND NOT EXISTS (
            SELECT 1 FROM ap_item_by_supplier lnk
@@ -3005,7 +3084,6 @@ router.post('/item-supplier-link/by-supplier/:apCode/link', async (req, res) => 
        FROM ap_supplier s
        WHERE s.code = $1::text
          AND ${activeSupplierWhere('s')}
-         AND ${enabledPlanningSupplierWhere('s')}
        LIMIT 1`,
       [apCode],
     )
