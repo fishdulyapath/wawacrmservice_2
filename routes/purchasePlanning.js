@@ -141,7 +141,7 @@ async function withPosTransaction(fn) {
 // multer: เก็บไฟล์ใน memory (ไฟล์ Excel มักเล็ก < 1MB)
 const importUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
   fileFilter(_req, file, cb) {
     const ok = /\.(xlsx|xls)$/i.test(path.extname(file.originalname))
     cb(ok ? null : new Error('ไฟล์ต้องเป็น .xlsx หรือ .xls เท่านั้น'), ok)
@@ -149,7 +149,7 @@ const importUpload = multer({
 })
 
 // จำกัดจำนวน row ที่ import ได้ต่อครั้ง (ป้องกัน DoS / ความผิดพลาด)
-const IMPORT_MAX_ROWS = 5000
+const IMPORT_MAX_ROWS = 50000
 
 // คอลัมน์ที่ export/import ของแต่ละ tab (key = ฟิลด์ DB, header = ชื่อใน Excel)
 const SUPPLIER_COLUMNS = [
@@ -1437,10 +1437,10 @@ router.post('/supplier-settings/import', importUpload.single('file'), async (req
         errors.push({ line: lineNo, message: 'ไม่ระบุรหัสเจ้าหนี้' })
         continue
       }
-      validRows.push(parsed)
+      validRows.push({ lineNo, parsed })
     }
 
-    const codes = [...new Set(validRows.map((r) => r.ap_code))]
+    const codes = [...new Set(validRows.map((r) => r.parsed.ap_code))]
     let existingMap = new Map()
     if (codes.length) {
       const existingResult = await posDB.query(
@@ -1450,15 +1450,14 @@ router.post('/supplier-settings/import', importUpload.single('file'), async (req
       existingMap = new Set(existingResult.rows.map((r) => r.code))
     }
     const checkedRows = []
-    for (let i = 0; i < validRows.length; i++) {
-      const parsed = validRows[i]
-      const lineNo = rows[i].lineNo
+    for (const { lineNo, parsed } of validRows) {
       if (!existingMap.has(parsed.ap_code)) {
         errors.push({ line: lineNo, ap_code: parsed.ap_code, message: 'ไม่พบรหัสเจ้าหนี้ในระบบ' })
         continue
       }
       checkedRows.push(parsed)
     }
+    const rowsToCommit = [...new Map(checkedRows.map((r) => [r.ap_code, r])).values()]
 
     const preview = checkedRows.slice(0, 10).map((r) => ({
       ap_code: r.ap_code,
@@ -1480,36 +1479,52 @@ router.post('/supplier-settings/import', importUpload.single('file'), async (req
 
     // commit: upsert ทั้งหมดใน transaction
     const result = await withPosTransaction(async (client) => {
-      let updated = 0
-      for (const r of checkedRows) {
-        await client.query(
-          `INSERT INTO purchase_planning_supplier_setting (
-              ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
-              planning_enabled, remark, create_code, last_update_code
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
-           ON CONFLICT (ap_code) DO UPDATE SET
-              lead_time_days = EXCLUDED.lead_time_days,
-              late_buffer_days = EXCLUDED.late_buffer_days,
-              wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
-              order_cycle_days = EXCLUDED.order_cycle_days,
-              planning_enabled = EXCLUDED.planning_enabled,
-              remark = EXCLUDED.remark,
-              last_update_code = EXCLUDED.last_update_code,
-              last_update_date_time = now()`,
-          [
-            r.ap_code,
-            r.lead_time_days,
-            r.late_buffer_days,
-            r.wholesale_buffer_days,
-            r.order_cycle_days,
-            Number(r.planning_enabled) === 0 ? 0 : 1,
-            r.remark,
-            userCode,
-          ],
-        )
-        updated += 1
-      }
-      return { updated }
+      if (!rowsToCommit.length) return { updated: 0 }
+      const upsertResult = await client.query(
+        `WITH input AS (
+           SELECT *
+           FROM unnest(
+             $1::text[],
+             $2::int[],
+             $3::int[],
+             $4::int[],
+             $5::int[],
+             $6::int[],
+             $7::text[]
+           ) AS t(
+             ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days,
+             order_cycle_days, planning_enabled, remark
+           )
+         )
+         INSERT INTO purchase_planning_supplier_setting (
+            ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+            planning_enabled, remark, create_code, last_update_code
+         )
+         SELECT
+            ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+            planning_enabled, remark, $8::text, $8::text
+         FROM input
+         ON CONFLICT (ap_code) DO UPDATE SET
+            lead_time_days = EXCLUDED.lead_time_days,
+            late_buffer_days = EXCLUDED.late_buffer_days,
+            wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+            order_cycle_days = EXCLUDED.order_cycle_days,
+            planning_enabled = EXCLUDED.planning_enabled,
+            remark = EXCLUDED.remark,
+            last_update_code = EXCLUDED.last_update_code,
+            last_update_date_time = now()`,
+        [
+          rowsToCommit.map((r) => r.ap_code),
+          rowsToCommit.map((r) => r.lead_time_days),
+          rowsToCommit.map((r) => r.late_buffer_days),
+          rowsToCommit.map((r) => r.wholesale_buffer_days),
+          rowsToCommit.map((r) => r.order_cycle_days),
+          rowsToCommit.map((r) => (Number(r.planning_enabled) === 0 ? 0 : 1)),
+          rowsToCommit.map((r) => r.remark),
+          userCode,
+        ],
+      )
+      return { updated: upsertResult.rowCount }
     })
 
     res.json({
@@ -1897,35 +1912,39 @@ router.post('/item-supplier-settings/import', importUpload.single('file'), async
         errors.push({ line: lineNo, message: 'ไม่ระบุรหัสสินค้าหรือรหัสเจ้าหนี้' })
         continue
       }
-      validRows.push(parsed)
+      validRows.push({ lineNo, parsed })
     }
 
     // validate ว่าคู่ (ic_code, ap_code) มีอยู่จริงใน ap_item_by_supplier
     let existingPairs = new Set()
     if (validRows.length) {
       const pairRows = await posDB.query(
-        `SELECT link.ic_code, link.ap_code
-         FROM ap_item_by_supplier link
+        `WITH input AS (
+           SELECT DISTINCT ic_code, ap_code
+           FROM unnest($1::text[], $2::text[]) AS t(ic_code, ap_code)
+         )
+         SELECT link.ic_code, link.ap_code
+         FROM input inp
+         JOIN ap_item_by_supplier link
+           ON link.ic_code = inp.ic_code AND link.ap_code = inp.ap_code
          LEFT JOIN ic_inventory i ON i.code = link.ic_code
          LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
          JOIN ap_supplier s ON s.code = link.ap_code
          JOIN purchase_planning_supplier_setting supplier_plan
            ON supplier_plan.ap_code = link.ap_code
           AND COALESCE(supplier_plan.planning_enabled, 0) = 1
-         WHERE (link.ic_code, link.ap_code) IN (
-           ${validRows.map((_, i) => `($${i * 2 + 1}::text, $${i * 2 + 2}::text)`).join(',')}
-         )
-           AND ${linkableItemWhere('i', 'd')}
+         WHERE ${linkableItemWhere('i', 'd')}
            AND ${activeSupplierWhere('s')}`,
-        validRows.flatMap((r) => [r.ic_code, r.ap_code]),
+        [
+          validRows.map((r) => r.parsed.ic_code),
+          validRows.map((r) => r.parsed.ap_code),
+        ],
       )
       existingPairs = new Set(pairRows.rows.map((r) => `${r.ic_code}\u0000${r.ap_code}`))
     }
 
     const checkedRows = []
-    for (let i = 0; i < validRows.length; i++) {
-      const parsed = validRows[i]
-      const lineNo = rows[i].lineNo
+    for (const { lineNo, parsed } of validRows) {
       const pairKey = `${parsed.ic_code}\u0000${parsed.ap_code}`
       if (!existingPairs.has(pairKey)) {
         errors.push({
@@ -1938,6 +1957,7 @@ router.post('/item-supplier-settings/import', importUpload.single('file'), async
       }
       checkedRows.push(parsed)
     }
+    const rowsToCommit = [...new Map(checkedRows.map((r) => [`${r.ic_code}\u0000${r.ap_code}`, r])).values()]
 
     const preview = checkedRows.slice(0, 10).map((r) => ({
       ic_code: r.ic_code,
@@ -1961,42 +1981,60 @@ router.post('/item-supplier-settings/import', importUpload.single('file'), async
 
     // commit: upsert ทั้งหมดใน transaction
     const result = await withPosTransaction(async (client) => {
-      let updated = 0
-      for (const r of checkedRows) {
-        const minOrderQty = Math.max(0, toNumber(r.min_order_qty, 0))
-        await client.query(
-          `INSERT INTO purchase_planning_item_supplier_setting (
-              ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
-              min_order_qty, planning_enabled, is_preferred, remark, create_code, last_update_code
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
-           ON CONFLICT (ic_code, ap_code) DO UPDATE SET
-              lead_time_days = EXCLUDED.lead_time_days,
-              late_buffer_days = EXCLUDED.late_buffer_days,
-              wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
-              order_cycle_days = EXCLUDED.order_cycle_days,
-              min_order_qty = EXCLUDED.min_order_qty,
-              planning_enabled = EXCLUDED.planning_enabled,
-              is_preferred = EXCLUDED.is_preferred,
-              remark = EXCLUDED.remark,
-              last_update_code = EXCLUDED.last_update_code,
-              last_update_date_time = now()`,
-          [
-            r.ic_code,
-            r.ap_code,
-            r.lead_time_days,
-            r.late_buffer_days,
-            r.wholesale_buffer_days,
-            r.order_cycle_days,
-            minOrderQty,
-            Number(r.planning_enabled) === 0 ? 0 : 1,
-            Number(r.is_preferred) === 1 ? 1 : 0,
-            r.remark,
-            userCode,
-          ],
-        )
-        updated += 1
-      }
-      return { updated }
+      if (!rowsToCommit.length) return { updated: 0 }
+      const upsertResult = await client.query(
+        `WITH input AS (
+           SELECT *
+           FROM unnest(
+             $1::text[],
+             $2::text[],
+             $3::int[],
+             $4::int[],
+             $5::int[],
+             $6::int[],
+             $7::numeric[],
+             $8::int[],
+             $9::int[],
+             $10::text[]
+           ) AS t(
+             ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days,
+             order_cycle_days, min_order_qty, planning_enabled, is_preferred, remark
+           )
+         )
+         INSERT INTO purchase_planning_item_supplier_setting (
+            ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+            min_order_qty, planning_enabled, is_preferred, remark, create_code, last_update_code
+         )
+         SELECT
+            ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+            min_order_qty, planning_enabled, is_preferred, remark, $11::text, $11::text
+         FROM input
+         ON CONFLICT (ic_code, ap_code) DO UPDATE SET
+            lead_time_days = EXCLUDED.lead_time_days,
+            late_buffer_days = EXCLUDED.late_buffer_days,
+            wholesale_buffer_days = EXCLUDED.wholesale_buffer_days,
+            order_cycle_days = EXCLUDED.order_cycle_days,
+            min_order_qty = EXCLUDED.min_order_qty,
+            planning_enabled = EXCLUDED.planning_enabled,
+            is_preferred = EXCLUDED.is_preferred,
+            remark = EXCLUDED.remark,
+            last_update_code = EXCLUDED.last_update_code,
+            last_update_date_time = now()`,
+        [
+          rowsToCommit.map((r) => r.ic_code),
+          rowsToCommit.map((r) => r.ap_code),
+          rowsToCommit.map((r) => r.lead_time_days),
+          rowsToCommit.map((r) => r.late_buffer_days),
+          rowsToCommit.map((r) => r.wholesale_buffer_days),
+          rowsToCommit.map((r) => r.order_cycle_days),
+          rowsToCommit.map((r) => Math.max(0, toNumber(r.min_order_qty, 0))),
+          rowsToCommit.map((r) => (Number(r.planning_enabled) === 0 ? 0 : 1)),
+          rowsToCommit.map((r) => (Number(r.is_preferred) === 1 ? 1 : 0)),
+          rowsToCommit.map((r) => r.remark),
+          userCode,
+        ],
+      )
+      return { updated: upsertResult.rowCount }
     })
 
     res.json({
