@@ -800,11 +800,12 @@ function buildPlanningMetricsSql({
       GROUP BY td.item_code
     ),
     latest_purchase AS (
-      SELECT DISTINCT ON (td.item_code, td.cust_code, td.unit_code)
+      SELECT DISTINCT ON (td.item_code, td.cust_code)
         td.item_code AS ic_code,
         td.cust_code AS ap_code,
-        td.price_exclude_vat AS price,
+        COALESCE(COALESCE(td.price_exclude_vat, 0) / NULLIF(COALESCE(td.stand_value, 1), 0), 0) AS price,
         td.price_exclude_vat,
+        COALESCE(td.stand_value, 1) AS stand_value,
         td.unit_code,
         td.doc_no,
         td.doc_date::date AS doc_date,
@@ -815,7 +816,7 @@ function buildPlanningMetricsSql({
         AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.item_code, '') <> ''
         AND COALESCE(td.cust_code, '') <> ''
-      ORDER BY td.item_code, td.cust_code, td.unit_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+      ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
     ),
     supplier_options AS (
       SELECT
@@ -823,8 +824,10 @@ function buildPlanningMetricsSql({
         link.ap_code,
         COALESCE(s.name_1, '') AS ap_name,
         COALESCE(sd.tax_type, '') AS tax_type,
-        lp.price_exclude_vat AS last_purchase_price,
-        lp.price_exclude_vat AS last_purchase_price_exclude_vat,
+        lp.price AS last_purchase_price,
+        lp.price AS last_purchase_price_exclude_vat,
+        COALESCE(lp.price_exclude_vat, 0) AS last_purchase_price_raw,
+        COALESCE(lp.stand_value, 1) AS last_purchase_stand_value,
         COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
         lp.doc_date AS last_purchase_date,
         COALESCE(r.lead_time_days, 0) AS lead_time_days,
@@ -851,7 +854,6 @@ function buildPlanningMetricsSql({
         ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
       LEFT JOIN latest_purchase lp
         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
-       AND lp.unit_code = COALESCE(NULLIF(r.purchase_unit_code, ''), c.unit_code)
       WHERE COALESCE(link.ic_code, '') <> ''
         AND COALESCE(link.ap_code, '') <> ''
         AND COALESCE(r.planning_enabled, 0) = 1
@@ -2376,11 +2378,12 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
 
     const supplierResult = await posDB.query(
       `WITH latest_purchase AS (
-         SELECT DISTINCT ON (td.item_code, td.cust_code, td.unit_code)
+         SELECT DISTINCT ON (td.item_code, td.cust_code)
            td.item_code AS ic_code,
            td.cust_code AS ap_code,
-           td.price_exclude_vat AS price,
+           COALESCE(COALESCE(td.price_exclude_vat, 0) / NULLIF(COALESCE(td.stand_value, 1), 0), 0) AS price,
            td.price_exclude_vat,
+           COALESCE(td.stand_value, 1) AS stand_value,
            td.unit_code,
            td.doc_no,
            td.doc_date::date AS doc_date,
@@ -2390,15 +2393,17 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
            AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
            AND COALESCE(td.cust_code, '') <> ''
-         ORDER BY td.item_code, td.cust_code, td.unit_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
        )
        SELECT
          link.ic_code,
          link.ap_code,
          COALESCE(s.name_1, '') AS ap_name,
          COALESCE(sd.tax_type, '') AS tax_type,
-         lp.price_exclude_vat AS last_purchase_price,
-         lp.price_exclude_vat AS last_purchase_price_exclude_vat,
+         lp.price AS last_purchase_price,
+         lp.price AS last_purchase_price_exclude_vat,
+         COALESCE(lp.price_exclude_vat, 0) AS last_purchase_price_raw,
+         COALESCE(lp.stand_value, 1) AS last_purchase_stand_value,
          COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
          lp.doc_no AS last_purchase_doc_no,
          lp.doc_date AS last_purchase_date,
@@ -2424,7 +2429,6 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
        LEFT JOIN latest_purchase lp
          ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
-        AND lp.unit_code = COALESCE(NULLIF(r.purchase_unit_code, ''), COALESCE(i.unit_standard, ''))
        WHERE link.ic_code = $1::text
          AND COALESCE(link.ap_code, '') <> ''
          AND COALESCE(r.planning_enabled, 0) = 1
