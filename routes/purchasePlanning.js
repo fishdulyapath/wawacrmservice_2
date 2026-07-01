@@ -1076,6 +1076,8 @@ function sortPlanningRows(rows) {
   })
 }
 
+const PLANNING_STOCK_STATUSES = new Set(['low', 'normal', 'high', 'inactive', 'insufficient_sales_days'])
+
 async function runReportJob(job) {
   try {
     const options = job.options
@@ -2147,9 +2149,14 @@ router.get('/report-lazy/:jobId', async (req, res) => {
 
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0)
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 30))
-  const rows = job.status === 'complete'
-    ? job.rows.slice(offset, offset + limit)
-    : sortPlanningRows([...job.rows]).slice(offset, offset + limit)
+  const stockStatus = clean(req.query.stock_status)
+  const sourceRows = job.status === 'complete'
+    ? job.rows
+    : sortPlanningRows([...job.rows])
+  const filteredRows = PLANNING_STOCK_STATUSES.has(stockStatus)
+    ? sourceRows.filter((row) => row.stock_status === stockStatus)
+    : sourceRows
+  const rows = filteredRows.slice(offset, offset + limit)
 
   job.updatedAt = Date.now()
   res.json({
@@ -2158,10 +2165,11 @@ router.get('/report-lazy/:jobId', async (req, res) => {
     error: job.error,
     data: rows,
     total: job.total,
+    filtered_total: filteredRows.length,
     processed: job.processed,
     offset,
     limit,
-    has_more: job.status === 'complete' ? offset + rows.length < job.rows.length : true,
+    has_more: job.status === 'complete' ? offset + rows.length < filteredRows.length : true,
     summary: job.status === 'complete' ? job.summary : null,
     partial_summary: job.partialSummary,
     pending_pr: job.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
