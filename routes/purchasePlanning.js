@@ -800,7 +800,7 @@ function buildPlanningMetricsSql({
       GROUP BY td.item_code
     ),
     latest_purchase AS (
-      SELECT DISTINCT ON (td.item_code, td.cust_code)
+      SELECT DISTINCT ON (td.item_code, td.cust_code, td.unit_code)
         td.item_code AS ic_code,
         td.cust_code AS ap_code,
         td.price_exclude_vat AS price,
@@ -815,7 +815,7 @@ function buildPlanningMetricsSql({
         AND COALESCE(td.status, 0) = 0
         AND COALESCE(td.item_code, '') <> ''
         AND COALESCE(td.cust_code, '') <> ''
-      ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+      ORDER BY td.item_code, td.cust_code, td.unit_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
     ),
     supplier_options AS (
       SELECT
@@ -840,7 +840,6 @@ function buildPlanningMetricsSql({
           PARTITION BY link.ic_code
           ORDER BY
             CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-            COALESCE(lp.price_exclude_vat, 999999999999),
             lp.doc_date DESC NULLS LAST,
             link.ap_code
         ) AS rn
@@ -852,6 +851,7 @@ function buildPlanningMetricsSql({
         ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
       LEFT JOIN latest_purchase lp
         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+       AND lp.unit_code = COALESCE(NULLIF(r.purchase_unit_code, ''), c.unit_code)
       WHERE COALESCE(link.ic_code, '') <> ''
         AND COALESCE(link.ap_code, '') <> ''
         AND COALESCE(r.planning_enabled, 0) = 1
@@ -1001,25 +1001,18 @@ function summaryFromRows(rows) {
     const status = row.stock_status || 'unknown'
     const apCode = clean(row.ap_code) || 'NO_SUPPLIER'
     const apName = clean(row.ap_name) || 'ไม่ระบุเจ้าหนี้'
-    const suggestAmount = Number(row.suggest_qty || 0) * Number(row.last_purchase_price || 0)
-
     acc.total += 1
     acc[status] = (acc[status] || 0) + 1
     acc.suggest_qty += Number(row.suggest_qty || 0)
-    acc.suggest_amount += suggestAmount
 
-    // กราฟ supplier: แสดงเฉพาะ supplier ที่มีจำนวนแนะนำซื้อ > 0 (ใช้ suggest_qty แทนยอดเงิน
-    // เพราะยอดเงินต้องมีราคาซื้อล่าสุด ถ้ายังไม่เคยซื้อจาก supplier นี้จะได้ 0)
     if (Number(row.suggest_qty || 0) > 0) {
       if (!acc.supplier_order_map[apCode]) {
         acc.supplier_order_map[apCode] = {
           ap_code: apCode,
           ap_name: apName,
-          suggest_amount: 0,
           suggest_qty: 0,
         }
       }
-      acc.supplier_order_map[apCode].suggest_amount += suggestAmount
       acc.supplier_order_map[apCode].suggest_qty += Number(row.suggest_qty || 0)
     }
 
@@ -1044,7 +1037,6 @@ function summaryFromRows(rows) {
     inactive: 0,
     insufficient_sales_days: 0,
     suggest_qty: 0,
-    suggest_amount: 0,
     with_supplier: 0,
     without_supplier: 0,
     supplier_order_map: {},
@@ -1053,7 +1045,7 @@ function summaryFromRows(rows) {
 
   const statusOrder = ['high', 'normal', 'low', 'insufficient_sales_days', 'inactive', 'unknown']
   const supplierOrderChart = Object.values(summary.supplier_order_map)
-    .sort((a, b) => Number(b.suggest_amount || 0) - Number(a.suggest_amount || 0))
+    .sort((a, b) => Number(b.suggest_qty || 0) - Number(a.suggest_qty || 0))
     .slice(0, 10)
   const stockStatusAmountChart = statusOrder
     .filter((status) => summary.stock_status_amount_map[status])
@@ -1660,7 +1652,7 @@ router.get('/item-supplier-settings', async (req, res) => {
 
     const dataResult = await posDB.query(
       `WITH latest_price AS (
-         SELECT DISTINCT ON (item_code, cust_code)
+         SELECT DISTINCT ON (item_code, cust_code, unit_code)
            item_code AS ic_code,
            cust_code AS ap_code,
            price_exclude_vat AS price,
@@ -1672,7 +1664,7 @@ router.get('/item-supplier-settings', async (req, res) => {
            AND COALESCE(status, 0) = 0
            AND COALESCE(item_code, '') <> ''
            AND COALESCE(cust_code, '') <> ''
-         ORDER BY item_code, cust_code, doc_date DESC, doc_time DESC, doc_no DESC
+         ORDER BY item_code, cust_code, unit_code, doc_date DESC, doc_time DESC, doc_no DESC
        )
        SELECT DISTINCT ON (link.ic_code, link.ap_code)
           link.ic_code,
@@ -1705,6 +1697,7 @@ router.get('/item-supplier-settings', async (req, res) => {
          ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
        LEFT JOIN latest_price lp
          ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+        AND lp.unit_code = COALESCE(NULLIF(p.purchase_unit_code, ''), COALESCE(i.unit_standard, ''))
        WHERE COALESCE(link.ic_code, '') <> ''
          AND COALESCE(link.ap_code, '') <> ''
          AND ${linkableItemWhere('i', 'd')}
@@ -2231,7 +2224,6 @@ router.post('/pr/create', async (req, res) => {
     for (const it of g.items) {
       if (!clean(it.item_code)) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
       if (!(Number(it.qty) > 0)) return res.status(400).json({ error: 'จำนวนต้องมากกว่า 0' })
-      if (Number(it.price) < 0) return res.status(400).json({ error: 'ราคาต้องไม่ติดลบ' })
     }
   }
 
@@ -2248,11 +2240,8 @@ router.post('/pr/create', async (req, res) => {
         // หมายเหตุแยกตามกลุ่ม/PR — ถ้ากลุ่มไม่ส่งมา ใช้ fallbackRemark (backward compatible)
         const remark = clean(g.remark || fallbackRemark).slice(0, 255)
 
-        // คำนวณยอดต่อ PR
-        let totalValue = 0
-        for (const it of g.items) {
-          totalValue += Number(it.qty) * Number(it.price)
-        }
+        // ไม่บันทึกราคาใน PR จากตะกร้าวางแผนซื้อ
+        const totalValue = 0
         const totalBeforeVat = Math.round((totalValue * 100 / divisor) * 100) / 100
         const totalVatValue = Math.round((totalValue - totalBeforeVat) * 100) / 100
         const totalAfterVat = totalValue
@@ -2289,11 +2278,11 @@ router.post('/pr/create', async (req, res) => {
           const itemCode = clean(it.item_code)
           const itemName = clean(it.item_name).slice(0, 255)
           const unitCode = clean(it.unit_code)
-          // บันทึก qty/price ตามหน่วยที่เลือกในบรรทัดเอกสาร
+          // บันทึก qty ตามหน่วยที่เลือกในบรรทัดเอกสาร และบังคับราคาเป็น 0
           // เช่น 100 ลัง ต้องเก็บ qty=100, unit_code=ลัง, stand_value=100
           const ratio = Number(it.unit_ratio) || 1
           const lineQty = Math.round(Number(it.qty) * 1000000) / 1000000
-          const linePrice = Math.round(Number(it.price) * 1000000) / 1000000
+          const linePrice = 0
           const sumAmount = Math.round(lineQty * linePrice * 100) / 100
           const standValue = Number(it.unit_stand_value) || ratio || 1
           const divideValue = Number(it.unit_divide_value) || 1
@@ -2385,7 +2374,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
 
     const supplierResult = await posDB.query(
       `WITH latest_purchase AS (
-         SELECT DISTINCT ON (td.item_code, td.cust_code)
+         SELECT DISTINCT ON (td.item_code, td.cust_code, td.unit_code)
            td.item_code AS ic_code,
            td.cust_code AS ap_code,
            td.price_exclude_vat AS price,
@@ -2399,7 +2388,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
            AND COALESCE(td.status, 0) = 0
            AND td.item_code = $1::text
            AND COALESCE(td.cust_code, '') <> ''
-         ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         ORDER BY td.item_code, td.cust_code, td.unit_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
        )
        SELECT
          link.ic_code,
@@ -2422,17 +2411,18 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
          ROW_NUMBER() OVER (
            ORDER BY
              CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-             COALESCE(lp.price_exclude_vat, 999999999999),
              lp.doc_date DESC NULLS LAST,
              link.ap_code
          ) AS rank_no
        FROM ap_item_by_supplier link
+       LEFT JOIN ic_inventory i ON i.code = link.ic_code
        LEFT JOIN ap_supplier s ON s.code = link.ap_code
        LEFT JOIN ap_supplier_detail sd ON sd.ap_code = link.ap_code AND COALESCE(sd.tax_type, '') <> ''
        LEFT JOIN purchase_planning_item_supplier_resolved r
          ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
        LEFT JOIN latest_purchase lp
          ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+        AND lp.unit_code = COALESCE(NULLIF(r.purchase_unit_code, ''), COALESCE(i.unit_standard, ''))
        WHERE link.ic_code = $1::text
          AND COALESCE(link.ap_code, '') <> ''
          AND COALESCE(r.planning_enabled, 0) = 1
@@ -2461,7 +2451,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
         min_stock: minStock,
         max_stock: maxStock,
         suggest_qty: suggestQty,
-        suggest_amount: suggestQty * Number(supplier.last_purchase_price || 0),
+        suggest_amount: 0,
         is_default: Number(supplier.rank_no) === 1 ? 1 : 0,
       }
     })
@@ -2513,6 +2503,42 @@ router.get('/items/:icCode/units', async (req, res) => {
     }
 
     res.json({ base_unit: baseUnit, units })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/items/:icCode/latest-purchase-price', async (req, res) => {
+  const icCode = clean(req.params.icCode)
+  const unitCode = clean(req.query.unit_code)
+  if (!icCode || !unitCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและหน่วยนับ' })
+
+  try {
+    const result = await posDB.query(
+      `SELECT
+         td.price_exclude_vat AS price,
+         td.price_exclude_vat,
+         td.doc_no,
+         td.doc_date::date AS doc_date,
+         td.doc_time,
+         td.unit_code
+       FROM ic_trans_detail td
+       WHERE td.trans_flag = 310
+         AND COALESCE(td.status, 0) = 0
+         AND td.item_code = $1::text
+         AND td.unit_code = $2::text
+         AND td.price_exclude_vat IS NOT NULL
+       ORDER BY td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+       LIMIT 1`,
+      [icCode, unitCode],
+    )
+
+    const row = result.rows[0] || null
+    res.json({
+      found: Boolean(row),
+      price: row ? Number(row.price_exclude_vat || 0) : null,
+      data: row,
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -2723,7 +2749,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
       ),
       posDB.query(
         `WITH latest_purchase AS (
-           SELECT DISTINCT ON (td.item_code, td.cust_code)
+           SELECT DISTINCT ON (td.item_code, td.cust_code, td.unit_code)
              td.item_code AS ic_code,
              td.cust_code AS ap_code,
              td.price_exclude_vat AS price,
@@ -2736,7 +2762,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
              AND COALESCE(td.status, 0) = 0
              AND td.item_code = $1::text
              AND COALESCE(td.cust_code, '') <> ''
-           ORDER BY td.item_code, td.cust_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+           ORDER BY td.item_code, td.cust_code, td.unit_code, td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
          )
          SELECT
            link.ap_code,
@@ -2754,16 +2780,18 @@ router.get('/items/:icCode/detail', async (req, res) => {
            COALESCE(NULLIF(r.pack_size, 0), 1) AS pack_size,
            COALESCE(r.is_preferred, 0) AS is_preferred
          FROM ap_item_by_supplier link
+         LEFT JOIN ic_inventory i ON i.code = link.ic_code
          LEFT JOIN ap_supplier s ON s.code = link.ap_code
          LEFT JOIN ap_supplier_detail sd ON sd.ap_code = link.ap_code AND COALESCE(sd.tax_type, '') <> ''
          LEFT JOIN purchase_planning_item_supplier_resolved r
            ON r.ic_code = link.ic_code AND r.ap_code = link.ap_code
          LEFT JOIN latest_purchase lp
            ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
+          AND lp.unit_code = COALESCE(NULLIF(r.purchase_unit_code, ''), COALESCE(i.unit_standard, ''))
          WHERE link.ic_code = $1::text
            AND COALESCE(r.planning_enabled, 0) = 1
-         ORDER BY CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
-                  COALESCE(lp.price_exclude_vat, 999999999999),
+          ORDER BY CASE WHEN COALESCE(r.is_preferred, 0) = 1 THEN 0 ELSE 1 END,
+                  lp.doc_date DESC NULLS LAST,
                   link.ap_code`,
         [icCode],
       ),
