@@ -2224,6 +2224,7 @@ router.post('/pr/create', async (req, res) => {
     for (const it of g.items) {
       if (!clean(it.item_code)) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
       if (!(Number(it.qty) > 0)) return res.status(400).json({ error: 'จำนวนต้องมากกว่า 0' })
+      if (Number(it.price) < 0) return res.status(400).json({ error: 'ราคาต้องไม่ติดลบ' })
     }
   }
 
@@ -2240,8 +2241,9 @@ router.post('/pr/create', async (req, res) => {
         // หมายเหตุแยกตามกลุ่ม/PR — ถ้ากลุ่มไม่ส่งมา ใช้ fallbackRemark (backward compatible)
         const remark = clean(g.remark || fallbackRemark).slice(0, 255)
 
-        // ไม่บันทึกราคาใน PR จากตะกร้าวางแผนซื้อ
-        const totalValue = 0
+        const totalValue = Math.round(g.items.reduce((sum, it) => (
+          sum + (Number(it.qty) || 0) * (Number(it.price) || 0)
+        ), 0) * 100) / 100
         const totalBeforeVat = Math.round((totalValue * 100 / divisor) * 100) / 100
         const totalVatValue = Math.round((totalValue - totalBeforeVat) * 100) / 100
         const totalAfterVat = totalValue
@@ -2278,11 +2280,11 @@ router.post('/pr/create', async (req, res) => {
           const itemCode = clean(it.item_code)
           const itemName = clean(it.item_name).slice(0, 255)
           const unitCode = clean(it.unit_code)
-          // บันทึก qty ตามหน่วยที่เลือกในบรรทัดเอกสาร และบังคับราคาเป็น 0
+          // บันทึก qty/price ตามที่ผู้ใช้กรอกในตะกร้า
           // เช่น 100 ลัง ต้องเก็บ qty=100, unit_code=ลัง, stand_value=100
           const ratio = Number(it.unit_ratio) || 1
           const lineQty = Math.round(Number(it.qty) * 1000000) / 1000000
-          const linePrice = 0
+          const linePrice = Math.round((Number(it.price) || 0) * 1000000) / 1000000
           const sumAmount = Math.round(lineQty * linePrice * 100) / 100
           const standValue = Number(it.unit_stand_value) || ratio || 1
           const divideValue = Number(it.unit_divide_value) || 1
