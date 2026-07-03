@@ -226,12 +226,13 @@ async function loadFleetSummaryByArCodes(codes) {
 // ─────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const { search = '', page = 1, limit = 20, status, owner, crm_only,
+    const { search = '', page = 1, limit = 20, status, owner, sale_area, crm_only,
             followup_enabled, fleet_status, sort_by = 'code', sort_dir = 'asc' } = req.query
 
     const SORT_WHITELIST = {
       code:               'c.code',
       name_1:             'c.name_1',
+      sale_area:          'sa.name_1',
       province:           'ep.name_1',
       last_purchase_date: 'last_purchase_date',
     }
@@ -327,7 +328,16 @@ router.get('/', async (req, res) => {
 
     if (search) {
       params.push(`%${search}%`)
-      where.push(`(c.code ILIKE $${params.length} OR c.name_1 ILIKE $${params.length})`)
+      where.push(`(
+        c.code ILIKE $${params.length}
+        OR c.name_1 ILIKE $${params.length}
+        OR d.area_code ILIKE $${params.length}
+        OR sa.name_1 ILIKE $${params.length}
+      )`)
+    }
+    if (sale_area) {
+      params.push(sale_area)
+      where.push(`d.area_code = $${params.length}`)
     }
     if (ownerArCodes) {
       params.push(ownerArCodes)
@@ -356,7 +366,11 @@ router.get('/', async (req, res) => {
 
     // ── 3. COUNT ──────────────────────────────────────────
     const countResult = await posDB.query(
-      `SELECT COUNT(*) FROM ar_customer c WHERE ${where.join(' AND ')}`,
+      `SELECT COUNT(*)
+       FROM ar_customer c
+       LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
+       LEFT JOIN ar_sale_area sa      ON sa.code = d.area_code
+       WHERE ${where.join(' AND ')}`,
       params
     )
     const total = parseInt(countResult.rows[0].count)
@@ -381,6 +395,7 @@ router.get('/', async (req, res) => {
         c.code, c.name_1, c.country, c.address, c.province,
         c.amper, c.tambon, c.zip_code, c.website, c.remark,
         d.sale_code, u.name_1 AS sale_name,
+        d.area_code AS sale_area_code, sa.name_1 AS sale_area_name,
         ep.name_1 AS province_name,
         ea.name_1 AS amper_name,
         (
@@ -393,6 +408,7 @@ router.get('/', async (req, res) => {
       FROM ar_customer c
       LEFT JOIN ar_customer_detail d ON d.ar_code = c.code
       LEFT JOIN erp_user u           ON u.code = d.sale_code
+      LEFT JOIN ar_sale_area sa      ON sa.code = d.area_code
       LEFT JOIN erp_province ep      ON ep.code = c.province
       LEFT JOIN erp_amper    ea      ON ea.code = c.amper AND ea.province = c.province
       WHERE ${where.join(' AND ')}

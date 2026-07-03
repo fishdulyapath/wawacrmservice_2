@@ -3,20 +3,173 @@ const crypto = require('crypto')
 const path = require('path')
 const multer = require('multer')
 const XLSX = require('xlsx')
-const { posDB } = require('../db')
-const { authMiddleware, requireRole } = require('../middleware/auth')
+const { posDB, crmDB } = require('../db')
+const { authMiddleware } = require('../middleware/auth')
 
 const router = express.Router()
 
-router.use(authMiddleware, requireRole('admin'))
+router.use(authMiddleware)
 
 const reportJobs = new Map()
 const REPORT_JOB_TTL_MS = 10 * 60 * 1000
 const MIN_SLOW_MOVER_D_AVG = 0.1
 const MIN_DISPLAY_QTY = 1
+const USER_COLORS = ['#dc2626', '#16a34a', '#2563eb', '#ca8a04', '#9333ea', '#0891b2', '#ea580c', '#4f46e5']
+let cartSchemaReady = false
 
 function clean(value) {
   return String(value || '').trim()
+}
+
+function isPlanningAdmin(user) {
+  return user?.code?.toUpperCase() === 'SUPERADMIN' || user?.role === 'admin'
+}
+
+function requirePlanningAdmin(req, res, next) {
+  if (isPlanningAdmin(req.user)) return next()
+  return res.status(403).json({ error: 'ไม่มีสิทธิ์จัดการข้อมูลวางแผนสั่งซื้อ' })
+}
+
+function userColor(userId) {
+  const n = Number(userId || 0)
+  return USER_COLORS[Math.abs(n) % USER_COLORS.length]
+}
+
+async function ensureCartSchema() {
+  if (cartSchemaReady) return
+  await crmDB.query(`
+    CREATE TABLE IF NOT EXISTS public.crm_purchase_planning_user_setting (
+      user_id integer PRIMARY KEY REFERENCES public.crm_users(id) ON DELETE CASCADE,
+      can_access smallint NOT NULL DEFAULT 0,
+      cart_color varchar(20) NOT NULL DEFAULT '#2563eb',
+      remark varchar(255) NOT NULL DEFAULT '',
+      create_datetime timestamp without time zone NOT NULL DEFAULT now(),
+      last_update_date_time timestamp without time zone NOT NULL DEFAULT now(),
+      create_code varchar(50) NOT NULL DEFAULT '',
+      last_update_code varchar(50) NOT NULL DEFAULT '',
+      CONSTRAINT crm_purchase_planning_user_setting_access_chk CHECK (can_access IN (0, 1)),
+      CONSTRAINT crm_purchase_planning_user_setting_color_chk CHECK (cart_color ~ '^#[0-9A-Fa-f]{6}$')
+    );
+
+    CREATE TABLE IF NOT EXISTS public.crm_purchase_planning_cart (
+      id bigserial PRIMARY KEY,
+      user_id integer NOT NULL REFERENCES public.crm_users(id) ON DELETE CASCADE,
+      item_code varchar(25) NOT NULL,
+      item_name varchar(255) NOT NULL DEFAULT '',
+      ap_code varchar(25) NOT NULL,
+      ap_name varchar(255) NOT NULL DEFAULT '',
+      unit_code varchar(25) NOT NULL DEFAULT '',
+      selected_unit varchar(25) NOT NULL DEFAULT '',
+      unit_ratio numeric NOT NULL DEFAULT 1,
+      unit_stand_value numeric NOT NULL DEFAULT 1,
+      unit_divide_value numeric NOT NULL DEFAULT 1,
+      base_qty numeric NOT NULL DEFAULT 0,
+      qty numeric NOT NULL DEFAULT 0,
+      price numeric NOT NULL DEFAULT 0,
+      suggest_qty numeric NOT NULL DEFAULT 0,
+      reference_unit_code varchar(25) NOT NULL DEFAULT '',
+      reference_price numeric NOT NULL DEFAULT 0,
+      status varchar(20) NOT NULL DEFAULT 'active',
+      pr_doc_no varchar(50) NOT NULL DEFAULT '',
+      create_datetime timestamp without time zone NOT NULL DEFAULT now(),
+      last_update_date_time timestamp without time zone NOT NULL DEFAULT now(),
+      create_code varchar(50) NOT NULL DEFAULT '',
+      last_update_code varchar(50) NOT NULL DEFAULT '',
+      CONSTRAINT crm_purchase_planning_cart_status_chk CHECK (status IN ('active', 'created_pr', 'removed')),
+      CONSTRAINT crm_purchase_planning_cart_qty_chk CHECK (qty >= 0 AND base_qty >= 0 AND price >= 0)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_crm_purchase_planning_cart_active_item_ap
+      ON public.crm_purchase_planning_cart (item_code, ap_code)
+      WHERE status = 'active';
+
+    CREATE INDEX IF NOT EXISTS idx_crm_purchase_planning_cart_user_status
+      ON public.crm_purchase_planning_cart (user_id, status);
+
+    CREATE INDEX IF NOT EXISTS idx_crm_purchase_planning_cart_item_ap_status
+      ON public.crm_purchase_planning_cart (item_code, ap_code, status);
+
+    CREATE TABLE IF NOT EXISTS public.crm_purchase_planning_report_snapshot (
+      query_key varchar(80) PRIMARY KEY,
+      query_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+      snapshot_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+      create_datetime timestamp without time zone NOT NULL DEFAULT now(),
+      last_update_date_time timestamp without time zone NOT NULL DEFAULT now(),
+      create_code varchar(50) NOT NULL DEFAULT '',
+      last_update_code varchar(50) NOT NULL DEFAULT ''
+    );
+  `)
+  cartSchemaReady = true
+}
+
+async function ensureCurrentUserPlanningSetting(req) {
+  await ensureCartSchema()
+  const user = req.user || {}
+  const canAccessDefault = isPlanningAdmin(user) ? 1 : 0
+  await crmDB.query(
+    `INSERT INTO public.crm_purchase_planning_user_setting
+       (user_id, can_access, cart_color, create_code, last_update_code)
+     VALUES ($1, $2, $3, $4, $4)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [user.id, canAccessDefault, userColor(user.id), clean(user.code)],
+  )
+  if (isPlanningAdmin(user)) return true
+  const result = await crmDB.query(
+    `SELECT COALESCE(can_access, 0)::int AS can_access
+     FROM public.crm_purchase_planning_user_setting
+     WHERE user_id = $1::int`,
+    [user.id],
+  )
+  if (Number(result.rows[0]?.can_access || 0) !== 1) {
+    const err = new Error('ไม่มีสิทธิ์ใช้งานวางแผนสั่งซื้อ')
+    err.statusCode = 403
+    throw err
+  }
+  return true
+}
+
+async function requirePlanningAccess(req, res, next) {
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    next()
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
+  }
+}
+
+function normalizeCartRow(row, currentUserId) {
+  return {
+    ...row,
+    id: Number(row.id),
+    user_id: Number(row.user_id),
+    is_owner: Number(row.user_id) === Number(currentUserId),
+    qty: Number(row.qty || 0),
+    base_qty: Number(row.base_qty || 0),
+    price: Number(row.price || 0),
+    suggest_qty: Number(row.suggest_qty || 0),
+    unit_ratio: Number(row.unit_ratio || 1),
+    unit_stand_value: Number(row.unit_stand_value || 1),
+    unit_divide_value: Number(row.unit_divide_value || 1),
+    reference_price: Number(row.reference_price || 0),
+  }
+}
+
+async function fetchCartRows(currentUserId, statuses = ['active']) {
+  const result = await crmDB.query(
+    `SELECT
+       c.*,
+       u.code AS user_code,
+       u.name AS user_name,
+       COALESCE(s.cart_color, $2::text) AS cart_color,
+       COALESCE(s.can_access, 0) AS can_access
+     FROM public.crm_purchase_planning_cart c
+     JOIN public.crm_users u ON u.id = c.user_id
+     LEFT JOIN public.crm_purchase_planning_user_setting s ON s.user_id = c.user_id
+     WHERE c.status = ANY($1::text[])
+     ORDER BY c.create_datetime, c.id`,
+    [statuses, userColor(currentUserId)],
+  )
+  return result.rows.map((row) => normalizeCartRow(row, currentUserId))
 }
 
 function linkableItemWhere(itemAlias = 'i', detailAlias = 'd') {
@@ -56,6 +209,17 @@ function boolQuery(value) {
   return text === '1' || text === 'true' || text === 'yes'
 }
 
+function planningEnabledStatusClause(status, alias = 'p', enabledOnly = null) {
+  const text = clean(status).toLowerCase()
+  if (boolQuery(enabledOnly) || ['enabled', 'active', '1', 'true'].includes(text)) {
+    return ` AND COALESCE(${alias}.planning_enabled, 0) = 1`
+  }
+  if (['disabled', 'inactive', 'not_enabled', '0', 'false'].includes(text)) {
+    return ` AND COALESCE(${alias}.planning_enabled, 0) = 0`
+  }
+  return ''
+}
+
 function optionalDate(value) {
   const text = clean(value)
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null
@@ -74,12 +238,106 @@ function takeParams(source, names) {
   }, {})
 }
 
+const REPORT_SNAPSHOT_QUERY_FIELDS = ['days', 'as_of_date', 'warehouse', 'group_main', 'ap_code', 'alert_only']
+const REPORT_SEARCH_QUERY_FIELDS = ['search', 'supplier_search', 'ap_search']
+
+function reportSnapshotQuery(query = {}) {
+  return takeParams(query, REPORT_SNAPSHOT_QUERY_FIELDS)
+}
+
 function reportJobKey(userCode, query) {
   const payload = {
-    userCode: clean(userCode),
-    query: takeParams(query, ['search', 'supplier_search', 'ap_search', 'days', 'as_of_date', 'warehouse', 'group_main', 'ap_code', 'alert_only']),
+    version: 2,
+    query: reportSnapshotQuery(query),
   }
   return crypto.createHash('sha1').update(JSON.stringify(payload)).digest('hex')
+}
+
+function rowMatchesTokens(row, keywords, fields) {
+  const tokens = clean(keywords).toLowerCase().split(/\s+/).filter(Boolean)
+  if (!tokens.length) return true
+  const haystack = fields.map((field) => String(row?.[field] ?? '').toLowerCase()).join(' ')
+  return tokens.every((token) => haystack.includes(token))
+}
+
+function filterReportRows(rows, query = {}) {
+  const itemSearch = clean(query.search)
+  const supplierSearch = clean(query.supplier_search || query.ap_search)
+  const apCode = clean(query.ap_code)
+  return rows.filter((row) => {
+    if (!rowMatchesTokens(row, itemSearch, ['ic_code', 'ic_name', 'ic_name_eng', 'barcode_text'])) return false
+    if (!rowMatchesTokens(row, supplierSearch, ['ap_code', 'ap_name', 'supplier_search_text'])) return false
+    if (apCode && !String(row.ap_code || '').toLowerCase().includes(apCode.toLowerCase())
+      && !String(row.supplier_search_text || '').toLowerCase().includes(apCode.toLowerCase())) return false
+    return true
+  })
+}
+
+async function loadReportSnapshot(key) {
+  await ensureCartSchema()
+  const result = await crmDB.query(
+    `SELECT query_json, snapshot_json, last_update_date_time
+     FROM public.crm_purchase_planning_report_snapshot
+     WHERE query_key = $1::text`,
+    [key],
+  )
+  return result.rows[0] || null
+}
+
+async function saveReportSnapshot(job) {
+  if (!job?.snapshotKey || job.status !== 'complete') return
+  await ensureCartSchema()
+  const snapshot = {
+    rows: job.rows || [],
+    summary: job.summary || summaryFromRows([]),
+    pending_pr: job.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
+    total: Number(job.total || 0),
+    processed: Number(job.processed || 0),
+    options: job.options || {},
+    completed_at: new Date().toISOString(),
+  }
+  await crmDB.query(
+    `INSERT INTO public.crm_purchase_planning_report_snapshot
+       (query_key, query_json, snapshot_json, create_code, last_update_code)
+     VALUES ($1::text, $2::jsonb, $3::jsonb, $4::text, $4::text)
+     ON CONFLICT (query_key) DO UPDATE SET
+       query_json = EXCLUDED.query_json,
+       snapshot_json = EXCLUDED.snapshot_json,
+       last_update_code = EXCLUDED.last_update_code,
+       last_update_date_time = NOW()`,
+    [
+      job.snapshotKey,
+      JSON.stringify(job.query || {}),
+      JSON.stringify(snapshot),
+      clean(job.createdBy || ''),
+    ],
+  )
+}
+
+function createSnapshotJob(key, snapshotRow) {
+  const snapshot = snapshotRow?.snapshot_json || {}
+  const rows = Array.isArray(snapshot.rows) ? snapshot.rows : []
+  const id = `${key}-snapshot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  return {
+    id,
+    snapshotKey: key,
+    query: snapshotRow?.query_json || {},
+    options: snapshot.options || {},
+    batchSize: 100,
+    total: Number(snapshot.total ?? rows.length ?? 0),
+    processed: Number(snapshot.processed ?? snapshot.total ?? rows.length ?? 0),
+    rows,
+    summary: snapshot.summary || summaryFromRows(rows),
+    partialSummary: snapshot.summary || summaryFromRows(rows),
+    pending_pr: snapshot.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
+    status: 'complete',
+    error: '',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    cancelled: false,
+    fromCache: true,
+    cacheUpdatedAt: snapshotRow?.last_update_date_time || null,
+  }
 }
 
 function pruneReportJobs() {
@@ -603,6 +861,11 @@ function buildPlanningMetricsSql({
         i.code AS ic_code,
         COALESCE(i.name_1, '') AS ic_name,
         COALESCE(i.name_eng_1, '') AS ic_name_eng,
+        COALESCE((
+          SELECT string_agg(COALESCE(b.barcode, ''), ' ')
+          FROM ic_inventory_barcode b
+          WHERE b.ic_code = i.code
+        ), '') AS barcode_text,
         COALESCE(i.unit_standard, '') AS unit_code,
         COALESCE(i.group_main, '') AS group_main,
         COALESCE(i.supplier_code, '') AS legacy_supplier_code,
@@ -838,6 +1101,7 @@ function buildPlanningMetricsSql({
         COALESCE(NULLIF(r.pack_size, 0), 1) AS pack_size,
         COALESCE(r.purchase_unit_code, '') AS purchase_unit_code,
         COALESCE(r.is_preferred, 0) AS is_preferred,
+        STRING_AGG(CONCAT_WS(' ', link.ap_code, COALESCE(s.name_1, '')), ' ') OVER (PARTITION BY link.ic_code) AS supplier_search_text,
         COUNT(*) OVER (PARTITION BY link.ic_code)::int AS supplier_count,
         ROW_NUMBER() OVER (
           PARTITION BY link.ic_code
@@ -912,6 +1176,7 @@ function buildPlanningMetricsSql({
         COALESCE(cs.purchase_unit_code, '') AS purchase_unit_code,
         COALESCE(cs.is_preferred, 0) AS is_preferred,
         COALESCE(cs.supplier_count, 0) AS supplier_count,
+        COALESCE(cs.supplier_search_text, '') AS supplier_search_text,
         COALESCE(cs.tax_type, '') AS tax_type
       FROM candidates c
       LEFT JOIN stock_balance sb ON sb.ic_code = c.ic_code AND sb.warehouse = $2::text
@@ -1215,6 +1480,7 @@ async function runReportJob(job) {
     job.status = 'complete'
     job.processed = job.total
     job.updatedAt = Date.now()
+    await saveReportSnapshot(job)
   } catch (err) {
     job.status = 'failed'
     job.error = err.message
@@ -1222,11 +1488,10 @@ async function runReportJob(job) {
   }
 }
 
-router.get('/supplier-settings', async (req, res) => {
+router.get('/supplier-settings', requirePlanningAdmin, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['s.code', 's.name_1'], 1)
-  const enabledOnly = boolQuery(req.query.enabled_only)
-  const enabledClause = enabledOnly ? ' AND p.planning_enabled = 1' : ''
+  const enabledClause = planningEnabledStatusClause(req.query.enabled_status, 'p', req.query.enabled_only)
   const params = [...search.params]
 
   try {
@@ -1270,7 +1535,7 @@ router.get('/supplier-settings', async (req, res) => {
   }
 })
 
-router.post('/supplier-settings/save/:apCode', async (req, res) => {
+router.post('/supplier-settings/save/:apCode', requirePlanningAdmin, async (req, res) => {
   const apCode = clean(req.params.apCode)
   const body = req.body || {}
   const userCode = clean(req.user?.code)
@@ -1310,7 +1575,90 @@ router.post('/supplier-settings/save/:apCode', async (req, res) => {
   }
 })
 
-router.post('/supplier-settings/sync-from-purchase-history', async (req, res) => {
+router.post('/supplier-settings/bulk-planning-enabled', requirePlanningAdmin, async (req, res) => {
+  const body = req.body || {}
+  const planningEnabled = Number(body.planning_enabled) === 0 ? 0 : 1
+  const search = searchClause(body.search, ['s.code', 's.name_1'], 2)
+  const enabledClause = planningEnabledStatusClause(body.enabled_status, 'p', body.enabled_only)
+  const userCode = clean(req.user?.code)
+  const userCodeIndex = search.params.length + 2
+  const params = [planningEnabled, ...search.params, userCode]
+  const targetSql = `
+    SELECT
+      s.code AS ap_code,
+      p.lead_time_days,
+      p.late_buffer_days,
+      p.wholesale_buffer_days,
+      p.order_cycle_days,
+      p.remark
+    FROM ap_supplier s
+    LEFT JOIN purchase_planning_supplier_setting p ON p.ap_code = s.code
+    WHERE COALESCE(s.code, '') <> ''${search.sql}${enabledClause}
+  `
+
+  try {
+    const result = await withPosTransaction((client) => {
+      if (planningEnabled === 1) {
+        return client.query(
+          `WITH target AS (${targetSql}),
+           upserted AS (
+             INSERT INTO purchase_planning_supplier_setting (
+               ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+               planning_enabled, remark, create_code, last_update_code
+             )
+             SELECT
+               ap_code,
+               COALESCE(lead_time_days, 1),
+               COALESCE(late_buffer_days, 1),
+               COALESCE(wholesale_buffer_days, 1),
+               COALESCE(order_cycle_days, 1),
+               $1::int,
+               COALESCE(remark, ''),
+               $${userCodeIndex}::text,
+               $${userCodeIndex}::text
+             FROM target
+             ON CONFLICT (ap_code) DO UPDATE SET
+               planning_enabled = EXCLUDED.planning_enabled,
+               last_update_code = EXCLUDED.last_update_code,
+               last_update_date_time = now()
+             RETURNING ap_code
+           )
+           SELECT
+             (SELECT COUNT(*)::int FROM target) AS target_count,
+             (SELECT COUNT(*)::int FROM upserted) AS updated_count`,
+          params,
+        )
+      }
+      return client.query(
+        `WITH target AS (${targetSql}),
+         updated AS (
+           UPDATE purchase_planning_supplier_setting p
+           SET planning_enabled = $1::int,
+               last_update_code = $${userCodeIndex}::text,
+               last_update_date_time = now()
+           FROM target
+           WHERE p.ap_code = target.ap_code
+           RETURNING p.ap_code
+         )
+         SELECT
+           (SELECT COUNT(*)::int FROM target) AS target_count,
+           (SELECT COUNT(*)::int FROM updated) AS updated_count`,
+        params,
+      )
+    })
+
+    res.json({
+      success: true,
+      planning_enabled: planningEnabled,
+      target_count: Number(result.rows[0]?.target_count || 0),
+      updated_count: Number(result.rows[0]?.updated_count || 0),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/supplier-settings/sync-from-purchase-history', requirePlanningAdmin, async (req, res) => {
   const body = req.body || {}
   const dryRun = boolQuery(body.dry_run)
   const fromDate = optionalDate(body.from_date)
@@ -1375,7 +1723,7 @@ router.post('/supplier-settings/sync-from-purchase-history', async (req, res) =>
 })
 
 // ── Supplier: Excel export/import ────────────────────────────────────────────
-router.get('/supplier-settings/export', async (req, res) => {
+router.get('/supplier-settings/export', requirePlanningAdmin, async (req, res) => {
   try {
     const dataResult = await posDB.query(
       `SELECT
@@ -1412,7 +1760,7 @@ router.get('/supplier-settings/export', async (req, res) => {
   }
 })
 
-router.post('/supplier-settings/import', importUpload.single('file'), async (req, res) => {
+router.post('/supplier-settings/import', requirePlanningAdmin, importUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
   const commit = boolQuery(req.body.commit)
   const userCode = clean(req.user?.code)
@@ -1536,7 +1884,7 @@ router.post('/supplier-settings/import', importUpload.single('file'), async (req
   }
 })
 
-router.get('/item-settings', async (req, res) => {
+router.get('/item-settings', requirePlanningAdmin, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = itemSearchClause(req.query.search, 1)
   const params = [...search.params]
@@ -1584,7 +1932,7 @@ router.get('/item-settings', async (req, res) => {
   }
 })
 
-router.post('/item-settings/save/:icCode', async (req, res) => {
+router.post('/item-settings/save/:icCode', requirePlanningAdmin, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const body = req.body || {}
   const userCode = clean(req.user?.code)
@@ -1623,11 +1971,10 @@ router.post('/item-settings/save/:icCode', async (req, res) => {
   }
 })
 
-router.get('/item-supplier-settings', async (req, res) => {
+router.get('/item-supplier-settings', requirePlanningAdmin, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 1)
-  const enabledOnly = boolQuery(req.query.enabled_only)
-  const enabledClause = enabledOnly ? ' AND p.planning_enabled = 1' : ''
+  const enabledClause = planningEnabledStatusClause(req.query.enabled_status, 'p', req.query.enabled_only)
   const params = [...search.params]
 
   try {
@@ -1720,7 +2067,7 @@ router.get('/item-supplier-settings', async (req, res) => {
   }
 })
 
-router.post('/item-supplier-settings/save', async (req, res) => {
+router.post('/item-supplier-settings/save', requirePlanningAdmin, async (req, res) => {
   const body = req.body || {}
   const icCode = clean(body.ic_code)
   const apCode = clean(body.ap_code)
@@ -1774,7 +2121,112 @@ router.post('/item-supplier-settings/save', async (req, res) => {
   }
 })
 
-router.post('/item-supplier-settings/sync-from-purchase-history', async (req, res) => {
+router.post('/item-supplier-settings/bulk-planning-enabled', requirePlanningAdmin, async (req, res) => {
+  const body = req.body || {}
+  const planningEnabled = Number(body.planning_enabled) === 0 ? 0 : 1
+  const search = searchClause(body.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 2)
+  const enabledClause = planningEnabledStatusClause(body.enabled_status, 'p', body.enabled_only)
+  const userCode = clean(req.user?.code)
+  const userCodeIndex = search.params.length + 2
+  const params = [planningEnabled, ...search.params, userCode]
+  const targetSql = `
+    SELECT DISTINCT
+      link.ic_code,
+      link.ap_code,
+      p.lead_time_days,
+      p.late_buffer_days,
+      p.wholesale_buffer_days,
+      p.order_cycle_days,
+      p.min_order_qty,
+      p.pack_size,
+      p.purchase_unit_code,
+      p.is_preferred,
+      p.remark
+    FROM ap_item_by_supplier link
+    LEFT JOIN ic_inventory i ON i.code = link.ic_code
+    LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+    JOIN ap_supplier s ON s.code = link.ap_code
+    JOIN purchase_planning_supplier_setting supplier_plan
+      ON supplier_plan.ap_code = link.ap_code
+     AND COALESCE(supplier_plan.planning_enabled, 0) = 1
+    LEFT JOIN purchase_planning_item_supplier_setting p
+      ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
+    WHERE COALESCE(link.ic_code, '') <> ''
+      AND COALESCE(link.ap_code, '') <> ''
+      AND ${linkableItemWhere('i', 'd')}
+      AND ${activeSupplierWhere('s')}${search.sql}${enabledClause}
+  `
+
+  try {
+    const result = await withPosTransaction((client) => {
+      if (planningEnabled === 1) {
+        return client.query(
+          `WITH target AS (${targetSql}),
+           upserted AS (
+             INSERT INTO purchase_planning_item_supplier_setting (
+               ic_code, ap_code, lead_time_days, late_buffer_days, wholesale_buffer_days, order_cycle_days,
+               min_order_qty, pack_size, purchase_unit_code, planning_enabled, is_preferred,
+               remark, create_code, last_update_code
+             )
+             SELECT
+               ic_code,
+               ap_code,
+               COALESCE(lead_time_days, 1),
+               COALESCE(late_buffer_days, 1),
+               COALESCE(wholesale_buffer_days, 1),
+               COALESCE(order_cycle_days, 1),
+               COALESCE(min_order_qty, 0),
+               COALESCE(NULLIF(pack_size, 0), 1),
+               COALESCE(purchase_unit_code, ''),
+               $1::int,
+               COALESCE(is_preferred, 0),
+               COALESCE(remark, ''),
+               $${userCodeIndex}::text,
+               $${userCodeIndex}::text
+             FROM target
+             ON CONFLICT (ic_code, ap_code) DO UPDATE SET
+               planning_enabled = EXCLUDED.planning_enabled,
+               last_update_code = EXCLUDED.last_update_code,
+               last_update_date_time = now()
+             RETURNING ic_code, ap_code
+           )
+           SELECT
+             (SELECT COUNT(*)::int FROM target) AS target_count,
+             (SELECT COUNT(*)::int FROM upserted) AS updated_count`,
+          params,
+        )
+      }
+      return client.query(
+        `WITH target AS (${targetSql}),
+         updated AS (
+           UPDATE purchase_planning_item_supplier_setting p
+           SET planning_enabled = $1::int,
+               last_update_code = $${userCodeIndex}::text,
+               last_update_date_time = now()
+           FROM target
+           WHERE p.ic_code = target.ic_code
+             AND p.ap_code = target.ap_code
+           RETURNING p.ic_code, p.ap_code
+         )
+         SELECT
+           (SELECT COUNT(*)::int FROM target) AS target_count,
+           (SELECT COUNT(*)::int FROM updated) AS updated_count`,
+        params,
+      )
+    })
+
+    res.json({
+      success: true,
+      planning_enabled: planningEnabled,
+      target_count: Number(result.rows[0]?.target_count || 0),
+      updated_count: Number(result.rows[0]?.updated_count || 0),
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/item-supplier-settings/sync-from-purchase-history', requirePlanningAdmin, async (req, res) => {
   const body = req.body || {}
   const dryRun = boolQuery(body.dry_run)
   const fromDate = optionalDate(body.from_date)
@@ -1842,7 +2294,7 @@ router.post('/item-supplier-settings/sync-from-purchase-history', async (req, re
 })
 
 // ── Item-Supplier: Excel export/import ───────────────────────────────────────
-router.get('/item-supplier-settings/export', async (req, res) => {
+router.get('/item-supplier-settings/export', requirePlanningAdmin, async (req, res) => {
   try {
     const dataResult = await posDB.query(
       `SELECT DISTINCT ON (link.ic_code, link.ap_code)
@@ -1890,7 +2342,7 @@ router.get('/item-supplier-settings/export', async (req, res) => {
   }
 })
 
-router.post('/item-supplier-settings/import', importUpload.single('file'), async (req, res) => {
+router.post('/item-supplier-settings/import', requirePlanningAdmin, importUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
   const commit = boolQuery(req.body.commit)
   const userCode = clean(req.user?.code)
@@ -2047,7 +2499,7 @@ router.post('/item-supplier-settings/import', importUpload.single('file'), async
   }
 })
 
-router.get('/report', async (req, res) => {
+router.get('/report', requirePlanningAccess, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const options = planningOptions(req)
   const countWhere = planningWhere(req, 1)
@@ -2082,36 +2534,321 @@ router.get('/report', async (req, res) => {
   }
 })
 
-router.post('/report-lazy', async (req, res) => {
-  pruneReportJobs()
+router.get('/users', requirePlanningAdmin, async (req, res) => {
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const { page, limit, offset } = pageParams(req)
+    const countSearch = searchClause(req.query.search, ['u.code', 'u.name', 'u.role'], 1)
+    const search = searchClause(req.query.search, ['u.code', 'u.name', 'u.role'], 2)
+    const countWhereSql = `WHERE COALESCE(u.is_active, true) = true${countSearch.sql}`
+    const whereSql = `WHERE COALESCE(u.is_active, true) = true${search.sql}`
+    const countResult = await crmDB.query(
+      `SELECT COUNT(*)::int AS total
+       FROM public.crm_users u
+       ${countWhereSql}`,
+      countSearch.params,
+    )
+    const result = await crmDB.query(
+      `SELECT
+         u.id AS user_id,
+         u.code AS user_code,
+         u.name AS user_name,
+         u.role,
+         COALESCE(s.can_access, 0) AS can_access,
+         COALESCE(s.cart_color, $1::text) AS cart_color,
+         COALESCE(s.remark, '') AS remark
+       FROM public.crm_users u
+       LEFT JOIN public.crm_purchase_planning_user_setting s ON s.user_id = u.id
+       ${whereSql}
+       ORDER BY u.name, u.code
+       OFFSET $${2 + search.params.length}::int LIMIT $${3 + search.params.length}::int`,
+      [userColor(req.user?.id), ...search.params, offset, limit],
+    )
+    res.json({ data: result.rows, total: countResult.rows[0]?.total || 0, page, limit })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.patch('/users/:userId', requirePlanningAdmin, async (req, res) => {
+  const userId = parseInt(req.params.userId, 10)
+  const canAccess = boolQuery(req.body?.can_access) ? 1 : 0
+  const color = clean(req.body?.cart_color || userColor(userId))
+  if (!userId) return res.status(400).json({ error: 'กรุณาระบุ user' })
+  if (!/^#[0-9A-Fa-f]{6}$/.test(color)) return res.status(400).json({ error: 'สีต้องเป็นรูปแบบ #RRGGBB' })
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const result = await crmDB.query(
+      `INSERT INTO public.crm_purchase_planning_user_setting
+         (user_id, can_access, cart_color, remark, create_code, last_update_code)
+       VALUES ($1, $2, $3, $4, $5, $5)
+       ON CONFLICT (user_id) DO UPDATE SET
+         can_access = EXCLUDED.can_access,
+         cart_color = EXCLUDED.cart_color,
+         remark = EXCLUDED.remark,
+         last_update_code = EXCLUDED.last_update_code,
+         last_update_date_time = NOW()
+       RETURNING *`,
+      [userId, canAccess, color, clean(req.body?.remark || '').slice(0, 255), clean(req.user?.code)],
+    )
+    res.json({ success: true, data: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/cart', requirePlanningAccess, async (req, res) => {
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const rows = await fetchCartRows(req.user.id, ['active'])
+    const createdRows = await fetchCartRows(req.user.id, ['created_pr'])
+    res.json({
+      data: rows,
+      created_pr: createdRows,
+      current_user_id: req.user.id,
+      current_user_code: req.user.code,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/cart/items', requirePlanningAccess, async (req, res) => {
   const body = req.body || {}
-  const query = takeParams(body, ['search', 'supplier_search', 'ap_search', 'days', 'as_of_date', 'warehouse', 'group_main', 'ap_code', 'alert_only'])
-  const batchSize = Math.min(10, Math.max(1, parseInt(body.batch_size, 10) || 5))
-  const key = reportJobKey(req.user?.code, query)
+  const itemCode = clean(body.item_code || body.ic_code)
+  const apCode = clean(body.ap_code)
+  if (!itemCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุสินค้าและเจ้าหนี้' })
 
   try {
-    // ไม่ reuse cache จากหน้าจอ — ทุกครั้งที่กดประมวลผลต้องคำนวณใหม่เสมอ
-    // (แก้ปัญหา: เพิ่มสินค้าเข้าแผนแล้วกดประมวลผลซ้ำ แต่สินค้าใหม่ไม่ขึ้น)
-    // ใช้ id ที่ unique ทุกครั้ง (key + timestamp + random) เพื่อไม่ให้ชนกับ job เดิม
+    await ensureCurrentUserPlanningSetting(req)
+    const existing = await crmDB.query(
+      `SELECT c.*, u.code AS user_code, u.name AS user_name
+       FROM public.crm_purchase_planning_cart c
+       JOIN public.crm_users u ON u.id = c.user_id
+       WHERE c.item_code = $1::text
+         AND c.ap_code = $2::text
+         AND c.status = 'active'
+       LIMIT 1`,
+      [itemCode, apCode],
+    )
+
+    const found = existing.rows[0]
+    if (found && Number(found.user_id) !== Number(req.user.id)) {
+      return res.status(409).json({
+        error: `รายการนี้อยู่ในตะกร้าของ ${found.user_name || found.user_code} แล้ว`,
+        owner: {
+          user_id: found.user_id,
+          user_code: found.user_code,
+          user_name: found.user_name,
+        },
+      })
+    }
+
+    const qty = Math.max(0, toNumber(body.qty, 0))
+    const unitRatio = Math.max(0, toNumber(body.unit_ratio, 1)) || 1
+    const baseQty = body.base_qty !== undefined && body.base_qty !== null
+      ? Math.max(0, toNumber(body.base_qty, 0))
+      : qty * unitRatio
+
+    let row
+    if (found) {
+      const result = await crmDB.query(
+        `UPDATE public.crm_purchase_planning_cart SET
+           item_name = $3::text,
+           ap_name = $4::text,
+           unit_code = $5::text,
+           selected_unit = $6::text,
+           unit_ratio = $7::numeric,
+           unit_stand_value = $8::numeric,
+           unit_divide_value = $9::numeric,
+           base_qty = base_qty + $10::numeric,
+           qty = qty + $11::numeric,
+           suggest_qty = $12::numeric,
+           reference_unit_code = $13::text,
+           reference_price = $14::numeric,
+           last_update_code = $15::text,
+           last_update_date_time = NOW()
+         WHERE id = $1::bigint AND user_id = $2::int
+         RETURNING *`,
+        [
+          found.id, req.user.id,
+          clean(body.item_name).slice(0, 255),
+          clean(body.ap_name).slice(0, 255),
+          clean(body.unit_code).slice(0, 25),
+          clean(body.selected_unit || body.unit_code).slice(0, 25),
+          unitRatio,
+          Math.max(0, toNumber(body.unit_stand_value, unitRatio)) || 1,
+          Math.max(0, toNumber(body.unit_divide_value, 1)) || 1,
+          baseQty,
+          qty,
+          Math.max(0, toNumber(body.suggest_qty, qty)),
+          clean(body.reference_unit_code).slice(0, 25),
+          Math.max(0, toNumber(body.reference_price, 0)),
+          clean(req.user.code),
+        ],
+      )
+      row = result.rows[0]
+    } else {
+      const result = await crmDB.query(
+        `INSERT INTO public.crm_purchase_planning_cart (
+           user_id, item_code, item_name, ap_code, ap_name,
+           unit_code, selected_unit, unit_ratio, unit_stand_value, unit_divide_value,
+           base_qty, qty, price, suggest_qty, reference_unit_code, reference_price,
+           create_code, last_update_code
+         ) VALUES (
+           $1, $2, $3, $4, $5,
+           $6, $7, $8, $9, $10,
+           $11, $12, $13, $14, $15, $16,
+           $17, $17
+         )
+         RETURNING *`,
+        [
+          req.user.id, itemCode, clean(body.item_name).slice(0, 255), apCode, clean(body.ap_name).slice(0, 255),
+          clean(body.unit_code).slice(0, 25), clean(body.selected_unit || body.unit_code).slice(0, 25),
+          unitRatio, Math.max(0, toNumber(body.unit_stand_value, unitRatio)) || 1, Math.max(0, toNumber(body.unit_divide_value, 1)) || 1,
+          baseQty, qty, Math.max(0, toNumber(body.price, 0)), Math.max(0, toNumber(body.suggest_qty, qty)),
+          clean(body.reference_unit_code).slice(0, 25), Math.max(0, toNumber(body.reference_price, 0)),
+          clean(req.user.code),
+        ],
+      )
+      row = result.rows[0]
+    }
+
+    const rows = await fetchCartRows(req.user.id, ['active'])
+    res.json({ success: true, data: normalizeCartRow(row, req.user.id), cart: rows })
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'รายการนี้ถูกผู้ใช้อื่นใส่ตะกร้าแล้ว กรุณาโหลดข้อมูลตะกร้าใหม่' })
+    }
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.patch('/cart/items/:id', requirePlanningAccess, async (req, res) => {
+  const id = parseInt(req.params.id, 10)
+  if (!id) return res.status(400).json({ error: 'กรุณาระบุรายการตะกร้า' })
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const result = await crmDB.query(
+      `UPDATE public.crm_purchase_planning_cart SET
+         qty = COALESCE($3::numeric, qty),
+         base_qty = COALESCE($4::numeric, base_qty),
+         price = COALESCE($5::numeric, price),
+         selected_unit = COALESCE(NULLIF($6::text, ''), selected_unit),
+         unit_ratio = COALESCE($7::numeric, unit_ratio),
+         unit_stand_value = COALESCE($8::numeric, unit_stand_value),
+         unit_divide_value = COALESCE($9::numeric, unit_divide_value),
+         last_update_code = $10::text,
+         last_update_date_time = NOW()
+       WHERE id = $1::bigint
+         AND user_id = $2::int
+         AND status = 'active'
+       RETURNING *`,
+      [
+        id,
+        req.user.id,
+        req.body?.qty === undefined ? null : Math.max(0, toNumber(req.body.qty, 0)),
+        req.body?.base_qty === undefined ? null : Math.max(0, toNumber(req.body.base_qty, 0)),
+        req.body?.price === undefined ? null : Math.max(0, toNumber(req.body.price, 0)),
+        clean(req.body?.selected_unit || ''),
+        req.body?.unit_ratio === undefined ? null : Math.max(0, toNumber(req.body.unit_ratio, 1)) || 1,
+        req.body?.unit_stand_value === undefined ? null : Math.max(0, toNumber(req.body.unit_stand_value, 1)) || 1,
+        req.body?.unit_divide_value === undefined ? null : Math.max(0, toNumber(req.body.unit_divide_value, 1)) || 1,
+        clean(req.user.code),
+      ],
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'ไม่พบรายการของคุณ หรือไม่มีสิทธิ์แก้ไขรายการนี้' })
+    res.json({ success: true, data: normalizeCartRow(result.rows[0], req.user.id) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.delete('/cart/items/:id', requirePlanningAccess, async (req, res) => {
+  const id = parseInt(req.params.id, 10)
+  if (!id) return res.status(400).json({ error: 'กรุณาระบุรายการตะกร้า' })
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const result = await crmDB.query(
+      `UPDATE public.crm_purchase_planning_cart SET
+         status = 'removed',
+         last_update_code = $3::text,
+         last_update_date_time = NOW()
+       WHERE id = $1::bigint
+         AND user_id = $2::int
+         AND status = 'active'
+       RETURNING id`,
+      [id, req.user.id, clean(req.user.code)],
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'ไม่พบรายการของคุณ หรือไม่มีสิทธิ์ลบรายการนี้' })
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.delete('/cart/items/by-key/:itemCode/:apCode', requirePlanningAccess, async (req, res) => {
+  const itemCode = clean(req.params.itemCode)
+  const apCode = clean(req.params.apCode)
+  if (!itemCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุสินค้าและเจ้าหนี้' })
+  try {
+    await ensureCurrentUserPlanningSetting(req)
+    const result = await crmDB.query(
+      `UPDATE public.crm_purchase_planning_cart SET
+         status = 'removed',
+         last_update_code = $3::text,
+         last_update_date_time = NOW()
+       WHERE item_code = $1::text
+         AND ap_code = $2::text
+         AND user_id = $4::int
+         AND status = 'active'
+       RETURNING id`,
+      [itemCode, apCode, clean(req.user.code), req.user.id],
+    )
+    if (!result.rows.length) return res.status(404).json({ error: 'ไม่พบรายการของคุณ หรือไม่มีสิทธิ์ลบรายการนี้' })
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/report-lazy', requirePlanningAccess, async (req, res) => {
+  pruneReportJobs()
+  const body = req.body || {}
+  const query = reportSnapshotQuery(body)
+  const batchSize = Math.min(10, Math.max(1, parseInt(body.batch_size, 10) || 5))
+  const key = reportJobKey(req.user?.code, query)
+  const forceReload = boolQuery(body.force_reload)
+
+  try {
+    if (!forceReload) {
+      const snapshotRow = await loadReportSnapshot(key)
+      if (snapshotRow) {
+        const job = createSnapshotJob(key, snapshotRow)
+        reportJobs.set(job.id, job)
+        return res.json({
+          job_id: job.id,
+          status: job.status,
+          total: job.total,
+          processed: job.processed,
+          options: job.options,
+          from_cache: true,
+          cache_updated_at: job.cacheUpdatedAt,
+        })
+      }
+    }
+
     const id = `${key}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
     const queryReq = { query }
-    const countWhere = planningWhere(queryReq, 1)
     const options = planningOptions(queryReq)
-    const countResult = await posDB.query(
-      `SELECT COUNT(*)::int AS total
-       FROM ic_inventory i
-       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
-       ${countWhere.sql}`,
-      countWhere.params,
-    )
 
     const job = {
       id,
       query,
       options,
       batchSize,
-      total: Number(countResult.rows[0]?.total || 0),
+      total: 0,
       processed: 0,
       rows: [],
       summary: summaryFromRows([]),
@@ -2121,6 +2858,9 @@ router.post('/report-lazy', async (req, res) => {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       cancelled: false,
+      snapshotKey: key,
+      createdBy: req.user?.code || '',
+      fromCache: false,
     }
     reportJobs.set(id, job)
     setImmediate(() => runReportJob(job))
@@ -2131,13 +2871,14 @@ router.post('/report-lazy', async (req, res) => {
       total: job.total,
       processed: job.processed,
       options,
+      from_cache: false,
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-router.get('/report-lazy/:jobId', async (req, res) => {
+router.get('/report-lazy/:jobId', requirePlanningAccess, async (req, res) => {
   pruneReportJobs()
   const job = reportJobs.get(clean(req.params.jobId))
   if (!job) return res.status(404).json({ error: 'ไม่พบงานคำนวณรายงาน กรุณาโหลดใหม่' })
@@ -2145,13 +2886,16 @@ router.get('/report-lazy/:jobId', async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0)
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 30))
   const stockStatus = clean(req.query.stock_status)
+  const searchQuery = takeParams(req.query, REPORT_SEARCH_QUERY_FIELDS)
   const sourceRows = job.status === 'complete'
     ? job.rows
     : sortPlanningRows([...job.rows])
+  const searchedRows = filterReportRows(sourceRows, searchQuery)
   const filteredRows = PLANNING_STOCK_STATUSES.has(stockStatus)
-    ? sourceRows.filter((row) => row.stock_status === stockStatus)
-    : sourceRows
+    ? searchedRows.filter((row) => row.stock_status === stockStatus)
+    : searchedRows
   const rows = filteredRows.slice(offset, offset + limit)
+  const filteredSummary = summaryFromRows(filteredRows)
 
   job.updatedAt = Date.now()
   res.json({
@@ -2165,10 +2909,12 @@ router.get('/report-lazy/:jobId', async (req, res) => {
     offset,
     limit,
     has_more: job.status === 'complete' ? offset + rows.length < filteredRows.length : true,
-    summary: job.status === 'complete' ? job.summary : null,
-    partial_summary: job.partialSummary,
+    summary: job.status === 'complete' ? filteredSummary : null,
+    partial_summary: filteredSummary,
     pending_pr: job.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
     options: job.options,
+    from_cache: Boolean(job.fromCache),
+    cache_updated_at: job.cacheUpdatedAt || null,
   })
 })
 
@@ -2205,7 +2951,7 @@ function newPRLogGuid() {
   return crypto.randomUUID().replace(/-/g, '')
 }
 
-router.post('/pr/create', async (req, res) => {
+router.post('/pr/create', requirePlanningAccess, async (req, res) => {
   const body = req.body || {}
   const userCode = clean(req.user?.code) || 'CRM'
   const docDate = optionalDate(body.doc_date)
@@ -2231,6 +2977,30 @@ router.post('/pr/create', async (req, res) => {
   }
 
   try {
+    const cartIds = groups
+      .flatMap((g) => Array.isArray(g.items) ? g.items : [])
+      .map((it) => parseInt(it.cart_id, 10))
+      .filter((id) => Number.isFinite(id) && id > 0)
+    let cartMetaById = new Map()
+
+    if (cartIds.length) {
+      const cartCheck = await crmDB.query(
+        `SELECT
+           c.id,
+           COALESCE(s.cart_color, $3::text) AS cart_color
+         FROM public.crm_purchase_planning_cart c
+         LEFT JOIN public.crm_purchase_planning_user_setting s ON s.user_id = c.user_id
+         WHERE c.id = ANY($1::bigint[])
+           AND c.user_id = $2::int
+           AND c.status = 'active'`,
+        [cartIds, req.user.id, userColor(req.user.id)],
+      )
+      if (cartCheck.rows.length !== new Set(cartIds).size) {
+        return res.status(409).json({ error: 'มีรายการตะกร้าที่ไม่ใช่ของคุณ หรือถูกสร้าง PR ไปแล้ว กรุณาโหลดตะกร้าใหม่' })
+      }
+      cartMetaById = new Map(cartCheck.rows.map((row) => [Number(row.id), row]))
+    }
+
     const result = await withPosTransaction(async (client) => {
       // อ่าน vat_rate จาก erp_option
       const vatResult = await client.query(`SELECT vat_rate FROM erp_option LIMIT 1`)
@@ -2240,6 +3010,10 @@ router.post('/pr/create', async (req, res) => {
       const prDocs = []
       for (const g of groups) {
         const apCode = clean(g.ap_code)
+        const groupCartIds = (Array.isArray(g.items) ? g.items : [])
+          .map((it) => parseInt(it.cart_id, 10))
+          .filter((id) => Number.isFinite(id) && id > 0)
+        const groupCartColor = groupCartIds.map((id) => clean(cartMetaById.get(id)?.cart_color)).find(Boolean) || clean(g.cart_color || '')
         // หมายเหตุแยกตามกลุ่ม/PR — ถ้ากลุ่มไม่ส่งมา ใช้ fallbackRemark (backward compatible)
         const remark = clean(g.remark || fallbackRemark).slice(0, 255)
 
@@ -2341,22 +3115,47 @@ router.post('/pr/create', async (req, res) => {
           doc_no: docNo,
           total_amount: totalAfterVat,
           item_count: g.items.length,
+          cart_ids: groupCartIds,
+          cart_color: groupCartColor,
         })
       }
       return { prDocs }
     })
 
+    for (const doc of result.prDocs) {
+      if (!Array.isArray(doc.cart_ids) || !doc.cart_ids.length) continue
+      await crmDB.query(
+        `UPDATE public.crm_purchase_planning_cart
+         SET status = 'created_pr',
+             pr_doc_no = $3::text,
+             last_update_code = $4::text,
+             last_update_date_time = NOW()
+         WHERE id = ANY($1::bigint[])
+           AND user_id = $2::int
+           AND status = 'active'`,
+        [doc.cart_ids, req.user.id, doc.doc_no, userCode],
+      )
+    }
+
+    const cartRows = await fetchCartRows(req.user.id, ['active'])
+    const createdRows = await fetchCartRows(req.user.id, ['created_pr'])
+
     res.json({
       success: true,
       pr_count: result.prDocs.length,
-      pr_docs: result.prDocs,
+      pr_docs: result.prDocs.map((doc) => {
+        const { cart_ids, ...safeDoc } = doc
+        return safeDoc
+      }),
+      cart: cartRows,
+      created_pr: createdRows,
     })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-router.get('/items/:icCode/suppliers', async (req, res) => {
+router.get('/items/:icCode/suppliers', requirePlanningAccess, async (req, res) => {
   const icCode = clean(req.params.icCode)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
 
@@ -2472,7 +3271,7 @@ router.get('/items/:icCode/suppliers', async (req, res) => {
 // GET /purchase-planning/items/:icCode/units — ดึงหน่วยนับทั้งหมดของสินค้า
 // ใช้สำหรับแปลงหน่วยสต๊อก/แนะนำซื้อ (ratio = stand_value / divide_value)
 // ─────────────────────────────────────────────────────────────────────────────
-router.get('/items/:icCode/units', async (req, res) => {
+router.get('/items/:icCode/units', requirePlanningAccess, async (req, res) => {
   const icCode = clean(req.params.icCode)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
 
@@ -2514,7 +3313,7 @@ router.get('/items/:icCode/units', async (req, res) => {
   }
 })
 
-router.get('/items/:icCode/latest-purchase-price', async (req, res) => {
+router.get('/items/:icCode/latest-purchase-price', requirePlanningAccess, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const unitCode = clean(req.query.unit_code)
   if (!icCode || !unitCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและหน่วยนับ' })
@@ -2550,7 +3349,7 @@ router.get('/items/:icCode/latest-purchase-price', async (req, res) => {
   }
 })
 
-router.get('/items/:icCode/detail', async (req, res) => {
+router.get('/items/:icCode/detail', requirePlanningAccess, async (req, res) => {
   const icCode = clean(req.params.icCode)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
 
@@ -2852,7 +3651,7 @@ router.get('/items/:icCode/detail', async (req, res) => {
 })
 
 // POST /purchase-planning/trigger-alert — manual trigger สำหรับทดสอบ (admin/SUPERADMIN เท่านั้น)
-router.post('/trigger-alert', requireRole('admin', 'manager'), async (req, res) => {
+router.post('/trigger-alert', requirePlanningAdmin, async (req, res) => {
   const user = req.user || {}
   const role = (user.role || '').toLowerCase()
   const code = (user.code || '').toUpperCase()
@@ -2876,7 +3675,7 @@ router.post('/trigger-alert', requireRole('admin', 'manager'), async (req, res) 
 // ── Item-Supplier Linking ──────────────────────────────────────────────────
 
 // GET /item-supplier-link/items?search=&page=&limit= — รายการสินค้า
-router.get('/item-supplier-link/items', async (req, res) => {
+router.get('/item-supplier-link/items', requirePlanningAdmin, async (req, res) => {
   const search = clean(req.query.search)
   const page = Math.max(1, parseInt(req.query.page, 10) || 1)
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 20))
@@ -2913,7 +3712,7 @@ router.get('/item-supplier-link/items', async (req, res) => {
 })
 
 // GET /item-supplier-link/:icCode/linked — เจ้าหนี้ที่ผูกกับสินค้านี้แล้ว
-router.get('/item-supplier-link/:icCode/linked', async (req, res) => {
+router.get('/item-supplier-link/:icCode/linked', requirePlanningAdmin, async (req, res) => {
   const icCode = clean(req.params.icCode)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
   try {
@@ -2940,7 +3739,7 @@ router.get('/item-supplier-link/:icCode/linked', async (req, res) => {
 })
 
 // GET /item-supplier-link/:icCode/available?search= — เจ้าหนี้ที่ยังไม่ผูก
-router.get('/item-supplier-link/:icCode/available', async (req, res) => {
+router.get('/item-supplier-link/:icCode/available', requirePlanningAdmin, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const search = clean(req.query.search)
   if (!icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
@@ -2981,7 +3780,7 @@ router.get('/item-supplier-link/:icCode/available', async (req, res) => {
 })
 
 // POST /item-supplier-link/:icCode/link — ผูกเจ้าหนี้กับสินค้า
-router.post('/item-supplier-link/:icCode/link', async (req, res) => {
+router.post('/item-supplier-link/:icCode/link', requirePlanningAdmin, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const apCode = clean(req.body?.ap_code)
   if (!icCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
@@ -3026,7 +3825,7 @@ router.post('/item-supplier-link/:icCode/link', async (req, res) => {
 })
 
 // DELETE /item-supplier-link/:icCode/link/:apCode — ยกเลิกผูก
-router.delete('/item-supplier-link/:icCode/link/:apCode', async (req, res) => {
+router.delete('/item-supplier-link/:icCode/link/:apCode', requirePlanningAdmin, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const apCode = clean(req.params.apCode)
   if (!icCode || !apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
@@ -3044,7 +3843,7 @@ router.delete('/item-supplier-link/:icCode/link/:apCode', async (req, res) => {
 })
 
 // GET /item-supplier-link/suppliers?search= — รายการเจ้าหนี้ (สำหรับ tab เลือกเจ้าหนี้ก่อน)
-router.get('/item-supplier-link/suppliers', async (req, res) => {
+router.get('/item-supplier-link/suppliers', requirePlanningAdmin, async (req, res) => {
   const search = clean(req.query.search)
   const page = Math.max(1, parseInt(req.query.page, 10) || 1)
   const limit = Math.min(100, Math.max(10, parseInt(req.query.limit, 10) || 20))
@@ -3082,7 +3881,7 @@ router.get('/item-supplier-link/suppliers', async (req, res) => {
 })
 
 // GET /item-supplier-link/by-supplier/:apCode/linked — สินค้าที่ผูกกับเจ้าหนี้นี้แล้ว
-router.get('/item-supplier-link/by-supplier/:apCode/linked', async (req, res) => {
+router.get('/item-supplier-link/by-supplier/:apCode/linked', requirePlanningAdmin, async (req, res) => {
   const apCode = clean(req.params.apCode)
   if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
   try {
@@ -3106,7 +3905,7 @@ router.get('/item-supplier-link/by-supplier/:apCode/linked', async (req, res) =>
 })
 
 // GET /item-supplier-link/by-supplier/:apCode/available?search= — สินค้าที่ยังไม่ผูกกับเจ้าหนี้นี้
-router.get('/item-supplier-link/by-supplier/:apCode/available', async (req, res) => {
+router.get('/item-supplier-link/by-supplier/:apCode/available', requirePlanningAdmin, async (req, res) => {
   const apCode = clean(req.params.apCode)
   if (!apCode) return res.status(400).json({ error: 'กรุณาระบุรหัสเจ้าหนี้' })
 
@@ -3142,7 +3941,7 @@ router.get('/item-supplier-link/by-supplier/:apCode/available', async (req, res)
 })
 
 // POST /item-supplier-link/by-supplier/:apCode/link — ผูกสินค้ากับเจ้าหนี้ (reverse direction)
-router.post('/item-supplier-link/by-supplier/:apCode/link', async (req, res) => {
+router.post('/item-supplier-link/by-supplier/:apCode/link', requirePlanningAdmin, async (req, res) => {
   const apCode = clean(req.params.apCode)
   const icCode = clean(req.body?.ic_code)
   if (!apCode || !icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })
@@ -3187,7 +3986,7 @@ router.post('/item-supplier-link/by-supplier/:apCode/link', async (req, res) => 
 })
 
 // DELETE /item-supplier-link/by-supplier/:apCode/link/:icCode — ยกเลิกผูก (reverse direction)
-router.delete('/item-supplier-link/by-supplier/:apCode/link/:icCode', async (req, res) => {
+router.delete('/item-supplier-link/by-supplier/:apCode/link/:icCode', requirePlanningAdmin, async (req, res) => {
   const apCode = clean(req.params.apCode)
   const icCode = clean(req.params.icCode)
   if (!apCode || !icCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้าและเจ้าหนี้' })

@@ -32,6 +32,12 @@ function bangkokDate() {
   }).format(new Date())
 }
 
+function maxDateText(dateText, fallbackDateText) {
+  const normalized = String(dateText || '').slice(0, 10)
+  if (!normalized) return fallbackDateText
+  return normalized < fallbackDateText ? fallbackDateText : normalized
+}
+
 async function loadFallbackUserId(client = crmDB) {
   const result = await client.query(`
     SELECT id FROM crm_users
@@ -357,7 +363,12 @@ async function runDueVisitFollowups({
       p.ar_code,
       p.next_visit_followup,
       p.next_visit_followup::text AS next_visit_followup_text,
-      COALESCE(p.visit_followup_interval_days, $2::integer) AS effective_visit_interval_days
+      COALESCE(p.visit_followup_interval_days, $2::integer) AS effective_visit_interval_days,
+      EXISTS (
+        SELECT 1 FROM crm_activities a
+        WHERE a.followup_key = ('auto-visit:' || p.ar_code || ':' || p.next_visit_followup::text)
+          AND a.status IN ('done','cancelled','deleted')
+      ) AS has_closed_same_followup_key
     FROM crm_customer_profile p
     WHERE p.status = 'active'
       AND p.visit_followup_enabled = TRUE
@@ -367,6 +378,7 @@ async function runDueVisitFollowups({
       AND NOT EXISTS (
         SELECT 1 FROM crm_activities a
         WHERE a.followup_key = ('auto-visit:' || p.ar_code || ':' || p.next_visit_followup::text)
+          AND a.status NOT IN ('done','cancelled','deleted')
       )
       AND NOT EXISTS (
         SELECT 1 FROM crm_activities a
@@ -400,6 +412,7 @@ async function runDueVisitFollowups({
       AND NOT EXISTS (
         SELECT 1 FROM crm_activities a
         WHERE a.followup_key = ('auto-visit:' || p.ar_code || ':' || p.next_visit_followup::text)
+          AND a.status NOT IN ('done','cancelled','deleted')
       )
       AND EXISTS (
         SELECT 1 FROM crm_activities a
@@ -445,13 +458,18 @@ async function runDueVisitFollowups({
       const primaryOwnerId = selectedOwnerIds[0] || fallbackUserId
       const requiresOwnerAssignment = selectedOwnerIds.length === 0
       const followupDateText = customer.next_visit_followup_text || String(customer.next_visit_followup).slice(0, 10)
-      const followupKey = `auto-visit:${customer.ar_code}:${followupDateText}`
+      const activityDateText = maxDateText(followupDateText, todayStr)
+      const baseFollowupKey = `auto-visit:${customer.ar_code}:${followupDateText}`
+      const followupKey = customer.has_closed_same_followup_key
+        ? `${baseFollowupKey}:rerun:${todayStr}`
+        : baseFollowupKey
       const subject = `เยี่ยมลูกค้า ${customer.ar_code}`
       const description = [
         source === 'manual'
           ? 'สร้างโดย Manual Trigger จาก Visit Follow-up Policy'
           : 'สร้างโดยระบบจาก Visit Follow-up Policy',
         `ครบกำหนดเยี่ยมวันที่ ${followupDateText}`,
+        activityDateText !== followupDateText ? `สร้างงานลงวันที่ ${activityDateText} เนื่องจากเลยกำหนดเดิม` : '',
         requiresOwnerAssignment ? 'ลูกค้ายังไม่มีทีมผู้ดูแล CRM กรุณาระบุผู้รับผิดชอบ' : '',
       ].filter(Boolean).join('\n')
 
@@ -491,7 +509,7 @@ async function runDueVisitFollowups({
         fallbackUserId,
         subject,
         description,
-        customer.next_visit_followup,
+        activityDateText,
         followupKey,
         requiresOwnerAssignment,
         requiresOwnerAssignment ? 'ไม่มี CRM owner ตอนระบบสร้างงาน' : null,
