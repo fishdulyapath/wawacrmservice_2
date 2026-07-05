@@ -2886,6 +2886,23 @@ router.post('/report-lazy', requirePlanningAccess, async (req, res) => {
   }
 })
 
+router.get('/report-snapshot/status', requirePlanningAccess, async (req, res) => {
+  try {
+    const query = reportSnapshotQuery(req.query || {})
+    const key = reportJobKey(req.user?.code, query)
+    const snapshotRow = await loadReportSnapshot(key)
+    const snapshot = snapshotRow?.snapshot_json || {}
+    res.json({
+      exists: Boolean(snapshotRow),
+      total: Number(snapshot.total || 0),
+      processed: Number(snapshot.processed || 0),
+      cache_updated_at: snapshotRow?.last_update_date_time || null,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 router.get('/report-lazy/:jobId', requirePlanningAccess, async (req, res) => {
   pruneReportJobs()
   const job = reportJobs.get(clean(req.params.jobId))
