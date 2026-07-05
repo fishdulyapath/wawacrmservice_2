@@ -180,6 +180,31 @@ async function fetchCartRows(currentUserId, statuses = ['active']) {
   return result.rows.map((row) => normalizeCartRow(row, currentUserId))
 }
 
+async function filterActiveCreatedPRRows(rows) {
+  const docNos = [...new Set((rows || []).map((row) => clean(row.pr_doc_no)).filter(Boolean))]
+  if (!docNos.length) return []
+  const result = await posDB.query(
+    `SELECT DISTINCT
+       t.doc_no,
+       t.cust_code AS ap_code,
+       d.item_code
+     FROM ic_trans t
+     JOIN ic_trans_detail d ON d.doc_no = t.doc_no AND d.trans_flag = t.trans_flag
+     WHERE t.trans_flag = 2
+       AND COALESCE(t.doc_success, 0) = 0
+       AND COALESCE(t.last_status, 0) = 0
+       AND COALESCE(d.status, 0) = 0
+       AND t.doc_no = ANY($1::text[])`,
+    [docNos],
+  )
+  const activeLines = new Set(result.rows.map((row) => (
+    `${clean(row.doc_no)}::${clean(row.ap_code)}::${clean(row.item_code)}`
+  )))
+  return rows.filter((row) => activeLines.has(
+    `${clean(row.pr_doc_no)}::${clean(row.ap_code)}::${clean(row.item_code)}`,
+  ))
+}
+
 function linkableItemWhere(itemAlias = 'i', detailAlias = 'd') {
   return `COALESCE(${itemAlias}.code, '') <> ''
     AND COALESCE(${itemAlias}.item_type, 0) NOT IN (1, 3)
@@ -337,7 +362,7 @@ function createSnapshotJob(key, snapshotRow) {
     rows,
     summary: snapshot.summary || summaryFromRows(rows),
     partialSummary: snapshot.summary || summaryFromRows(rows),
-    pending_pr: snapshot.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
+    pending_pr: { total: 0, byAp: {}, byItemAp: {} },
     status: 'complete',
     error: '',
     createdAt: Date.now(),
@@ -2542,6 +2567,14 @@ router.get('/report', requirePlanningAccess, async (req, res) => {
   }
 })
 
+router.get('/pending-pr', requirePlanningAccess, async (req, res) => {
+  try {
+    res.json(await getPendingPRCount())
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
 router.get('/users', requirePlanningAdminOnly, async (req, res) => {
   try {
     await ensureCurrentUserPlanningSetting(req)
@@ -2609,7 +2642,7 @@ router.get('/cart', requirePlanningAccess, async (req, res) => {
   try {
     await ensureCurrentUserPlanningSetting(req)
     const rows = await fetchCartRows(req.user.id, ['active'])
-    const createdRows = await fetchCartRows(req.user.id, ['created_pr'])
+    const createdRows = await filterActiveCreatedPRRows(await fetchCartRows(req.user.id, ['created_pr']))
     res.json({
       data: rows,
       created_pr: createdRows,
@@ -2921,6 +2954,15 @@ router.get('/report-lazy/:jobId', requirePlanningAccess, async (req, res) => {
     : searchedRows
   const rows = filteredRows.slice(offset, offset + limit)
   const filteredSummary = summaryFromRows(filteredRows)
+  let pendingPR = job.pending_pr || { total: 0, byAp: {}, byItemAp: {} }
+  if (job.status === 'complete') {
+    try {
+      pendingPR = await getPendingPRCount()
+      job.pending_pr = pendingPR
+    } catch {
+      pendingPR = { total: 0, byAp: {}, byItemAp: {} }
+    }
+  }
 
   job.updatedAt = Date.now()
   res.json({
@@ -2936,7 +2978,7 @@ router.get('/report-lazy/:jobId', requirePlanningAccess, async (req, res) => {
     has_more: job.status === 'complete' ? offset + rows.length < filteredRows.length : true,
     summary: job.status === 'complete' ? filteredSummary : null,
     partial_summary: filteredSummary,
-    pending_pr: job.pending_pr || { total: 0, byAp: {}, byItemAp: {} },
+    pending_pr: pendingPR,
     options: job.options,
     from_cache: Boolean(job.fromCache),
     cache_updated_at: job.cacheUpdatedAt || null,
@@ -3163,7 +3205,7 @@ router.post('/pr/create', requirePlanningAccess, async (req, res) => {
     }
 
     const cartRows = await fetchCartRows(req.user.id, ['active'])
-    const createdRows = await fetchCartRows(req.user.id, ['created_pr'])
+    const createdRows = await filterActiveCreatedPRRows(await fetchCartRows(req.user.id, ['created_pr']))
 
     res.json({
       success: true,
