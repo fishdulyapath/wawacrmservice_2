@@ -25,9 +25,17 @@ function isPlanningAdmin(user) {
   return user?.code?.toUpperCase() === 'SUPERADMIN' || user?.role === 'admin'
 }
 
-function requirePlanningAdmin(req, res, next) {
+function requirePlanningAdminOnly(req, res, next) {
   if (isPlanningAdmin(req.user)) return next()
   return res.status(403).json({ error: 'ไม่มีสิทธิ์จัดการข้อมูลวางแผนสั่งซื้อ' })
+}
+
+function requirePlanningAdmin(req, res, next) {
+  return requirePlanningAdminOnly(req, res, next)
+}
+
+function requirePlanningManageAccess(req, res, next) {
+  return requirePlanningAccess(req, res, next)
 }
 
 function userColor(userId) {
@@ -1488,7 +1496,7 @@ async function runReportJob(job) {
   }
 }
 
-router.get('/supplier-settings', requirePlanningAdmin, async (req, res) => {
+router.get('/supplier-settings', requirePlanningManageAccess, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['s.code', 's.name_1'], 1)
   const enabledClause = planningEnabledStatusClause(req.query.enabled_status, 'p', req.query.enabled_only)
@@ -1535,7 +1543,7 @@ router.get('/supplier-settings', requirePlanningAdmin, async (req, res) => {
   }
 })
 
-router.post('/supplier-settings/save/:apCode', requirePlanningAdmin, async (req, res) => {
+router.post('/supplier-settings/save/:apCode', requirePlanningManageAccess, async (req, res) => {
   const apCode = clean(req.params.apCode)
   const body = req.body || {}
   const userCode = clean(req.user?.code)
@@ -1575,7 +1583,7 @@ router.post('/supplier-settings/save/:apCode', requirePlanningAdmin, async (req,
   }
 })
 
-router.post('/supplier-settings/bulk-planning-enabled', requirePlanningAdmin, async (req, res) => {
+router.post('/supplier-settings/bulk-planning-enabled', requirePlanningManageAccess, async (req, res) => {
   const body = req.body || {}
   const planningEnabled = Number(body.planning_enabled) === 0 ? 0 : 1
   const search = searchClause(body.search, ['s.code', 's.name_1'], 2)
@@ -1658,7 +1666,7 @@ router.post('/supplier-settings/bulk-planning-enabled', requirePlanningAdmin, as
   }
 })
 
-router.post('/supplier-settings/sync-from-purchase-history', requirePlanningAdmin, async (req, res) => {
+router.post('/supplier-settings/sync-from-purchase-history', requirePlanningManageAccess, async (req, res) => {
   const body = req.body || {}
   const dryRun = boolQuery(body.dry_run)
   const fromDate = optionalDate(body.from_date)
@@ -1723,7 +1731,7 @@ router.post('/supplier-settings/sync-from-purchase-history', requirePlanningAdmi
 })
 
 // ── Supplier: Excel export/import ────────────────────────────────────────────
-router.get('/supplier-settings/export', requirePlanningAdmin, async (req, res) => {
+router.get('/supplier-settings/export', requirePlanningManageAccess, async (req, res) => {
   try {
     const dataResult = await posDB.query(
       `SELECT
@@ -1760,7 +1768,7 @@ router.get('/supplier-settings/export', requirePlanningAdmin, async (req, res) =
   }
 })
 
-router.post('/supplier-settings/import', requirePlanningAdmin, importUpload.single('file'), async (req, res) => {
+router.post('/supplier-settings/import', requirePlanningManageAccess, importUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
   const commit = boolQuery(req.body.commit)
   const userCode = clean(req.user?.code)
@@ -1884,7 +1892,7 @@ router.post('/supplier-settings/import', requirePlanningAdmin, importUpload.sing
   }
 })
 
-router.get('/item-settings', requirePlanningAdmin, async (req, res) => {
+router.get('/item-settings', requirePlanningManageAccess, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = itemSearchClause(req.query.search, 1)
   const params = [...search.params]
@@ -1932,7 +1940,7 @@ router.get('/item-settings', requirePlanningAdmin, async (req, res) => {
   }
 })
 
-router.post('/item-settings/save/:icCode', requirePlanningAdmin, async (req, res) => {
+router.post('/item-settings/save/:icCode', requirePlanningManageAccess, async (req, res) => {
   const icCode = clean(req.params.icCode)
   const body = req.body || {}
   const userCode = clean(req.user?.code)
@@ -1971,7 +1979,7 @@ router.post('/item-settings/save/:icCode', requirePlanningAdmin, async (req, res
   }
 })
 
-router.get('/item-supplier-settings', requirePlanningAdmin, async (req, res) => {
+router.get('/item-supplier-settings', requirePlanningManageAccess, async (req, res) => {
   const { page, limit, offset } = pageParams(req)
   const search = searchClause(req.query.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 1)
   const enabledClause = planningEnabledStatusClause(req.query.enabled_status, 'p', req.query.enabled_only)
@@ -2067,7 +2075,7 @@ router.get('/item-supplier-settings', requirePlanningAdmin, async (req, res) => 
   }
 })
 
-router.post('/item-supplier-settings/save', requirePlanningAdmin, async (req, res) => {
+router.post('/item-supplier-settings/save', requirePlanningManageAccess, async (req, res) => {
   const body = req.body || {}
   const icCode = clean(body.ic_code)
   const apCode = clean(body.ap_code)
@@ -2121,7 +2129,7 @@ router.post('/item-supplier-settings/save', requirePlanningAdmin, async (req, re
   }
 })
 
-router.post('/item-supplier-settings/bulk-planning-enabled', requirePlanningAdmin, async (req, res) => {
+router.post('/item-supplier-settings/bulk-planning-enabled', requirePlanningManageAccess, async (req, res) => {
   const body = req.body || {}
   const planningEnabled = Number(body.planning_enabled) === 0 ? 0 : 1
   const search = searchClause(body.search, ['link.ic_code', 'i.name_1', 'link.ap_code', 's.name_1'], 2)
@@ -2226,7 +2234,7 @@ router.post('/item-supplier-settings/bulk-planning-enabled', requirePlanningAdmi
   }
 })
 
-router.post('/item-supplier-settings/sync-from-purchase-history', requirePlanningAdmin, async (req, res) => {
+router.post('/item-supplier-settings/sync-from-purchase-history', requirePlanningManageAccess, async (req, res) => {
   const body = req.body || {}
   const dryRun = boolQuery(body.dry_run)
   const fromDate = optionalDate(body.from_date)
@@ -2294,7 +2302,7 @@ router.post('/item-supplier-settings/sync-from-purchase-history', requirePlannin
 })
 
 // ── Item-Supplier: Excel export/import ───────────────────────────────────────
-router.get('/item-supplier-settings/export', requirePlanningAdmin, async (req, res) => {
+router.get('/item-supplier-settings/export', requirePlanningManageAccess, async (req, res) => {
   try {
     const dataResult = await posDB.query(
       `SELECT DISTINCT ON (link.ic_code, link.ap_code)
@@ -2342,7 +2350,7 @@ router.get('/item-supplier-settings/export', requirePlanningAdmin, async (req, r
   }
 })
 
-router.post('/item-supplier-settings/import', requirePlanningAdmin, importUpload.single('file'), async (req, res) => {
+router.post('/item-supplier-settings/import', requirePlanningManageAccess, importUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'กรุณาแนบไฟล์ Excel' })
   const commit = boolQuery(req.body.commit)
   const userCode = clean(req.user?.code)
@@ -2534,7 +2542,7 @@ router.get('/report', requirePlanningAccess, async (req, res) => {
   }
 })
 
-router.get('/users', requirePlanningAdmin, async (req, res) => {
+router.get('/users', requirePlanningAdminOnly, async (req, res) => {
   try {
     await ensureCurrentUserPlanningSetting(req)
     const { page, limit, offset } = pageParams(req)
@@ -2570,7 +2578,7 @@ router.get('/users', requirePlanningAdmin, async (req, res) => {
   }
 })
 
-router.patch('/users/:userId', requirePlanningAdmin, async (req, res) => {
+router.patch('/users/:userId', requirePlanningAdminOnly, async (req, res) => {
   const userId = parseInt(req.params.userId, 10)
   const canAccess = boolQuery(req.body?.can_access) ? 1 : 0
   const color = clean(req.body?.cart_color || userColor(userId))

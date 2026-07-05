@@ -3,6 +3,7 @@ const router  = express.Router()
 const jwt     = require('jsonwebtoken')
 const { posDB, crmDB } = require('../db')
 const { authMiddleware } = require('../middleware/auth')
+const { ensurePurchasePlanningUserSettingForUser } = require('../services/purchasePlanningUserSettings')
 
 const MAX_ATTEMPTS    = parseInt(process.env.MAX_LOGIN_ATTEMPTS  || '5')
 const LOCK_MINUTES    = parseInt(process.env.LOCK_DURATION_MINUTES || '15')
@@ -137,6 +138,8 @@ router.post('/login', async (req, res) => {
 
     await _logLogin(user.id, code, true, null, ip, userAgent)
 
+    const purchasePlanningSetting = await ensurePurchasePlanningUserSettingForUser(user)
+
     res.json({
       token,
       refresh_token: refreshToken,
@@ -145,7 +148,9 @@ router.post('/login', async (req, res) => {
         id:   user.id,
         code: user.code,
         name: user.name || posUser.name_1,
-        role: user.role
+        role: user.role,
+        purchase_planning_can_access: purchasePlanningSetting?.can_access || 0,
+        purchase_planning_cart_color: purchasePlanningSetting?.cart_color || '#2563eb',
       }
     })
 
@@ -257,6 +262,8 @@ router.post('/liff', async (req, res) => {
 
     await _logLogin(user.id, user.code, true, null, ip, `LIFF:${userAgent}`)
 
+    const purchasePlanningSetting = await ensurePurchasePlanningUserSettingForUser(user)
+
     res.json({
       token,
       refresh_token: refreshToken,
@@ -265,7 +272,9 @@ router.post('/liff', async (req, res) => {
         id:   user.id,
         code: user.code,
         name: user.name,
-        role: user.role
+        role: user.role,
+        purchase_planning_can_access: purchasePlanningSetting?.can_access || 0,
+        purchase_planning_cart_color: purchasePlanningSetting?.cart_color || '#2563eb',
       }
     })
 
@@ -366,7 +375,13 @@ router.get('/me', authMiddleware, async (req, res) => {
        FROM crm_users WHERE id=$1`,
       [req.user.id]
     )
-    res.json(result.rows[0] || req.user)
+    const user = result.rows[0] || req.user
+    const purchasePlanningSetting = await ensurePurchasePlanningUserSettingForUser(user)
+    res.json({
+      ...user,
+      purchase_planning_can_access: purchasePlanningSetting?.can_access || 0,
+      purchase_planning_cart_color: purchasePlanningSetting?.cart_color || '#2563eb',
+    })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
