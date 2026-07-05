@@ -2033,59 +2033,67 @@ router.get('/item-supplier-settings', requirePlanningManageAccess, async (req, r
     )
 
     const dataResult = await posDB.query(
-      `WITH latest_price AS (
-         SELECT DISTINCT ON (item_code, cust_code, unit_code)
-           item_code AS ic_code,
-           cust_code AS ap_code,
-           price_exclude_vat AS price,
-           unit_code,
-           doc_date,
-           doc_time
-         FROM ic_trans_detail
-         WHERE trans_flag = 310
-           AND COALESCE(status, 0) = 0
-           AND COALESCE(item_code, '') <> ''
-           AND COALESCE(cust_code, '') <> ''
-         ORDER BY item_code, cust_code, unit_code, doc_date DESC, doc_time DESC, doc_no DESC
+      `WITH filtered_links AS (
+         SELECT DISTINCT ON (link.ic_code, link.ap_code)
+            link.ic_code,
+            COALESCE(i.name_1, '') AS ic_name,
+            COALESCE(i.unit_standard, '') AS item_unit_code,
+            link.ap_code,
+            COALESCE(s.name_1, '') AS ap_name,
+            p.lead_time_days,
+            p.late_buffer_days,
+            p.wholesale_buffer_days,
+            p.order_cycle_days,
+            COALESCE(p.min_order_qty, 0) AS min_order_qty,
+            COALESCE(NULLIF(p.pack_size, 0), 1) AS pack_size,
+            COALESCE(p.purchase_unit_code, '') AS purchase_unit_code,
+            COALESCE(p.planning_enabled, 0) AS planning_enabled,
+            COALESCE(p.is_preferred, 0) AS is_preferred,
+            COALESCE(p.remark, '') AS remark,
+            p.last_update_date_time
+         FROM ap_item_by_supplier link
+         LEFT JOIN ic_inventory i ON i.code = link.ic_code
+         LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
+         JOIN ap_supplier s ON s.code = link.ap_code
+         JOIN purchase_planning_supplier_setting supplier_plan
+           ON supplier_plan.ap_code = link.ap_code
+          AND COALESCE(supplier_plan.planning_enabled, 0) = 1
+         LEFT JOIN purchase_planning_item_supplier_setting p
+           ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
+         WHERE COALESCE(link.ic_code, '') <> ''
+           AND COALESCE(link.ap_code, '') <> ''
+           AND ${linkableItemWhere('i', 'd')}
+           AND ${activeSupplierWhere('s')}${search.sql}${enabledClause}
+         ORDER BY link.ic_code, link.ap_code
+       ),
+       paged_links AS (
+         SELECT *
+         FROM filtered_links
+         ORDER BY ic_code, ap_code
+         OFFSET $${params.length + 1} LIMIT $${params.length + 2}
        )
-       SELECT DISTINCT ON (link.ic_code, link.ap_code)
-          link.ic_code,
-          COALESCE(i.name_1, '') AS ic_name,
-          COALESCE(i.unit_standard, '') AS item_unit_code,
-          link.ap_code,
-          COALESCE(s.name_1, '') AS ap_name,
+       SELECT
+          p.*,
           lp.price AS last_purchase_price,
           COALESCE(lp.unit_code, '') AS last_purchase_unit_code,
-          lp.doc_date AS last_purchase_date,
-          p.lead_time_days,
-          p.late_buffer_days,
-          p.wholesale_buffer_days,
-          p.order_cycle_days,
-          COALESCE(p.min_order_qty, 0) AS min_order_qty,
-          COALESCE(NULLIF(p.pack_size, 0), 1) AS pack_size,
-          COALESCE(p.purchase_unit_code, '') AS purchase_unit_code,
-          COALESCE(p.planning_enabled, 0) AS planning_enabled,
-          COALESCE(p.is_preferred, 0) AS is_preferred,
-          COALESCE(p.remark, '') AS remark,
-          p.last_update_date_time
-       FROM ap_item_by_supplier link
-       LEFT JOIN ic_inventory i ON i.code = link.ic_code
-       LEFT JOIN ic_inventory_detail d ON d.ic_code = i.code
-       JOIN ap_supplier s ON s.code = link.ap_code
-       JOIN purchase_planning_supplier_setting supplier_plan
-         ON supplier_plan.ap_code = link.ap_code
-        AND COALESCE(supplier_plan.planning_enabled, 0) = 1
-       LEFT JOIN purchase_planning_item_supplier_setting p
-         ON p.ic_code = link.ic_code AND p.ap_code = link.ap_code
-       LEFT JOIN latest_price lp
-         ON lp.ic_code = link.ic_code AND lp.ap_code = link.ap_code
-        AND lp.unit_code = COALESCE(NULLIF(p.purchase_unit_code, ''), COALESCE(i.unit_standard, ''))
-       WHERE COALESCE(link.ic_code, '') <> ''
-         AND COALESCE(link.ap_code, '') <> ''
-         AND ${linkableItemWhere('i', 'd')}
-         AND ${activeSupplierWhere('s')}${search.sql}${enabledClause}
-       ORDER BY link.ic_code, link.ap_code
-       OFFSET $${params.length + 1} LIMIT $${params.length + 2}`,
+          lp.doc_date AS last_purchase_date
+       FROM paged_links p
+       LEFT JOIN LATERAL (
+         SELECT
+           td.price_exclude_vat AS price,
+           td.unit_code,
+           td.doc_date,
+           td.doc_time
+         FROM ic_trans_detail td
+         WHERE td.trans_flag = 310
+           AND COALESCE(td.status, 0) = 0
+           AND td.item_code = p.ic_code
+           AND td.cust_code = p.ap_code
+           AND td.unit_code = COALESCE(NULLIF(p.purchase_unit_code, ''), p.item_unit_code)
+         ORDER BY td.doc_date DESC, td.doc_time DESC, td.doc_no DESC
+         LIMIT 1
+       ) lp ON true
+       ORDER BY p.ic_code, p.ap_code`,
       [...params, offset, limit],
     )
 

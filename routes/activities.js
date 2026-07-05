@@ -72,6 +72,23 @@ async function getFollowupQueueNotifyIds(client) {
 }
 
 // ── Helper: ตรวจสิทธิ์ — เป็น active owner หรือ superadmin ──
+async function getCustomerActivityOwnerIds(arCode, activityType, client) {
+  const db = client || crmDB
+  if (!arCode) return []
+  const table = activityType === 'visit' ? 'crm_customer_visit_owner' : 'crm_customer_owner'
+  try {
+    const res = await db.query(`
+      SELECT user_id
+      FROM ${table}
+      WHERE ar_code = $1
+      ORDER BY is_primary DESC, assigned_at ASC
+    `, [arCode])
+    return [...new Set(res.rows.map(r => Number(r.user_id)).filter(Boolean))]
+  } catch {
+    return []
+  }
+}
+
 async function isActiveOwner(activityId, userId, client) {
   const db = client || crmDB
   const res = await db.query(`
@@ -1205,6 +1222,9 @@ router.post('/', async (req, res) => {
 
   // resolve owners list
   let ownerList = owners.length ? owners.map(Number) : (owner_id ? [Number(owner_id)] : [])
+  if (!ownerList.length && ar_code) {
+    ownerList = await getCustomerActivityOwnerIds(ar_code, activity_type)
+  }
   if (!ownerList.length) ownerList = [req.user.id]
   // deduplicate
   ownerList = [...new Set(ownerList)]
