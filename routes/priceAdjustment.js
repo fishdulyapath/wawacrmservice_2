@@ -16,6 +16,30 @@ function clean(value) {
   return String(value || '').trim()
 }
 
+function searchTokenPatterns(token) {
+  const raw = clean(token).toLowerCase()
+  if (!raw) return []
+
+  const variants = new Set([raw])
+  const gramMatch = raw.match(/^(\d+(?:\.\d+)?)\s*g$/i)
+  if (gramMatch) {
+    variants.add(`${gramMatch[1]}g`)
+    variants.add(`${gramMatch[1]} g`)
+    variants.add(`${gramMatch[1]}กรัม`)
+    variants.add(`${gramMatch[1]} กรัม`)
+  }
+
+  return [...variants].map((value) => `%${value}%`)
+}
+
+function isAnchorSearchToken(token) {
+  const raw = clean(token).toLowerCase()
+  if (!raw) return false
+  if (/^\d+(?:\.\d+)?$/.test(raw)) return false
+  if (/^\d+(?:\.\d+)?\s*(g|kg|ml|l)$/.test(raw)) return false
+  return true
+}
+
 function intValue(value, fallback = 0) {
   const n = Number(value)
   return Number.isInteger(n) ? n : fallback
@@ -33,6 +57,11 @@ function toPriceText(value) {
   const n = numericValue(value)
   if (!Number.isFinite(n)) return null
   return String(n)
+}
+
+function pricesChanged(oldPrices, newPrices, oldPriceAvailable) {
+  if (!oldPriceAvailable) return newPrices.some((price) => Number(price || 0) > 0)
+  return PRICE_FIELDS.some((_, index) => Number(oldPrices[index] || 0) !== Number(newPrices[index] || 0))
 }
 
 function percentValue(value) {
@@ -65,6 +94,42 @@ function priceObject(row, prefix = '') {
   return Object.fromEntries(PRICE_FIELDS.map((field) => [field, clean(row[`${prefix}${field}`])]))
 }
 
+function otherPriceFilter(alias = 'op') {
+  return `
+  COALESCE(${alias}.status, 1) = 1
+  AND COALESCE(${alias}.to_date, 'infinity'::date) >= CURRENT_DATE
+  AND (
+    COALESCE(${alias}.price_type, 1) <> 1
+    OR COALESCE(${alias}.cust_code, '') <> ''
+    OR COALESCE(${alias}.cust_group_1, '') <> ''
+    OR COALESCE(${alias}.cust_group_2, '') <> ''
+    OR COALESCE(${alias}.from_qty, 0) <> 0
+    OR COALESCE(${alias}.to_qty, 0) <> 0
+  )
+`
+}
+
+function otherPriceSummarySelect(itemCodeExpr = 'u.item_code') {
+  return `LEFT JOIN LATERAL (
+         SELECT
+           COUNT(*)::int AS other_price_count,
+           COUNT(*) FILTER (
+             WHERE COALESCE(op.price_type, 1) = 3 OR COALESCE(op.cust_code, '') <> ''
+           )::int AS customer_price_count,
+           COUNT(*) FILTER (
+             WHERE COALESCE(op.price_type, 1) = 2
+               OR COALESCE(op.cust_group_1, '') <> ''
+               OR COALESCE(op.cust_group_2, '') <> ''
+           )::int AS group_price_count,
+           COUNT(*) FILTER (
+             WHERE COALESCE(op.from_qty, 0) <> 0 OR COALESCE(op.to_qty, 0) <> 0
+           )::int AS qty_price_count
+         FROM ic_inventory_price op
+         WHERE op.ic_code = ${itemCodeExpr}
+           AND ${otherPriceFilter('op')}
+       ) other_prices ON true`
+}
+
 async function ensureFormulaHistorySchema(client) {
   if (formulaHistorySchemaReady) return
 
@@ -88,6 +153,8 @@ async function ensureFormulaHistorySchema(client) {
       unit_code character varying(25) DEFAULT ''::character varying,
       sale_type smallint DEFAULT 0,
       tax_type smallint DEFAULT 0,
+      formula_category_code character varying(25) DEFAULT ''::character varying,
+      formula_category_name character varying(255) DEFAULT ''::character varying,
       old_price_available boolean DEFAULT false,
       old_price_0 numeric DEFAULT 0.0,
       old_price_1 numeric DEFAULT 0.0,
@@ -123,6 +190,8 @@ async function ensureFormulaHistorySchema(client) {
       unit_code character varying(25) DEFAULT ''::character varying,
       sale_type smallint DEFAULT 0,
       tax_type smallint DEFAULT 0,
+      formula_category_code character varying(25) DEFAULT ''::character varying,
+      formula_category_name character varying(255) DEFAULT ''::character varying,
       old_price_available boolean DEFAULT false,
       old_price_0 numeric DEFAULT 0.0,
       old_price_1 numeric DEFAULT 0.0,
@@ -159,6 +228,14 @@ async function ensureFormulaHistorySchema(client) {
       ADD COLUMN IF NOT EXISTS old_price_available boolean DEFAULT false;
     ALTER TABLE public.pc_formular_doc_detail_temp_log
       ADD COLUMN IF NOT EXISTS old_price_available boolean DEFAULT false;
+    ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS formula_category_code character varying(25) DEFAULT ''::character varying;
+    ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS formula_category_name character varying(255) DEFAULT ''::character varying;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS formula_category_code character varying(25) DEFAULT ''::character varying;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS formula_category_name character varying(255) DEFAULT ''::character varying;
     ${PRICE_FIELDS.map((field) => `
     ALTER TABLE public.pc_formular_doc_detail_temp
       ADD COLUMN IF NOT EXISTS old_${field} numeric DEFAULT 0.0;
@@ -247,7 +324,7 @@ router.get('/margin-master', async (req, res) => {
 router.put('/margin-master', async (req, res) => {
   const items = Array.isArray(req.body.items) ? req.body.items : []
   if (!items.length) return res.status(400).json({ error: 'ไม่มีรายการ master margin สำหรับบันทึก' })
-  if (items.length > 500) return res.status(400).json({ error: 'บันทึก master margin ได้ไม่เกิน 500 หมวดต่อครั้ง' })
+  if (items.length > 2000) return res.status(400).json({ error: 'บันทึก master margin ได้ไม่เกิน 2,000 หมวดต่อครั้ง' })
 
   const normalized = []
   for (const item of items) {
@@ -424,9 +501,9 @@ router.post('/items-from-documents', async (req, res) => {
            COALESCE(cat.name_1, '') AS category_name,
            COALESCE(i.group_main, '') AS group_main,
            COALESCE(d.vat_type, i.tax_type, 0) AS vat_type,
-           COALESCE(d.price_exclude_vat, 0) AS purchase_price,
+           (COALESCE(d.price, 0) + COALESCE(d.total_vat_value, 0)) AS purchase_price,
            COALESCE(d.price_exclude_vat, 0) AS price_exclude_vat,
-           COALESCE(d.price, 0) AS price_include_vat,
+           (COALESCE(d.price, 0) + COALESCE(d.total_vat_value, 0)) AS price_include_vat,
            COALESCE(d.qty, 0) AS qty
          FROM selected s
          JOIN ic_trans t ON t.doc_no = s.doc_no AND t.trans_flag = s.trans_flag
@@ -523,6 +600,10 @@ router.post('/items-from-documents', async (req, res) => {
          COALESCE(ru.source_unit_ratio, ri.source_unit_ratio, 1) AS source_unit_ratio,
          COALESCE(ru.trans_flag, ri.trans_flag, 0) AS source_trans_flag,
          COALESCE(ru.doc_date, ri.doc_date) AS source_doc_date,
+         COALESCE(other_prices.other_price_count, 0) AS other_price_count,
+         COALESCE(other_prices.customer_price_count, 0) AS customer_price_count,
+         COALESCE(other_prices.group_price_count, 0) AS group_price_count,
+         COALESCE(other_prices.qty_price_count, 0) AS qty_price_count,
          s.source_docs,
          s.source_doc_count,
          s.source_line_count,
@@ -536,6 +617,7 @@ router.post('/items-from-documents', async (req, res) => {
         AND f.unit_code = u.unit_code
         AND f.sale_type = 0::smallint
         AND f.tax_type = COALESCE(ru.vat_type, ri.vat_type, 0)::smallint
+       ${otherPriceSummarySelect('u.item_code')}
        ORDER BY u.item_code, u.unit_row_order, u.unit_code`,
       params,
     )
@@ -556,6 +638,193 @@ router.post('/items-from-documents', async (req, res) => {
     })
 
     res.json({ data, count: data.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/formula-products', async (req, res) => {
+  const query = clean(req.query.q)
+  const categoryCode = clean(req.query.category_code)
+  const tokens = query.split(/\s+/).map(clean).filter(Boolean).slice(0, 8)
+
+  const params = []
+  const where = [
+    `COALESCE(f.ic_code, '') <> ''`,
+    `COALESCE(f.unit_code, '') <> ''`,
+    `COALESCE(f.sale_type, 0) = 0`,
+  ]
+  const tokenMatches = []
+  const anchorMatches = []
+  for (const token of tokens) {
+    const patterns = searchTokenPatterns(token)
+    if (!patterns.length) continue
+    params.push(patterns)
+    const match = `(
+      lower(COALESCE(f.ic_code, '')) LIKE ANY($${params.length}::text[])
+      OR lower(COALESCE(i.name_1, '')) LIKE ANY($${params.length}::text[])
+    )`
+    tokenMatches.push(match)
+    if (isAnchorSearchToken(token)) anchorMatches.push(match)
+  }
+  if (anchorMatches.length) where.push(`(${anchorMatches.join(' OR ')})`)
+  else if (tokenMatches.length) where.push(`(${tokenMatches.join(' OR ')})`)
+  if (categoryCode) {
+    params.push(categoryCode)
+    where.push(`COALESCE(i.item_category, '') = $${params.length}`)
+  }
+  const matchScore = tokenMatches.length
+    ? tokenMatches.map((match) => `CASE WHEN ${match} THEN 1 ELSE 0 END`).join(' + ')
+    : '0'
+
+  try {
+    const result = await posDB.query(
+      `SELECT
+         f.ic_code AS item_code,
+         COALESCE(i.name_1, '') AS item_name,
+         COALESCE(i.item_category, '') AS category_code,
+         COALESCE(cat.name_1, '') AS category_name,
+         COALESCE(i.group_main, '') AS group_main,
+         COUNT(*)::int AS formula_count,
+         COUNT(DISTINCT f.unit_code)::int AS unit_count,
+         STRING_AGG(DISTINCT f.unit_code, ', ' ORDER BY f.unit_code) AS unit_codes,
+         (${matchScore})::int AS match_score
+       FROM ic_inventory_price_formula f
+       LEFT JOIN ic_inventory i ON i.code = f.ic_code
+       LEFT JOIN ic_category cat ON cat.code = i.item_category
+       WHERE ${where.join(' AND ')}
+       GROUP BY f.ic_code, i.name_1, i.item_category, cat.name_1, i.group_main
+       ORDER BY match_score DESC, f.ic_code`,
+      params,
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/items-from-products', async (req, res) => {
+  const rawProducts = Array.isArray(req.body.products) ? req.body.products : []
+  const productCodes = [...new Set(rawProducts
+    .map((item) => clean(item.item_code || item.code || item))
+    .filter(Boolean))]
+
+  if (!productCodes.length) return res.status(400).json({ error: 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ' })
+
+  const params = [productCodes]
+  try {
+    const result = await posDB.query(
+      `WITH selected AS (
+         SELECT unnest($1::text[]) AS item_code
+       )
+       SELECT
+         f.ic_code AS item_code,
+         COALESCE(i.name_1, '') AS item_name,
+         f.unit_code,
+         COALESCE(i.item_category, '') AS category_code,
+         COALESCE(cat.name_1, '') AS category_name,
+         COALESCE(i.group_main, '') AS group_main,
+         COALESCE(f.tax_type, 0) AS vat_type,
+         COALESCE(u.row_order, 0) AS unit_row_order,
+         COALESCE(u.ratio, 1) AS unit_ratio,
+         COALESCE(u.stand_value, 1) AS stand_value,
+         COALESCE(u.divide_value, 1) AS divide_value,
+         0::numeric AS purchase_price,
+         0::numeric AS price_exclude_vat,
+         0::numeric AS price_include_vat,
+         0::numeric AS qty,
+         '' AS source_doc_no,
+         f.unit_code AS source_unit_code,
+         COALESCE(u.ratio, 1) AS source_unit_ratio,
+         0 AS source_trans_flag,
+         NULL::date AS source_doc_date,
+         'ราคาตามสูตร' AS source_docs,
+         0::int AS source_doc_count,
+         COUNT(*) OVER (PARTITION BY f.ic_code)::int AS source_line_count,
+         COALESCE(other_prices.other_price_count, 0) AS other_price_count,
+         COALESCE(other_prices.customer_price_count, 0) AS customer_price_count,
+         COALESCE(other_prices.group_price_count, 0) AS group_price_count,
+         COALESCE(other_prices.qty_price_count, 0) AS qty_price_count,
+         ${priceSelect('f', 'old_')}
+       FROM selected s
+       JOIN ic_inventory_price_formula f ON f.ic_code = s.item_code
+       LEFT JOIN ic_inventory i ON i.code = f.ic_code
+       LEFT JOIN ic_category cat ON cat.code = i.item_category
+       LEFT JOIN ic_unit_use u ON u.ic_code = f.ic_code AND u.code = f.unit_code
+       ${otherPriceSummarySelect('f.ic_code')}
+       WHERE COALESCE(f.sale_type, 0) = 0
+         AND COALESCE(f.ic_code, '') <> ''
+         AND COALESCE(f.unit_code, '') <> ''
+       ORDER BY f.ic_code, COALESCE(u.row_order, 0), f.unit_code, COALESCE(f.tax_type, 0)`,
+      params,
+    )
+
+    const data = result.rows.map((row) => {
+      const oldPrices = {}
+      const newPrices = {}
+      for (const field of PRICE_FIELDS) {
+        const oldValue = clean(row[`old_${field}`])
+        oldPrices[field] = oldValue
+        newPrices[field] = oldValue || '0'
+      }
+      return {
+        ...row,
+        old_prices: oldPrices,
+        new_prices: newPrices,
+      }
+    })
+
+    res.json({ data, count: data.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/other-prices', async (req, res) => {
+  const itemCode = clean(req.query.item_code)
+  const unitCode = clean(req.query.unit_code)
+  if (!itemCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+
+  const params = [itemCode]
+  const unitOrder = unitCode ? 'CASE WHEN ip.unit_code = $2 THEN 0 ELSE 1 END,' : ''
+  if (unitCode) params.push(unitCode)
+
+  try {
+    const result = await posDB.query(
+      `SELECT
+         ip.roworder,
+         ip.ic_code AS item_code,
+         COALESCE(i.name_1, '') AS item_name,
+         ip.unit_code,
+         COALESCE(ip.price_mode, 0) AS price_mode,
+         COALESCE(ip.price_type, 0) AS price_type,
+         COALESCE(ip.sale_type, 0) AS sale_type,
+         COALESCE(ip.transport_type, 0) AS transport_type,
+         COALESCE(ip.from_qty, 0) AS from_qty,
+         COALESCE(ip.to_qty, 0) AS to_qty,
+         ip.from_date::date AS from_date,
+         ip.to_date::date AS to_date,
+         COALESCE(ip.sale_price1, 0) AS sale_price1,
+         COALESCE(ip.sale_price2, 0) AS sale_price2,
+         COALESCE(ip.cust_code, '') AS cust_code,
+         COALESCE(ar.name_1, '') AS cust_name,
+         COALESCE(ip.cust_group_1, '') AS cust_group_1,
+         COALESCE(ip.cust_group_2, '') AS cust_group_2,
+         COALESCE(ip.status, 0) AS status,
+         COALESCE(ip.creator_code, '') AS creator_code,
+         COALESCE(ip.doc_no, '') AS doc_no,
+         COALESCE(TO_CHAR(ip.create_date_time_now, 'YYYY-MM-DD'), '') AS doc_date,
+         COALESCE(TO_CHAR(ip.create_date_time_now, 'HH24:MI'), '') AS doc_time
+       FROM ic_inventory_price ip
+       LEFT JOIN ic_inventory i ON i.code = ip.ic_code
+       LEFT JOIN ar_customer ar ON ar.code = ip.cust_code
+       WHERE ip.ic_code = $1
+         AND ${otherPriceFilter('ip')}
+       ORDER BY ${unitOrder} ip.price_type, ip.unit_code, ip.from_qty, ip.to_qty, ip.create_date_time_now DESC
+       LIMIT 500`,
+      params,
+    )
+    res.json({ data: result.rows, count: result.rowCount })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -610,6 +879,8 @@ router.get('/history/:docNo/details', async (req, res) => {
          d.unit_code,
          d.sale_type,
          d.tax_type,
+         COALESCE(d.formula_category_code, '') AS formula_category_code,
+         COALESCE(d.formula_category_name, '') AS formula_category_name,
          d.command,
          COALESCE(d.old_price_available, false) AS old_price_available,
          d.create_date_time_now,
@@ -648,6 +919,8 @@ router.post('/save', async (req, res) => {
     const icCode = clean(item.item_code)
     const unitCode = clean(item.unit_code)
     const taxType = intValue(item.tax_type ?? item.vat_type, 0)
+    const formulaCategoryCode = clean(item.formula_category_code || item.selected_category_code).slice(0, 25)
+    const formulaCategoryName = clean(item.formula_category_name || item.selected_category_name).slice(0, 255)
     if (!icCode || !unitCode) return res.status(400).json({ error: 'พบรายการที่ไม่มีรหัสสินค้าหรือหน่วยนับ' })
 
     const prices = PRICE_FIELDS.map((field) => numericValue(item[field]))
@@ -655,7 +928,7 @@ router.post('/save', async (req, res) => {
       return res.status(400).json({ error: `ราคาของสินค้า ${icCode} ต้องเป็นตัวเลขและไม่ติดลบ` })
     }
 
-    normalizedItems.push({ icCode, unitCode, taxType, prices })
+    normalizedItems.push({ icCode, unitCode, taxType, formulaCategoryCode, formulaCategoryName, prices })
   }
 
   const client = await posDB.connect()
@@ -690,6 +963,8 @@ router.post('/save', async (req, res) => {
 
       const command = exists.rowCount ? 'Update' : 'Insert'
       const oldPrices = PRICE_FIELDS.map((field) => numericValue(exists.rows[0]?.[field]))
+      if (!pricesChanged(oldPrices, item.prices, exists.rowCount > 0)) continue
+
       if (exists.rowCount) {
         await client.query(
           `UPDATE ic_inventory_price_formula
@@ -724,6 +999,8 @@ router.post('/save', async (req, res) => {
         item.unitCode,
         saleType,
         item.taxType,
+        item.formulaCategoryCode,
+        item.formulaCategoryName,
         exists.rowCount > 0,
         ...oldPrices,
         ...item.prices,
@@ -734,6 +1011,7 @@ router.post('/save', async (req, res) => {
       await client.query(
         `INSERT INTO pc_formular_doc_detail_temp (
            doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           formula_category_code, formula_category_name,
            old_price_available,
            ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
            ${PRICE_FIELDS.join(', ')}, command
@@ -744,6 +1022,7 @@ router.post('/save', async (req, res) => {
       await client.query(
         `INSERT INTO pc_formular_doc_detail_temp_log (
            doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           formula_category_code, formula_category_name,
            old_price_available,
            ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
            ${PRICE_FIELDS.join(', ')}, command
@@ -753,11 +1032,16 @@ router.post('/save', async (req, res) => {
       )
     }
 
+    if (insertCount + updateCount === 0) {
+      await client.query('ROLLBACK')
+      return res.status(400).json({ error: 'ไม่มีรายการที่มีการเปลี่ยนแปลงราคา' })
+    }
+
     await client.query('COMMIT')
     res.json({
       success: true,
       doc_no: docNo,
-      saved_count: normalizedItems.length,
+      saved_count: insertCount + updateCount,
       insert_count: insertCount,
       update_count: updateCount,
     })
