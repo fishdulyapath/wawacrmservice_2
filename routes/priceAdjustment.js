@@ -1,0 +1,772 @@
+const express = require('express')
+const { posDB } = require('../db')
+const { authMiddleware, requireRole } = require('../middleware/auth')
+
+const router = express.Router()
+
+router.use(authMiddleware, requireRole('admin'))
+
+const PRICE_FIELDS = Array.from({ length: 10 }, (_, i) => `price_${i}`)
+const UNIT_MARGIN_FIELDS = [1, 2, 3, 4]
+const PURCHASE_FLAGS = [12, 310]
+let formulaHistorySchemaReady = false
+let priceMarginSchemaReady = false
+
+function clean(value) {
+  return String(value || '').trim()
+}
+
+function intValue(value, fallback = 0) {
+  const n = Number(value)
+  return Number.isInteger(n) ? n : fallback
+}
+
+function numericValue(value) {
+  const raw = String(value ?? '').replace(/,/g, '').trim()
+  if (!raw) return 0
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return NaN
+  return Math.ceil(n)
+}
+
+function toPriceText(value) {
+  const n = numericValue(value)
+  if (!Number.isFinite(n)) return null
+  return String(n)
+}
+
+function percentValue(value) {
+  const raw = String(value ?? '').replace(/,/g, '').trim()
+  if (!raw) return 0
+  const n = Number(raw)
+  return Number.isFinite(n) ? Math.round(n * 10000) / 10000 : NaN
+}
+
+function formatDocNo(date = new Date()) {
+  const pad = (n, len = 2) => String(n).padStart(len, '0')
+  const stamp = [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+    pad(date.getMilliseconds(), 3),
+  ].join('')
+  const suffix = pad(Math.floor(Math.random() * 100), 2)
+  return `CRMPR${stamp}${suffix}`.slice(0, 25)
+}
+
+function priceSelect(alias = 'f', prefix = '') {
+  return PRICE_FIELDS.map((field) => `COALESCE(${alias}.${field}::text, '') AS ${prefix}${field}`).join(',\n         ')
+}
+
+function priceObject(row, prefix = '') {
+  return Object.fromEntries(PRICE_FIELDS.map((field) => [field, clean(row[`${prefix}${field}`])]))
+}
+
+async function ensureFormulaHistorySchema(client) {
+  if (formulaHistorySchemaReady) return
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.pc_formular_doc_temp (
+      roworder serial,
+      doc_no character varying(255) NOT NULL,
+      doc_date date DEFAULT now(),
+      creator_code character varying(255),
+      remark character varying(255),
+      create_datetime timestamp without time zone DEFAULT now(),
+      CONSTRAINT pc_formular_doc_temp_pk PRIMARY KEY (doc_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS public.pc_formular_doc_detail_temp (
+      roworder serial,
+      doc_no character varying(25) DEFAULT ''::character varying,
+      doc_date date,
+      creator_code character varying(25) DEFAULT ''::character varying,
+      ic_code character varying(25) NOT NULL DEFAULT ''::character varying,
+      unit_code character varying(25) DEFAULT ''::character varying,
+      sale_type smallint DEFAULT 0,
+      tax_type smallint DEFAULT 0,
+      old_price_available boolean DEFAULT false,
+      old_price_0 numeric DEFAULT 0.0,
+      old_price_1 numeric DEFAULT 0.0,
+      old_price_2 numeric DEFAULT 0.0,
+      old_price_3 numeric DEFAULT 0.0,
+      old_price_4 numeric DEFAULT 0.0,
+      old_price_5 numeric DEFAULT 0.0,
+      old_price_6 numeric DEFAULT 0.0,
+      old_price_7 numeric DEFAULT 0.0,
+      old_price_8 numeric DEFAULT 0.0,
+      old_price_9 numeric DEFAULT 0.0,
+      price_0 numeric DEFAULT 0.0,
+      price_1 numeric DEFAULT 0.0,
+      price_2 numeric DEFAULT 0.0,
+      price_3 numeric DEFAULT 0.0,
+      price_4 numeric DEFAULT 0.0,
+      price_5 numeric DEFAULT 0.0,
+      price_6 numeric DEFAULT 0.0,
+      price_7 numeric DEFAULT 0.0,
+      price_8 numeric DEFAULT 0.0,
+      price_9 numeric DEFAULT 0.0,
+      create_date_time_now timestamp without time zone NOT NULL DEFAULT now(),
+      command character varying(255),
+      CONSTRAINT pc_formular_doc_detail_temp_pkey PRIMARY KEY (roworder)
+    );
+
+    CREATE TABLE IF NOT EXISTS public.pc_formular_doc_detail_temp_log (
+      roworder serial,
+      doc_no character varying(25) DEFAULT ''::character varying,
+      doc_date date,
+      creator_code character varying(25) DEFAULT ''::character varying,
+      ic_code character varying(25) NOT NULL DEFAULT ''::character varying,
+      unit_code character varying(25) DEFAULT ''::character varying,
+      sale_type smallint DEFAULT 0,
+      tax_type smallint DEFAULT 0,
+      old_price_available boolean DEFAULT false,
+      old_price_0 numeric DEFAULT 0.0,
+      old_price_1 numeric DEFAULT 0.0,
+      old_price_2 numeric DEFAULT 0.0,
+      old_price_3 numeric DEFAULT 0.0,
+      old_price_4 numeric DEFAULT 0.0,
+      old_price_5 numeric DEFAULT 0.0,
+      old_price_6 numeric DEFAULT 0.0,
+      old_price_7 numeric DEFAULT 0.0,
+      old_price_8 numeric DEFAULT 0.0,
+      old_price_9 numeric DEFAULT 0.0,
+      price_0 numeric DEFAULT 0.0,
+      price_1 numeric DEFAULT 0.0,
+      price_2 numeric DEFAULT 0.0,
+      price_3 numeric DEFAULT 0.0,
+      price_4 numeric DEFAULT 0.0,
+      price_5 numeric DEFAULT 0.0,
+      price_6 numeric DEFAULT 0.0,
+      price_7 numeric DEFAULT 0.0,
+      price_8 numeric DEFAULT 0.0,
+      price_9 numeric DEFAULT 0.0,
+      create_date_time_now timestamp without time zone NOT NULL DEFAULT now(),
+      command character varying(255),
+      CONSTRAINT pc_formular_doc_detail_temp_log_pkey PRIMARY KEY (roworder)
+    );
+  `)
+
+  await client.query(`
+    ALTER TABLE public.ic_inventory_price_formula
+      ADD COLUMN IF NOT EXISTS doc_no character varying(255);
+    ALTER TABLE public.ic_inventory_price_formula
+      ADD COLUMN IF NOT EXISTS creator_code character varying(255);
+    ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS old_price_available boolean DEFAULT false;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS old_price_available boolean DEFAULT false;
+    ${PRICE_FIELDS.map((field) => `
+    ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS old_${field} numeric DEFAULT 0.0;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS old_${field} numeric DEFAULT 0.0;`).join('')}
+  `)
+
+  formulaHistorySchemaReady = true
+}
+
+async function ensurePriceMarginSchema(client) {
+  if (priceMarginSchemaReady) return
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.crm_price_margin_category (
+      category_code character varying(25) PRIMARY KEY,
+      category_name character varying(255) NOT NULL DEFAULT '',
+      price_0_margin numeric NOT NULL DEFAULT 0,
+      price_1_margin numeric NOT NULL DEFAULT 0,
+      price_2_margin numeric NOT NULL DEFAULT 0,
+      price_3_margin numeric NOT NULL DEFAULT 0,
+      price_4_margin numeric NOT NULL DEFAULT 0,
+      price_5_margin numeric NOT NULL DEFAULT 0,
+      price_6_margin numeric NOT NULL DEFAULT 0,
+      price_7_margin numeric NOT NULL DEFAULT 0,
+      price_8_margin numeric NOT NULL DEFAULT 0,
+      price_9_margin numeric NOT NULL DEFAULT 0,
+      unit_1_margin numeric NOT NULL DEFAULT 0,
+      unit_2_margin numeric NOT NULL DEFAULT 0,
+      unit_3_margin numeric NOT NULL DEFAULT 0,
+      unit_4_margin numeric NOT NULL DEFAULT 0,
+      create_datetime timestamp without time zone NOT NULL DEFAULT now(),
+      last_update_date_time timestamp without time zone NOT NULL DEFAULT now(),
+      create_code character varying(50) NOT NULL DEFAULT '',
+      last_update_code character varying(50) NOT NULL DEFAULT ''
+    );
+  `)
+
+  priceMarginSchemaReady = true
+}
+
+function marginSelect(alias = 'm') {
+  return [
+    ...PRICE_FIELDS.map((field) => `COALESCE(${alias}.${field}_margin, 0) AS ${field}_margin`),
+    ...UNIT_MARGIN_FIELDS.map((field) => `COALESCE(${alias}.unit_${field}_margin, 0) AS unit_${field}_margin`),
+  ].join(',\n         ')
+}
+
+router.get('/margin-master', async (req, res) => {
+  const rawCodes = clean(req.query.category_codes)
+  const categoryCodes = rawCodes
+    ? rawCodes.split(',').map(clean).filter(Boolean).slice(0, 500)
+    : []
+
+  const client = await posDB.connect()
+  try {
+    await ensurePriceMarginSchema(client)
+
+    const params = []
+    const where = ['COALESCE(c.code, \'\') <> \'\'']
+    if (categoryCodes.length) {
+      params.push(categoryCodes)
+      where.push(`c.code = ANY($${params.length}::text[])`)
+    }
+
+    const result = await client.query(
+      `SELECT
+         c.code AS category_code,
+         COALESCE(c.name_1, '') AS category_name,
+         ${marginSelect('m')}
+       FROM ic_category c
+       LEFT JOIN crm_price_margin_category m ON m.category_code = c.code
+       WHERE ${where.join(' AND ')}
+       ORDER BY c.code`,
+      params,
+    )
+
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
+  }
+})
+
+router.put('/margin-master', async (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : []
+  if (!items.length) return res.status(400).json({ error: 'ไม่มีรายการ master margin สำหรับบันทึก' })
+  if (items.length > 500) return res.status(400).json({ error: 'บันทึก master margin ได้ไม่เกิน 500 หมวดต่อครั้ง' })
+
+  const normalized = []
+  for (const item of items) {
+    const categoryCode = clean(item.category_code)
+    if (!categoryCode) return res.status(400).json({ error: 'พบรายการ master margin ที่ไม่มีรหัสหมวดสินค้า' })
+
+    const priceMargins = PRICE_FIELDS.map((field) => percentValue(item[`${field}_margin`]))
+    const unitMargins = UNIT_MARGIN_FIELDS.map((field) => percentValue(item[`unit_${field}_margin`]))
+    if ([...priceMargins, ...unitMargins].some((n) => !Number.isFinite(n))) {
+      return res.status(400).json({ error: `margin ของหมวด ${categoryCode} ต้องเป็นตัวเลข` })
+    }
+
+    normalized.push({
+      categoryCode,
+      categoryName: clean(item.category_name).slice(0, 255),
+      priceMargins,
+      unitMargins,
+    })
+  }
+
+  const client = await posDB.connect()
+  try {
+    await client.query('BEGIN')
+    await ensurePriceMarginSchema(client)
+
+    for (const item of normalized) {
+      await client.query(
+        `INSERT INTO crm_price_margin_category (
+           category_code,
+           category_name,
+           ${PRICE_FIELDS.map((field) => `${field}_margin`).join(', ')},
+           ${UNIT_MARGIN_FIELDS.map((field) => `unit_${field}_margin`).join(', ')},
+           create_code,
+           last_update_code
+         )
+         VALUES (
+           $1, $2,
+           ${PRICE_FIELDS.map((_, index) => `$${index + 3}`).join(', ')},
+           ${UNIT_MARGIN_FIELDS.map((_, index) => `$${index + 13}`).join(', ')},
+           $17, $17
+         )
+         ON CONFLICT (category_code) DO UPDATE SET
+           category_name = EXCLUDED.category_name,
+           ${PRICE_FIELDS.map((field) => `${field}_margin = EXCLUDED.${field}_margin`).join(', ')},
+           ${UNIT_MARGIN_FIELDS.map((field) => `unit_${field}_margin = EXCLUDED.unit_${field}_margin`).join(', ')},
+           last_update_date_time = now(),
+           last_update_code = EXCLUDED.last_update_code`,
+        [
+          item.categoryCode,
+          item.categoryName,
+          ...item.priceMargins,
+          ...item.unitMargins,
+          clean(req.user?.code),
+        ],
+      )
+    }
+
+    await client.query('COMMIT')
+    res.json({ success: true, saved_count: normalized.length })
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
+  }
+})
+
+router.get('/documents', async (req, res) => {
+  const fromDate = clean(req.query.from_date)
+  const toDate = clean(req.query.to_date)
+  const docNo = clean(req.query.doc_no)
+  const docNoFrom = clean(req.query.doc_no_from)
+  const docNoTo = clean(req.query.doc_no_to)
+  const limit = Math.min(500, Math.max(1, intValue(req.query.limit, 200)))
+
+  const params = []
+  const where = [
+    't.trans_flag IN (12, 310)',
+    'COALESCE(t.last_status, 0) = 0',
+  ]
+
+  if (fromDate) {
+    params.push(fromDate)
+    where.push(`t.doc_date >= $${params.length}::date`)
+  }
+  if (toDate) {
+    params.push(toDate)
+    where.push(`t.doc_date <= $${params.length}::date`)
+  }
+  if (docNo) {
+    params.push(`%${docNo}%`)
+    where.push(`t.doc_no ILIKE $${params.length}`)
+  }
+  if (docNoFrom) {
+    params.push(docNoFrom)
+    where.push(`t.doc_no >= $${params.length}`)
+  }
+  if (docNoTo) {
+    params.push(docNoTo)
+    where.push(`t.doc_no <= $${params.length}`)
+  }
+  params.push(limit)
+
+  try {
+    const result = await posDB.query(
+      `SELECT
+         t.doc_no,
+         t.doc_date::date AS doc_date,
+         t.trans_flag,
+         CASE t.trans_flag WHEN 12 THEN 'ซื้อ' WHEN 310 THEN 'รับสินค้า' ELSE t.trans_flag::text END AS trans_name,
+         COALESCE(t.cust_code, '') AS supplier_code,
+         COALESCE(ap.name_1, '') AS supplier_name,
+         COALESCE(t.total_amount, 0) AS total_amount,
+         COALESCE(t.creator_code, '') AS creator_code,
+         COALESCE(t.remark, '') AS remark,
+         COALESCE(line_stats.line_count, 0)::int AS line_count,
+         COALESCE(line_stats.item_count, 0)::int AS item_count
+       FROM ic_trans t
+       LEFT JOIN ap_supplier ap ON ap.code = t.cust_code
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*) AS line_count, COUNT(DISTINCT d.item_code) AS item_count
+         FROM ic_trans_detail d
+         WHERE d.doc_no = t.doc_no
+           AND d.trans_flag = t.trans_flag
+           AND COALESCE(d.status, 0) = 0
+           AND COALESCE(d.last_status, 0) = 0
+       ) line_stats ON true
+       WHERE ${where.join(' AND ')}
+       ORDER BY t.doc_date DESC, t.doc_time DESC, t.doc_no DESC
+       LIMIT $${params.length}`,
+      params,
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.post('/items-from-documents', async (req, res) => {
+  const rawDocs = Array.isArray(req.body.documents) ? req.body.documents : []
+
+  const docs = rawDocs
+    .map((doc) => ({
+      doc_no: clean(doc.doc_no),
+      trans_flag: intValue(doc.trans_flag, 0),
+    }))
+    .filter((doc) => doc.doc_no && PURCHASE_FLAGS.includes(doc.trans_flag))
+
+  if (!docs.length) return res.status(400).json({ error: 'กรุณาเลือกเอกสารอย่างน้อย 1 ใบ' })
+  if (docs.length > 200) return res.status(400).json({ error: 'เลือกเอกสารได้ไม่เกิน 200 ใบต่อครั้ง' })
+
+  const params = []
+  const values = docs.map((doc) => {
+    params.push(doc.doc_no, doc.trans_flag)
+    return `($${params.length - 1}::text, $${params.length}::smallint)`
+  }).join(', ')
+
+  try {
+    const result = await posDB.query(
+      `WITH selected(doc_no, trans_flag) AS (
+         VALUES ${values}
+       ),
+       detail_rows AS (
+         SELECT
+           d.roworder,
+           d.doc_no,
+           d.trans_flag,
+           d.doc_date::date AS doc_date,
+           d.item_code,
+           COALESCE(d.item_name, i.name_1, '') AS item_name,
+           d.unit_code AS source_unit_code,
+           COALESCE(du.ratio, d.ratio, 1) AS source_unit_ratio,
+           COALESCE(i.item_category, '') AS category_code,
+           COALESCE(cat.name_1, '') AS category_name,
+           COALESCE(i.group_main, '') AS group_main,
+           COALESCE(d.vat_type, i.tax_type, 0) AS vat_type,
+           COALESCE(d.price_exclude_vat, 0) AS purchase_price,
+           COALESCE(d.price_exclude_vat, 0) AS price_exclude_vat,
+           COALESCE(d.price, 0) AS price_include_vat,
+           COALESCE(d.qty, 0) AS qty
+         FROM selected s
+         JOIN ic_trans t ON t.doc_no = s.doc_no AND t.trans_flag = s.trans_flag
+         JOIN ic_trans_detail d ON d.doc_no = t.doc_no AND d.trans_flag = t.trans_flag
+         LEFT JOIN ic_inventory i ON i.code = d.item_code
+         LEFT JOIN ic_category cat ON cat.code = i.item_category
+         LEFT JOIN ic_unit_use du ON du.ic_code = d.item_code AND du.code = d.unit_code
+         WHERE t.trans_flag IN (12, 310)
+           AND COALESCE(t.last_status, 0) = 0
+           AND COALESCE(d.status, 0) = 0
+           AND COALESCE(d.last_status, 0) = 0
+           AND COALESCE(d.item_code, '') <> ''
+           AND COALESCE(d.unit_code, '') <> ''
+       ),
+       unit_rows AS (
+         SELECT
+           u.ic_code AS item_code,
+           u.code AS unit_code,
+           COALESCE(u.row_order, 0) AS unit_row_order,
+           COALESCE(u.ratio, 1) AS unit_ratio,
+           COALESCE(u.stand_value, 1) AS stand_value,
+           COALESCE(u.divide_value, 1) AS divide_value
+         FROM ic_unit_use u
+         JOIN (SELECT DISTINCT item_code FROM detail_rows) i ON i.item_code = u.ic_code
+         WHERE COALESCE(u.code, '') <> ''
+         UNION
+         SELECT DISTINCT
+           item_code,
+           source_unit_code AS unit_code,
+           0 AS unit_row_order,
+           COALESCE(source_unit_ratio, 1) AS unit_ratio,
+           1 AS stand_value,
+           1 AS divide_value
+         FROM detail_rows d
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM ic_unit_use u
+           WHERE u.ic_code = d.item_code
+             AND u.code = d.source_unit_code
+         )
+       ),
+       ranked_by_unit AS (
+         SELECT *,
+           ROW_NUMBER() OVER (
+             PARTITION BY item_code, source_unit_code
+             ORDER BY purchase_price DESC, doc_date DESC, doc_no DESC, roworder DESC
+           ) AS rn
+         FROM detail_rows
+       ),
+       ranked_by_item AS (
+         SELECT *,
+           ROW_NUMBER() OVER (
+             PARTITION BY item_code
+             ORDER BY purchase_price DESC, doc_date DESC, doc_no DESC, roworder DESC
+           ) AS rn
+         FROM detail_rows
+       ),
+       sources AS (
+         SELECT
+           item_code,
+           COUNT(*)::int AS source_line_count,
+           COUNT(DISTINCT doc_no)::int AS source_doc_count,
+           STRING_AGG(DISTINCT doc_no, ', ') AS source_docs
+         FROM detail_rows
+         GROUP BY item_code
+       )
+       SELECT
+         u.item_code,
+         COALESCE(ru.item_name, ri.item_name, '') AS item_name,
+         u.unit_code,
+         COALESCE(ru.category_code, ri.category_code, '') AS category_code,
+         COALESCE(ru.category_name, ri.category_name, '') AS category_name,
+         COALESCE(ru.group_main, ri.group_main, '') AS group_main,
+         COALESCE(ru.vat_type, ri.vat_type, 0) AS vat_type,
+         u.unit_row_order,
+         u.unit_ratio,
+         u.stand_value,
+         u.divide_value,
+         CASE
+           WHEN ru.item_code IS NOT NULL THEN ru.purchase_price
+           ELSE ROUND(COALESCE(ri.purchase_price, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS purchase_price,
+         CASE
+           WHEN ru.item_code IS NOT NULL THEN ru.price_exclude_vat
+           ELSE ROUND(COALESCE(ri.price_exclude_vat, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS price_exclude_vat,
+         CASE
+           WHEN ru.item_code IS NOT NULL THEN ru.price_include_vat
+           ELSE ROUND(COALESCE(ri.price_include_vat, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS price_include_vat,
+         COALESCE(ru.qty, ri.qty, 0) AS qty,
+         COALESCE(ru.doc_no, ri.doc_no, '') AS source_doc_no,
+         COALESCE(ru.source_unit_code, ri.source_unit_code, '') AS source_unit_code,
+         COALESCE(ru.source_unit_ratio, ri.source_unit_ratio, 1) AS source_unit_ratio,
+         COALESCE(ru.trans_flag, ri.trans_flag, 0) AS source_trans_flag,
+         COALESCE(ru.doc_date, ri.doc_date) AS source_doc_date,
+         s.source_docs,
+         s.source_doc_count,
+         s.source_line_count,
+         ${priceSelect('f', 'old_')}
+       FROM unit_rows u
+       JOIN sources s ON s.item_code = u.item_code
+       LEFT JOIN ranked_by_unit ru ON ru.item_code = u.item_code AND ru.source_unit_code = u.unit_code AND ru.rn = 1
+       LEFT JOIN ranked_by_item ri ON ri.item_code = u.item_code AND ri.rn = 1
+       LEFT JOIN ic_inventory_price_formula f
+         ON f.ic_code = u.item_code
+        AND f.unit_code = u.unit_code
+        AND f.sale_type = 0::smallint
+        AND f.tax_type = COALESCE(ru.vat_type, ri.vat_type, 0)::smallint
+       ORDER BY u.item_code, u.unit_row_order, u.unit_code`,
+      params,
+    )
+
+    const data = result.rows.map((row) => {
+      const oldPrices = {}
+      const newPrices = {}
+      for (const field of PRICE_FIELDS) {
+        const oldValue = clean(row[`old_${field}`])
+        oldPrices[field] = oldValue
+        newPrices[field] = oldValue || String(Math.ceil(Number(row.purchase_price || 0)))
+      }
+      return {
+        ...row,
+        old_prices: oldPrices,
+        new_prices: newPrices,
+      }
+    })
+
+    res.json({ data, count: data.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+router.get('/history', async (req, res) => {
+  const limit = Math.min(Math.max(intValue(req.query.limit, 50), 1), 200)
+  const client = await posDB.connect()
+
+  try {
+    await ensureFormulaHistorySchema(client)
+    const result = await client.query(
+      `SELECT
+         h.doc_no,
+         h.doc_date,
+         h.creator_code,
+         h.remark,
+         h.create_datetime,
+         COUNT(d.roworder)::int AS line_count,
+         COUNT(*) FILTER (WHERE d.command = 'Insert')::int AS insert_count,
+         COUNT(*) FILTER (WHERE d.command = 'Update')::int AS update_count
+       FROM pc_formular_doc_temp h
+       LEFT JOIN pc_formular_doc_detail_temp_log d ON d.doc_no = h.doc_no
+       GROUP BY h.doc_no, h.doc_date, h.creator_code, h.remark, h.create_datetime
+       ORDER BY h.create_datetime DESC, h.doc_no DESC
+       LIMIT $1`,
+      [limit],
+    )
+    res.json({ data: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
+  }
+})
+
+router.get('/history/:docNo/details', async (req, res) => {
+  const docNo = clean(req.params.docNo)
+  if (!docNo) return res.status(400).json({ error: 'กรุณาระบุเลขที่เอกสาร' })
+
+  const client = await posDB.connect()
+  try {
+    await ensureFormulaHistorySchema(client)
+    const result = await client.query(
+      `SELECT
+         d.roworder,
+         d.doc_no,
+         d.doc_date,
+         d.creator_code,
+         d.ic_code,
+         COALESCE(i.name_1, '') AS item_name,
+         d.unit_code,
+         d.sale_type,
+         d.tax_type,
+         d.command,
+         COALESCE(d.old_price_available, false) AS old_price_available,
+         d.create_date_time_now,
+         ${PRICE_FIELDS.map((field) => `COALESCE(d.old_${field}, 0) AS old_${field}`).join(',\n         ')},
+         ${PRICE_FIELDS.map((field) => `COALESCE(d.${field}, 0) AS ${field}`).join(',\n         ')}
+       FROM pc_formular_doc_detail_temp_log d
+       LEFT JOIN ic_inventory i ON i.code = d.ic_code
+       WHERE d.doc_no = $1
+       ORDER BY d.roworder
+       LIMIT 2000`,
+      [docNo],
+    )
+    const data = result.rows.map((row) => ({
+      ...row,
+      old_prices: priceObject(row, 'old_'),
+      new_prices: priceObject(row),
+    }))
+    res.json({ data, count: data.length })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
+  }
+})
+
+router.post('/save', async (req, res) => {
+  const saleType = 0
+  const items = Array.isArray(req.body.items) ? req.body.items : []
+  const remark = clean(req.body.remark).slice(0, 255)
+
+  if (!items.length) return res.status(400).json({ error: 'ไม่มีรายการสำหรับบันทึก' })
+  if (items.length > 1000) return res.status(400).json({ error: 'บันทึกได้ไม่เกิน 1,000 รายการต่อครั้ง' })
+
+  const normalizedItems = []
+  for (const item of items) {
+    const icCode = clean(item.item_code)
+    const unitCode = clean(item.unit_code)
+    const taxType = intValue(item.tax_type ?? item.vat_type, 0)
+    if (!icCode || !unitCode) return res.status(400).json({ error: 'พบรายการที่ไม่มีรหัสสินค้าหรือหน่วยนับ' })
+
+    const prices = PRICE_FIELDS.map((field) => numericValue(item[field]))
+    if (prices.some((price) => !Number.isFinite(price))) {
+      return res.status(400).json({ error: `ราคาของสินค้า ${icCode} ต้องเป็นตัวเลขและไม่ติดลบ` })
+    }
+
+    normalizedItems.push({ icCode, unitCode, taxType, prices })
+  }
+
+  const client = await posDB.connect()
+  const docNo = formatDocNo()
+  const docDate = new Date().toISOString().slice(0, 10)
+  const creatorCode = clean(req.user?.code)
+
+  try {
+    await client.query('BEGIN')
+    await ensureFormulaHistorySchema(client)
+
+    await client.query(
+      `INSERT INTO pc_formular_doc_temp (doc_no, doc_date, creator_code, remark)
+       VALUES ($1, $2::date, $3, $4)`,
+      [docNo, docDate, creatorCode, remark],
+    )
+
+    let insertCount = 0
+    let updateCount = 0
+
+    for (const item of normalizedItems) {
+      const exists = await client.query(
+        `SELECT ${PRICE_FIELDS.map((field) => `COALESCE(${field}::text, '0') AS ${field}`).join(', ')}
+         FROM ic_inventory_price_formula
+         WHERE COALESCE(ic_code, '') = COALESCE($1, '')
+           AND COALESCE(unit_code, '') = COALESCE($2, '')
+           AND sale_type = $3
+           AND tax_type = $4
+         LIMIT 1`,
+        [item.icCode, item.unitCode, saleType, item.taxType],
+      )
+
+      const command = exists.rowCount ? 'Update' : 'Insert'
+      const oldPrices = PRICE_FIELDS.map((field) => numericValue(exists.rows[0]?.[field]))
+      if (exists.rowCount) {
+        await client.query(
+          `UPDATE ic_inventory_price_formula
+           SET creator_code = $1,
+               create_date_time_now = now(),
+               doc_no = $2,
+               ${PRICE_FIELDS.map((field, index) => `${field} = $${index + 3}`).join(', ')}
+           WHERE COALESCE(ic_code, '') = COALESCE($13, '')
+             AND COALESCE(unit_code, '') = COALESCE($14, '')
+             AND sale_type = $15
+             AND tax_type = $16`,
+          [creatorCode, docNo, ...item.prices.map(toPriceText), item.icCode, item.unitCode, saleType, item.taxType],
+        )
+        updateCount += 1
+      } else {
+        await client.query(
+          `INSERT INTO ic_inventory_price_formula (
+             ic_code, unit_code, sale_type, tax_type,
+             ${PRICE_FIELDS.join(', ')}, creator_code, doc_no
+           )
+           VALUES ($1, $2, $3, $4, ${PRICE_FIELDS.map((_, index) => `$${index + 5}`).join(', ')}, $15, $16)`,
+          [item.icCode, item.unitCode, saleType, item.taxType, ...item.prices.map(toPriceText), creatorCode, docNo],
+        )
+        insertCount += 1
+      }
+
+      const detailParams = [
+        docNo,
+        docDate,
+        creatorCode,
+        item.icCode,
+        item.unitCode,
+        saleType,
+        item.taxType,
+        exists.rowCount > 0,
+        ...oldPrices,
+        ...item.prices,
+        command,
+      ]
+      const detailValues = detailParams.map((_, index) => `$${index + 1}`).join(', ')
+
+      await client.query(
+        `INSERT INTO pc_formular_doc_detail_temp (
+           doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           old_price_available,
+           ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
+           ${PRICE_FIELDS.join(', ')}, command
+         )
+         VALUES (${detailValues})`,
+        detailParams,
+      )
+      await client.query(
+        `INSERT INTO pc_formular_doc_detail_temp_log (
+           doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           old_price_available,
+           ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
+           ${PRICE_FIELDS.join(', ')}, command
+         )
+         VALUES (${detailValues})`,
+        detailParams,
+      )
+    }
+
+    await client.query('COMMIT')
+    res.json({
+      success: true,
+      doc_no: docNo,
+      saved_count: normalizedItems.length,
+      insert_count: insertCount,
+      update_count: updateCount,
+    })
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    res.status(500).json({ error: err.message })
+  } finally {
+    client.release()
+  }
+})
+
+module.exports = router
