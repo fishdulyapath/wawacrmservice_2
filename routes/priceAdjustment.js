@@ -577,6 +577,8 @@ router.post('/items-from-documents', async (req, res) => {
          COALESCE(ru.category_code, ri.category_code, '') AS category_code,
          COALESCE(ru.category_name, ri.category_name, '') AS category_name,
          COALESCE(ru.group_main, ri.group_main, '') AS group_main,
+         COALESCE(barcode_info.barcode, '') AS barcode,
+         COALESCE(barcode_info.description, '') AS barcode_description,
          COALESCE(ru.vat_type, ri.vat_type, 0) AS vat_type,
          u.unit_row_order,
          u.unit_ratio,
@@ -614,9 +616,18 @@ router.post('/items-from-documents', async (req, res) => {
        LEFT JOIN ranked_by_item ri ON ri.item_code = u.item_code AND ri.rn = 1
        LEFT JOIN ic_inventory_price_formula f
          ON f.ic_code = u.item_code
-        AND f.unit_code = u.unit_code
-        AND f.sale_type = 0::smallint
-        AND f.tax_type = COALESCE(ru.vat_type, ri.vat_type, 0)::smallint
+       AND f.unit_code = u.unit_code
+       AND f.sale_type = 0::smallint
+       AND f.tax_type = COALESCE(ru.vat_type, ri.vat_type, 0)::smallint
+       LEFT JOIN LATERAL (
+         SELECT ib.barcode, COALESCE(ib.description, '') AS description
+         FROM ic_inventory_barcode ib
+         WHERE ib.ic_code = u.item_code
+           AND ib.unit_code = u.unit_code
+           AND COALESCE(ib.barcode, '') <> ''
+         ORDER BY COALESCE(ib.roworder, 0), ib.barcode
+         LIMIT 1
+       ) barcode_info ON true
        ${otherPriceSummarySelect('u.item_code')}
        ORDER BY u.item_code, u.unit_row_order, u.unit_code`,
       params,
@@ -724,6 +735,8 @@ router.post('/items-from-products', async (req, res) => {
          COALESCE(i.item_category, '') AS category_code,
          COALESCE(cat.name_1, '') AS category_name,
          COALESCE(i.group_main, '') AS group_main,
+         COALESCE(barcode_info.barcode, '') AS barcode,
+         COALESCE(barcode_info.description, '') AS barcode_description,
          COALESCE(f.tax_type, 0) AS vat_type,
          COALESCE(u.row_order, 0) AS unit_row_order,
          COALESCE(u.ratio, 1) AS unit_ratio,
@@ -751,6 +764,15 @@ router.post('/items-from-products', async (req, res) => {
        LEFT JOIN ic_inventory i ON i.code = f.ic_code
        LEFT JOIN ic_category cat ON cat.code = i.item_category
        LEFT JOIN ic_unit_use u ON u.ic_code = f.ic_code AND u.code = f.unit_code
+       LEFT JOIN LATERAL (
+         SELECT ib.barcode, COALESCE(ib.description, '') AS description
+         FROM ic_inventory_barcode ib
+         WHERE ib.ic_code = f.ic_code
+           AND ib.unit_code = f.unit_code
+           AND COALESCE(ib.barcode, '') <> ''
+         ORDER BY COALESCE(ib.roworder, 0), ib.barcode
+         LIMIT 1
+       ) barcode_info ON true
        ${otherPriceSummarySelect('f.ic_code')}
        WHERE COALESCE(f.sale_type, 0) = 0
          AND COALESCE(f.ic_code, '') <> ''
@@ -877,6 +899,9 @@ router.get('/history/:docNo/details', async (req, res) => {
          d.ic_code,
          COALESCE(i.name_1, '') AS item_name,
          d.unit_code,
+         COALESCE(barcode_info.barcode, '') AS barcode,
+         COALESCE(barcode_info.description, '') AS barcode_description,
+         COALESCE(u.ratio, 1) AS unit_ratio,
          d.sale_type,
          d.tax_type,
          COALESCE(d.formula_category_code, '') AS formula_category_code,
@@ -888,6 +913,16 @@ router.get('/history/:docNo/details', async (req, res) => {
          ${PRICE_FIELDS.map((field) => `COALESCE(d.${field}, 0) AS ${field}`).join(',\n         ')}
        FROM pc_formular_doc_detail_temp_log d
        LEFT JOIN ic_inventory i ON i.code = d.ic_code
+       LEFT JOIN ic_unit_use u ON u.ic_code = d.ic_code AND u.code = d.unit_code
+       LEFT JOIN LATERAL (
+         SELECT ib.barcode, COALESCE(ib.description, '') AS description
+         FROM ic_inventory_barcode ib
+         WHERE ib.ic_code = d.ic_code
+           AND ib.unit_code = d.unit_code
+           AND COALESCE(ib.barcode, '') <> ''
+         ORDER BY COALESCE(ib.roworder, 0), ib.barcode
+         LIMIT 1
+       ) barcode_info ON true
        WHERE d.doc_no = $1
        ORDER BY d.roworder
        LIMIT 2000`,
