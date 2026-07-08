@@ -71,21 +71,6 @@ function percentValue(value) {
   return Number.isFinite(n) ? Math.round(n * 10000) / 10000 : NaN
 }
 
-function formatDocNo(date = new Date()) {
-  const pad = (n, len = 2) => String(n).padStart(len, '0')
-  const stamp = [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
-    pad(date.getMilliseconds(), 3),
-  ].join('')
-  const suffix = pad(Math.floor(Math.random() * 100), 2)
-  return `CRMPR${stamp}${suffix}`.slice(0, 25)
-}
-
 function priceSelect(alias = 'f', prefix = '') {
   return PRICE_FIELDS.map((field) => `COALESCE(${alias}.${field}::text, '') AS ${prefix}${field}`).join(',\n         ')
 }
@@ -432,7 +417,7 @@ router.get('/documents', async (req, res) => {
     const result = await posDB.query(
       `SELECT
          t.doc_no,
-         t.doc_date::date AS doc_date,
+         TO_CHAR(t.doc_date::date, 'YYYY-MM-DD') AS doc_date,
          t.trans_flag,
          CASE t.trans_flag WHEN 12 THEN 'ซื้อ' WHEN 310 THEN 'รับสินค้า' ELSE t.trans_flag::text END AS trans_name,
          COALESCE(t.cust_code, '') AS supplier_code,
@@ -441,11 +426,17 @@ router.get('/documents', async (req, res) => {
          COALESCE(t.creator_code, '') AS creator_code,
          COALESCE(t.remark, '') AS remark,
          COALESCE(line_stats.line_count, 0)::int AS line_count,
-         COALESCE(line_stats.item_count, 0)::int AS item_count
+         COALESCE(line_stats.item_count, 0)::int AS item_count,
+         COALESCE(line_stats.vat_type, 0)::int AS vat_type,
+         COALESCE(line_stats.vat_type_count, 0)::int AS vat_type_count
        FROM ic_trans t
        LEFT JOIN ap_supplier ap ON ap.code = t.cust_code
        LEFT JOIN LATERAL (
-         SELECT COUNT(*) AS line_count, COUNT(DISTINCT d.item_code) AS item_count
+         SELECT
+           COUNT(*) AS line_count,
+           COUNT(DISTINCT d.item_code) AS item_count,
+           MIN(COALESCE(d.vat_type, 0)) AS vat_type,
+           COUNT(DISTINCT COALESCE(d.vat_type, 0)) AS vat_type_count
          FROM ic_trans_detail d
          WHERE d.doc_no = t.doc_no
            AND d.trans_flag = t.trans_flag
@@ -487,6 +478,9 @@ router.post('/items-from-documents', async (req, res) => {
       `WITH selected(doc_no, trans_flag) AS (
          VALUES ${values}
        ),
+       vat_option AS (
+         SELECT COALESCE((SELECT vat_rate FROM erp_option LIMIT 1), 0)::numeric AS vat_rate
+       ),
        detail_rows AS (
          SELECT
            d.roworder,
@@ -501,11 +495,34 @@ router.post('/items-from-documents', async (req, res) => {
            COALESCE(cat.name_1, '') AS category_name,
            COALESCE(i.group_main, '') AS group_main,
            COALESCE(d.vat_type, i.tax_type, 0) AS vat_type,
-           (COALESCE(d.price, 0) + COALESCE(d.total_vat_value, 0)) AS purchase_price,
+           CASE
+             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+               THEN ROUND(COALESCE(d.price, 0) * (1 + (v.vat_rate / 100)), 6)
+             ELSE COALESCE(d.price, 0)
+           END AS purchase_price,
+           CASE
+             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+               THEN ROUND(
+                 COALESCE(d.average_cost, 0)
+                 * (COALESCE(NULLIF(d.stand_value, 0), NULLIF(du.stand_value, 0), 1) / COALESCE(NULLIF(d.divide_value, 0), NULLIF(du.divide_value, 0), 1))
+                 * (1 + (v.vat_rate / 100)),
+                 6
+               )
+             ELSE ROUND(
+               COALESCE(d.average_cost, 0)
+               * (COALESCE(NULLIF(d.stand_value, 0), NULLIF(du.stand_value, 0), 1) / COALESCE(NULLIF(d.divide_value, 0), NULLIF(du.divide_value, 0), 1)),
+               6
+             )
+           END AS average_cost,
            COALESCE(d.price_exclude_vat, 0) AS price_exclude_vat,
-           (COALESCE(d.price, 0) + COALESCE(d.total_vat_value, 0)) AS price_include_vat,
+           CASE
+             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+               THEN ROUND(COALESCE(d.price, 0) * (1 + (v.vat_rate / 100)), 6)
+             ELSE COALESCE(d.price, 0)
+           END AS price_include_vat,
            COALESCE(d.qty, 0) AS qty
          FROM selected s
+         CROSS JOIN vat_option v
          JOIN ic_trans t ON t.doc_no = s.doc_no AND t.trans_flag = s.trans_flag
          JOIN ic_trans_detail d ON d.doc_no = t.doc_no AND d.trans_flag = t.trans_flag
          LEFT JOIN ic_inventory i ON i.code = d.item_code
@@ -566,7 +583,17 @@ router.post('/items-from-documents', async (req, res) => {
            item_code,
            COUNT(*)::int AS source_line_count,
            COUNT(DISTINCT doc_no)::int AS source_doc_count,
-           STRING_AGG(DISTINCT doc_no, ', ') AS source_docs
+           STRING_AGG(
+             DISTINCT doc_no || ' (' ||
+               CASE COALESCE(vat_type, 0)
+                 WHEN 0 THEN 'แยกนอก'
+                 WHEN 1 THEN 'รวมใน'
+                 WHEN 2 THEN 'ภาษีศูนย์'
+                 WHEN 3 THEN 'ไม่กระทบภาษี'
+                 ELSE 'ไม่ทราบ'
+               END || ')',
+             ', '
+           ) AS source_docs
          FROM detail_rows
          GROUP BY item_code
        )
@@ -589,6 +616,10 @@ router.post('/items-from-documents', async (req, res) => {
            ELSE ROUND(COALESCE(ri.purchase_price, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
          END AS purchase_price,
          CASE
+           WHEN ru.item_code IS NOT NULL THEN ru.average_cost
+           ELSE ROUND(COALESCE(ri.average_cost, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS average_cost,
+         CASE
            WHEN ru.item_code IS NOT NULL THEN ru.price_exclude_vat
            ELSE ROUND(COALESCE(ri.price_exclude_vat, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
          END AS price_exclude_vat,
@@ -601,7 +632,7 @@ router.post('/items-from-documents', async (req, res) => {
          COALESCE(ru.source_unit_code, ri.source_unit_code, '') AS source_unit_code,
          COALESCE(ru.source_unit_ratio, ri.source_unit_ratio, 1) AS source_unit_ratio,
          COALESCE(ru.trans_flag, ri.trans_flag, 0) AS source_trans_flag,
-         COALESCE(ru.doc_date, ri.doc_date) AS source_doc_date,
+         TO_CHAR(COALESCE(ru.doc_date, ri.doc_date), 'YYYY-MM-DD') AS source_doc_date,
          COALESCE(other_prices.other_price_count, 0) AS other_price_count,
          COALESCE(other_prices.customer_price_count, 0) AS customer_price_count,
          COALESCE(other_prices.group_price_count, 0) AS group_price_count,
@@ -743,6 +774,7 @@ router.post('/items-from-products', async (req, res) => {
          COALESCE(u.stand_value, 1) AS stand_value,
          COALESCE(u.divide_value, 1) AS divide_value,
          0::numeric AS purchase_price,
+         0::numeric AS average_cost,
          0::numeric AS price_exclude_vat,
          0::numeric AS price_include_vat,
          0::numeric AS qty,
@@ -824,8 +856,8 @@ router.get('/other-prices', async (req, res) => {
          COALESCE(ip.transport_type, 0) AS transport_type,
          COALESCE(ip.from_qty, 0) AS from_qty,
          COALESCE(ip.to_qty, 0) AS to_qty,
-         ip.from_date::date AS from_date,
-         ip.to_date::date AS to_date,
+         TO_CHAR(ip.from_date::date, 'YYYY-MM-DD') AS from_date,
+         TO_CHAR(ip.to_date::date, 'YYYY-MM-DD') AS to_date,
          COALESCE(ip.sale_price1, 0) AS sale_price1,
          COALESCE(ip.sale_price2, 0) AS sale_price2,
          COALESCE(ip.cust_code, '') AS cust_code,
@@ -861,7 +893,7 @@ router.get('/history', async (req, res) => {
     const result = await client.query(
       `SELECT
          h.doc_no,
-         h.doc_date,
+         TO_CHAR(h.doc_date::date, 'YYYY-MM-DD') AS doc_date,
          h.creator_code,
          h.remark,
          h.create_datetime,
@@ -894,7 +926,7 @@ router.get('/history/:docNo/details', async (req, res) => {
       `SELECT
          d.roworder,
          d.doc_no,
-         d.doc_date,
+         TO_CHAR(d.doc_date::date, 'YYYY-MM-DD') AS doc_date,
          d.creator_code,
          d.ic_code,
          COALESCE(i.name_1, '') AS item_name,
@@ -967,13 +999,21 @@ router.post('/save', async (req, res) => {
   }
 
   const client = await posDB.connect()
-  const docNo = formatDocNo()
-  const docDate = new Date().toISOString().slice(0, 10)
+  let docNo = ''
+  let docDate = ''
   const creatorCode = clean(req.user?.code)
 
   try {
     await client.query('BEGIN')
     await ensureFormulaHistorySchema(client)
+    const clock = await client.query(
+      `SELECT
+         TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD') AS doc_date,
+         TO_CHAR(CURRENT_TIMESTAMP, 'YYYYMMDDHH24MISSMS') AS stamp`,
+    )
+    const suffix = String(Math.floor(Math.random() * 100)).padStart(2, '0')
+    docDate = clock.rows[0].doc_date
+    docNo = `CRMPR${clock.rows[0].stamp}${suffix}`.slice(0, 25)
 
     await client.query(
       `INSERT INTO pc_formular_doc_temp (doc_no, doc_date, creator_code, remark)
