@@ -1,4 +1,4 @@
-const express = require('express')
+﻿const express = require('express')
 const { posDB } = require('../db')
 const { authMiddleware, requireRole } = require('../middleware/auth')
 
@@ -25,8 +25,8 @@ function searchTokenPatterns(token) {
   if (gramMatch) {
     variants.add(`${gramMatch[1]}g`)
     variants.add(`${gramMatch[1]} g`)
-    variants.add(`${gramMatch[1]}กรัม`)
-    variants.add(`${gramMatch[1]} กรัม`)
+    variants.add(`${gramMatch[1]}à¸à¸£à¸±à¸¡`)
+    variants.add(`${gramMatch[1]} à¸à¸£à¸±à¸¡`)
   }
 
   return [...variants].map((value) => `%${value}%`)
@@ -308,18 +308,18 @@ router.get('/margin-master', async (req, res) => {
 
 router.put('/margin-master', async (req, res) => {
   const items = Array.isArray(req.body.items) ? req.body.items : []
-  if (!items.length) return res.status(400).json({ error: 'ไม่มีรายการ master margin สำหรับบันทึก' })
-  if (items.length > 2000) return res.status(400).json({ error: 'บันทึก master margin ได้ไม่เกิน 2,000 หมวดต่อครั้ง' })
+  if (!items.length) return res.status(400).json({ error: 'à¹„à¸¡à¹ˆà¸¡à¸µà¸£à¸²à¸¢à¸à¸²à¸£ master margin à¸ªà¸³à¸«à¸£à¸±à¸šà¸šà¸±à¸™à¸—à¸¶à¸' })
+  if (items.length > 2000) return res.status(400).json({ error: 'à¸šà¸±à¸™à¸—à¸¶à¸ master margin à¹„à¸”à¹‰à¹„à¸¡à¹ˆà¹€à¸à¸´à¸™ 2,000 à¸«à¸¡à¸§à¸”à¸•à¹ˆà¸­à¸„à¸£à¸±à¹‰à¸‡' })
 
   const normalized = []
   for (const item of items) {
     const categoryCode = clean(item.category_code)
-    if (!categoryCode) return res.status(400).json({ error: 'พบรายการ master margin ที่ไม่มีรหัสหมวดสินค้า' })
+    if (!categoryCode) return res.status(400).json({ error: 'à¸žà¸šà¸£à¸²à¸¢à¸à¸²à¸£ master margin à¸—à¸µà¹ˆà¹„à¸¡à¹ˆà¸¡à¸µà¸£à¸«à¸±à¸ªà¸«à¸¡à¸§à¸”à¸ªà¸´à¸™à¸„à¹‰à¸²' })
 
     const priceMargins = PRICE_FIELDS.map((field) => percentValue(item[`${field}_margin`]))
     const unitMargins = UNIT_MARGIN_FIELDS.map((field) => percentValue(item[`unit_${field}_margin`]))
     if ([...priceMargins, ...unitMargins].some((n) => !Number.isFinite(n))) {
-      return res.status(400).json({ error: `margin ของหมวด ${categoryCode} ต้องเป็นตัวเลข` })
+      return res.status(400).json({ error: `margin à¸‚à¸­à¸‡à¸«à¸¡à¸§à¸” ${categoryCode} à¸•à¹‰à¸­à¸‡à¹€à¸›à¹‡à¸™à¸•à¸±à¸§à¹€à¸¥à¸‚` })
     }
 
     normalized.push({
@@ -419,7 +419,7 @@ router.get('/documents', async (req, res) => {
          t.doc_no,
          TO_CHAR(t.doc_date::date, 'YYYY-MM-DD') AS doc_date,
          t.trans_flag,
-         CASE t.trans_flag WHEN 12 THEN 'ซื้อ' WHEN 310 THEN 'รับสินค้า' ELSE t.trans_flag::text END AS trans_name,
+         CASE t.trans_flag WHEN 12 THEN 'à¸‹à¸·à¹‰à¸­' WHEN 310 THEN 'à¸£à¸±à¸šà¸ªà¸´à¸™à¸„à¹‰à¸²' ELSE t.trans_flag::text END AS trans_name,
          COALESCE(t.cust_code, '') AS supplier_code,
          COALESCE(ap.name_1, '') AS supplier_name,
          COALESCE(t.total_amount, 0) AS total_amount,
@@ -464,8 +464,8 @@ router.post('/items-from-documents', async (req, res) => {
     }))
     .filter((doc) => doc.doc_no && PURCHASE_FLAGS.includes(doc.trans_flag))
 
-  if (!docs.length) return res.status(400).json({ error: 'กรุณาเลือกเอกสารอย่างน้อย 1 ใบ' })
-  if (docs.length > 200) return res.status(400).json({ error: 'เลือกเอกสารได้ไม่เกิน 200 ใบต่อครั้ง' })
+  if (!docs.length) return res.status(400).json({ error: 'à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¹€à¸­à¸à¸ªà¸²à¸£à¸­à¸¢à¹ˆà¸²à¸‡à¸™à¹‰à¸­à¸¢ 1 à¹ƒà¸š' })
+  if (docs.length > 200) return res.status(400).json({ error: 'à¹€à¸¥à¸·à¸­à¸à¹€à¸­à¸à¸ªà¸²à¸£à¹„à¸”à¹‰à¹„à¸¡à¹ˆà¹€à¸à¸´à¸™ 200 à¹ƒà¸šà¸•à¹ˆà¸­à¸„à¸£à¸±à¹‰à¸‡' })
 
   const params = []
   const values = docs.map((doc) => {
@@ -501,7 +501,7 @@ router.post('/items-from-documents', async (req, res) => {
              ELSE COALESCE(d.price, 0)
            END AS purchase_price,
            CASE
-             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+             WHEN COALESCE(d.vat_type, i.tax_type, 0) IN (0, 1)
                THEN ROUND(
                  COALESCE(d.average_cost, 0)
                  * (COALESCE(NULLIF(d.stand_value, 0), NULLIF(du.stand_value, 0), 1) / COALESCE(NULLIF(d.divide_value, 0), NULLIF(du.divide_value, 0), 1))
@@ -586,11 +586,11 @@ router.post('/items-from-documents', async (req, res) => {
            STRING_AGG(
              DISTINCT doc_no || ' (' ||
                CASE COALESCE(vat_type, 0)
-                 WHEN 0 THEN 'แยกนอก'
-                 WHEN 1 THEN 'รวมใน'
-                 WHEN 2 THEN 'ภาษีศูนย์'
-                 WHEN 3 THEN 'ไม่กระทบภาษี'
-                 ELSE 'ไม่ทราบ'
+                 WHEN 0 THEN 'à¹à¸¢à¸à¸™à¸­à¸'
+                 WHEN 1 THEN 'à¸£à¸§à¸¡à¹ƒà¸™'
+                 WHEN 2 THEN 'à¸ à¸²à¸©à¸µà¸¨à¸¹à¸™à¸¢à¹Œ'
+                 WHEN 3 THEN 'à¹„à¸¡à¹ˆà¸à¸£à¸°à¸—à¸šà¸ à¸²à¸©à¸µ'
+                 ELSE 'à¹„à¸¡à¹ˆà¸—à¸£à¸²à¸š'
                END || ')',
              ', '
            ) AS source_docs
@@ -751,7 +751,7 @@ router.post('/items-from-products', async (req, res) => {
     .map((item) => clean(item.item_code || item.code || item))
     .filter(Boolean))]
 
-  if (!productCodes.length) return res.status(400).json({ error: 'กรุณาเลือกสินค้าอย่างน้อย 1 รายการ' })
+  if (!productCodes.length) return res.status(400).json({ error: 'à¸à¸£à¸¸à¸“à¸²à¹€à¸¥à¸·à¸­à¸à¸ªà¸´à¸™à¸„à¹‰à¸²à¸­à¸¢à¹ˆà¸²à¸‡à¸™à¹‰à¸­à¸¢ 1 à¸£à¸²à¸¢à¸à¸²à¸£' })
 
   const params = [productCodes]
   try {
@@ -783,7 +783,7 @@ router.post('/items-from-products', async (req, res) => {
          COALESCE(u.ratio, 1) AS source_unit_ratio,
          0 AS source_trans_flag,
          NULL::date AS source_doc_date,
-         'ราคาตามสูตร' AS source_docs,
+         'à¸£à¸²à¸„à¸²à¸•à¸²à¸¡à¸ªà¸¹à¸•à¸£' AS source_docs,
          0::int AS source_doc_count,
          COUNT(*) OVER (PARTITION BY f.ic_code)::int AS source_line_count,
          COALESCE(other_prices.other_price_count, 0) AS other_price_count,
@@ -837,7 +837,7 @@ router.post('/items-from-products', async (req, res) => {
 router.get('/other-prices', async (req, res) => {
   const itemCode = clean(req.query.item_code)
   const unitCode = clean(req.query.unit_code)
-  if (!itemCode) return res.status(400).json({ error: 'กรุณาระบุรหัสสินค้า' })
+  if (!itemCode) return res.status(400).json({ error: 'à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²' })
 
   const params = [itemCode]
   const unitOrder = unitCode ? 'CASE WHEN ip.unit_code = $2 THEN 0 ELSE 1 END,' : ''
@@ -917,7 +917,7 @@ router.get('/history', async (req, res) => {
 
 router.get('/history/:docNo/details', async (req, res) => {
   const docNo = clean(req.params.docNo)
-  if (!docNo) return res.status(400).json({ error: 'กรุณาระบุเลขที่เอกสาร' })
+  if (!docNo) return res.status(400).json({ error: 'à¸à¸£à¸¸à¸“à¸²à¸£à¸°à¸šà¸¸à¹€à¸¥à¸‚à¸—à¸µà¹ˆà¹€à¸­à¸à¸ªà¸²à¸£' })
 
   const client = await posDB.connect()
   try {
@@ -978,8 +978,8 @@ router.post('/save', async (req, res) => {
   const items = Array.isArray(req.body.items) ? req.body.items : []
   const remark = clean(req.body.remark).slice(0, 255)
 
-  if (!items.length) return res.status(400).json({ error: 'ไม่มีรายการสำหรับบันทึก' })
-  if (items.length > 1000) return res.status(400).json({ error: 'บันทึกได้ไม่เกิน 1,000 รายการต่อครั้ง' })
+  if (!items.length) return res.status(400).json({ error: 'à¹„à¸¡à¹ˆà¸¡à¸µà¸£à¸²à¸¢à¸à¸²à¸£à¸ªà¸³à¸«à¸£à¸±à¸šà¸šà¸±à¸™à¸—à¸¶à¸' })
+  if (items.length > 1000) return res.status(400).json({ error: 'à¸šà¸±à¸™à¸—à¸¶à¸à¹„à¸”à¹‰à¹„à¸¡à¹ˆà¹€à¸à¸´à¸™ 1,000 à¸£à¸²à¸¢à¸à¸²à¸£à¸•à¹ˆà¸­à¸„à¸£à¸±à¹‰à¸‡' })
 
   const normalizedItems = []
   for (const item of items) {
@@ -988,11 +988,11 @@ router.post('/save', async (req, res) => {
     const taxType = intValue(item.tax_type ?? item.vat_type, 0)
     const formulaCategoryCode = clean(item.formula_category_code || item.selected_category_code).slice(0, 25)
     const formulaCategoryName = clean(item.formula_category_name || item.selected_category_name).slice(0, 255)
-    if (!icCode || !unitCode) return res.status(400).json({ error: 'พบรายการที่ไม่มีรหัสสินค้าหรือหน่วยนับ' })
+    if (!icCode || !unitCode) return res.status(400).json({ error: 'à¸žà¸šà¸£à¸²à¸¢à¸à¸²à¸£à¸—à¸µà¹ˆà¹„à¸¡à¹ˆà¸¡à¸µà¸£à¸«à¸±à¸ªà¸ªà¸´à¸™à¸„à¹‰à¸²à¸«à¸£à¸·à¸­à¸«à¸™à¹ˆà¸§à¸¢à¸™à¸±à¸š' })
 
     const prices = PRICE_FIELDS.map((field) => numericValue(item[field]))
     if (prices.some((price) => !Number.isFinite(price))) {
-      return res.status(400).json({ error: `ราคาของสินค้า ${icCode} ต้องเป็นตัวเลขและไม่ติดลบ` })
+      return res.status(400).json({ error: `à¸£à¸²à¸„à¸²à¸‚à¸­à¸‡à¸ªà¸´à¸™à¸„à¹‰à¸² ${icCode} à¸•à¹‰à¸­à¸‡à¹€à¸›à¹‡à¸™à¸•à¸±à¸§à¹€à¸¥à¸‚à¹à¸¥à¸°à¹„à¸¡à¹ˆà¸•à¸´à¸”à¸¥à¸š` })
     }
 
     normalizedItems.push({ icCode, unitCode, taxType, formulaCategoryCode, formulaCategoryName, prices })
@@ -1109,7 +1109,7 @@ router.post('/save', async (req, res) => {
 
     if (insertCount + updateCount === 0) {
       await client.query('ROLLBACK')
-      return res.status(400).json({ error: 'ไม่มีรายการที่มีการเปลี่ยนแปลงราคา' })
+      return res.status(400).json({ error: 'à¹„à¸¡à¹ˆà¸¡à¸µà¸£à¸²à¸¢à¸à¸²à¸£à¸—à¸µà¹ˆà¸¡à¸µà¸à¸²à¸£à¹€à¸›à¸¥à¸µà¹ˆà¸¢à¸™à¹à¸›à¸¥à¸‡à¸£à¸²à¸„à¸²' })
     }
 
     await client.query('COMMIT')
