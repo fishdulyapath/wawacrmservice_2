@@ -494,29 +494,29 @@ router.post('/items-from-documents', async (req, res) => {
            COALESCE(i.item_category, '') AS category_code,
            COALESCE(cat.name_1, '') AS category_name,
            COALESCE(i.group_main, '') AS group_main,
-           COALESCE(d.vat_type, i.tax_type, 0) AS vat_type,
+           COALESCE(d.vat_type, 0) AS vat_type,
+           COALESCE(d.tax_type, 0) AS item_tax_type,
+           COALESCE(d.is_permium, 0) AS is_permium,
            CASE
-             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+             WHEN COALESCE(d.vat_type, 0) = 0 AND COALESCE(d.tax_type, 0) = 0
                THEN ROUND(COALESCE(d.price, 0) * (1 + (v.vat_rate / 100)), 6)
              ELSE COALESCE(d.price, 0)
            END AS purchase_price,
            CASE
-             WHEN COALESCE(d.vat_type, i.tax_type, 0) IN (0, 1)
-               THEN ROUND(
-                 COALESCE(d.average_cost, 0)
-                 * (COALESCE(NULLIF(d.stand_value, 0), NULLIF(du.stand_value, 0), 1) / COALESCE(NULLIF(d.divide_value, 0), NULLIF(du.divide_value, 0), 1))
-                 * (1 + (v.vat_rate / 100)),
-                 6
-               )
-             ELSE ROUND(
-               COALESCE(d.average_cost, 0)
-               * (COALESCE(NULLIF(d.stand_value, 0), NULLIF(du.stand_value, 0), 1) / COALESCE(NULLIF(d.divide_value, 0), NULLIF(du.divide_value, 0), 1)),
-               6
-             )
-           END AS average_cost,
+             WHEN COALESCE(d.tax_type, 0) = 1 THEN COALESCE(d.price, 0)
+             WHEN COALESCE(d.vat_type, 0) = 0 THEN COALESCE(d.price, 0)
+             WHEN COALESCE(d.vat_type, 0) = 1 THEN ROUND(COALESCE(d.price, 0) / NULLIF((1 + (v.vat_rate / 100)), 0), 6)
+             ELSE COALESCE(d.price, 0)
+           END AS purchase_price_before_vat,
+           CASE
+             WHEN COALESCE(d.tax_type, 0) = 1 THEN 0
+             WHEN COALESCE(d.vat_type, 0) = 0 THEN ROUND(COALESCE(d.price, 0) * (v.vat_rate / 100), 6)
+             WHEN COALESCE(d.vat_type, 0) = 1 THEN ROUND(COALESCE(d.price, 0) - (COALESCE(d.price, 0) / NULLIF((1 + (v.vat_rate / 100)), 0)), 6)
+             ELSE 0
+           END AS purchase_price_vat_amount,
            COALESCE(d.price_exclude_vat, 0) AS price_exclude_vat,
            CASE
-             WHEN COALESCE(d.vat_type, i.tax_type, 0) = 0
+             WHEN COALESCE(d.vat_type, 0) = 0 AND COALESCE(d.tax_type, 0) = 0
                THEN ROUND(COALESCE(d.price, 0) * (1 + (v.vat_rate / 100)), 6)
              ELSE COALESCE(d.price, 0)
            END AS price_include_vat,
@@ -534,6 +534,19 @@ router.post('/items-from-documents', async (req, res) => {
            AND COALESCE(d.last_status, 0) = 0
            AND COALESCE(d.item_code, '') <> ''
            AND COALESCE(d.unit_code, '') <> ''
+       ),
+       stock_costs AS (
+         SELECT
+           sb.ic_code AS item_code,
+           MAX(COALESCE(sb.average_cost, 0)) AS base_average_cost
+         FROM (SELECT DISTINCT item_code FROM detail_rows) items
+         CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
+           CURRENT_DATE,
+           items.item_code::varchar,
+           'MMA01'::varchar,
+           ''::varchar
+         ) sb
+         GROUP BY sb.ic_code
        ),
        unit_rows AS (
          SELECT
@@ -607,6 +620,9 @@ router.post('/items-from-documents', async (req, res) => {
          COALESCE(barcode_info.barcode, '') AS barcode,
          COALESCE(barcode_info.description, '') AS barcode_description,
          0::int AS vat_type,
+         COALESCE(ru.vat_type, ri.vat_type, 0) AS source_vat_type,
+         COALESCE(ru.item_tax_type, ri.item_tax_type, 0) AS item_tax_type,
+         COALESCE(ru.is_permium, ri.is_permium, 0) AS is_permium,
          u.unit_row_order,
          u.unit_ratio,
          u.stand_value,
@@ -616,9 +632,38 @@ router.post('/items-from-documents', async (req, res) => {
            ELSE ROUND(COALESCE(ri.purchase_price, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
          END AS purchase_price,
          CASE
-           WHEN ru.item_code IS NOT NULL THEN ru.average_cost
-           ELSE ROUND(COALESCE(ri.average_cost, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
-         END AS average_cost,
+           WHEN ru.item_code IS NOT NULL THEN ru.purchase_price_before_vat
+           ELSE ROUND(COALESCE(ri.purchase_price_before_vat, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS purchase_price_before_vat,
+         CASE
+           WHEN ru.item_code IS NOT NULL THEN ru.purchase_price_vat_amount
+           ELSE ROUND(COALESCE(ri.purchase_price_vat_amount, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
+         END AS purchase_price_vat_amount,
+         ROUND(
+           COALESCE(sc.base_average_cost, 0)
+           * COALESCE(u.unit_ratio, 1)
+           * CASE
+               WHEN COALESCE(ru.item_tax_type, ri.item_tax_type, 0) <> 1
+                 THEN (1 + (v.vat_rate / 100))
+               ELSE 1
+             END,
+           6
+         ) AS average_cost,
+         ROUND(
+           COALESCE(sc.base_average_cost, 0)
+           * COALESCE(u.unit_ratio, 1),
+           6
+         ) AS average_cost_before_vat,
+         ROUND(
+           COALESCE(sc.base_average_cost, 0)
+           * COALESCE(u.unit_ratio, 1)
+           * CASE
+               WHEN COALESCE(ru.item_tax_type, ri.item_tax_type, 0) <> 1
+                 THEN (v.vat_rate / 100)
+               ELSE 0
+             END,
+           6
+         ) AS average_cost_vat_amount,
          CASE
            WHEN ru.item_code IS NOT NULL THEN ru.price_exclude_vat
            ELSE ROUND(COALESCE(ri.price_exclude_vat, 0) * COALESCE(u.unit_ratio, 1) / NULLIF(COALESCE(ri.source_unit_ratio, 1), 0), 6)
@@ -642,9 +687,11 @@ router.post('/items-from-documents', async (req, res) => {
          s.source_line_count,
          ${priceSelect('f', 'old_')}
        FROM unit_rows u
+       CROSS JOIN vat_option v
        JOIN sources s ON s.item_code = u.item_code
        LEFT JOIN ranked_by_unit ru ON ru.item_code = u.item_code AND ru.source_unit_code = u.unit_code AND ru.rn = 1
        LEFT JOIN ranked_by_item ri ON ri.item_code = u.item_code AND ri.rn = 1
+       LEFT JOIN stock_costs sc ON sc.item_code = u.item_code
        LEFT JOIN ic_inventory_price_formula f
          ON f.ic_code = u.item_code
        AND f.unit_code = u.unit_code
@@ -736,7 +783,7 @@ router.get('/formula-products', async (req, res) => {
        LEFT JOIN ic_category cat ON cat.code = i.item_category
        WHERE ${where.join(' AND ')}
        GROUP BY f.ic_code, i.name_1, i.item_category, cat.name_1, i.group_main
-       ORDER BY match_score DESC, f.ic_code`,
+       ORDER BY match_score DESC, f.ic_code limit 3000`,
       params,
     )
     res.json({ data: result.rows })
@@ -758,6 +805,22 @@ router.post('/items-from-products', async (req, res) => {
     const result = await posDB.query(
       `WITH selected AS (
          SELECT unnest($1::text[]) AS item_code
+       ),
+       vat_option AS (
+         SELECT COALESCE((SELECT vat_rate FROM erp_option LIMIT 1), 0)::numeric AS vat_rate
+       ),
+       stock_costs AS (
+         SELECT
+           sb.ic_code AS item_code,
+           MAX(COALESCE(sb.average_cost, 0)) AS base_average_cost
+         FROM selected s
+         CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
+           now()::date,
+           s.item_code::varchar,
+           'MMA01'::varchar,
+           ''::varchar
+         ) sb
+         GROUP BY sb.ic_code
        )
        SELECT
          f.ic_code AS item_code,
@@ -769,12 +832,34 @@ router.post('/items-from-products', async (req, res) => {
          COALESCE(barcode_info.barcode, '') AS barcode,
          COALESCE(barcode_info.description, '') AS barcode_description,
          0::int AS vat_type,
+         COALESCE(i.tax_type, 0) AS item_tax_type,
+         COALESCE(detail_info.is_premium, 0) AS is_permium,
          COALESCE(u.row_order, 0) AS unit_row_order,
          COALESCE(u.ratio, 1) AS unit_ratio,
          COALESCE(u.stand_value, 1) AS stand_value,
          COALESCE(u.divide_value, 1) AS divide_value,
          0::numeric AS purchase_price,
-         0::numeric AS average_cost,
+         0::numeric AS purchase_price_before_vat,
+         0::numeric AS purchase_price_vat_amount,
+         ROUND(
+           COALESCE(sc.base_average_cost, 0)
+           * COALESCE(u.ratio, 1)
+           * CASE
+               WHEN COALESCE(i.tax_type, 0) <> 1 THEN (1 + (v.vat_rate / 100))
+               ELSE 1
+             END,
+           6
+         ) AS average_cost,
+         ROUND(COALESCE(sc.base_average_cost, 0) * COALESCE(u.ratio, 1), 6) AS average_cost_before_vat,
+         ROUND(
+           COALESCE(sc.base_average_cost, 0)
+           * COALESCE(u.ratio, 1)
+           * CASE
+               WHEN COALESCE(i.tax_type, 0) <> 1 THEN (v.vat_rate / 100)
+               ELSE 0
+             END,
+           6
+         ) AS average_cost_vat_amount,
          0::numeric AS price_exclude_vat,
          0::numeric AS price_include_vat,
          0::numeric AS qty,
@@ -793,9 +878,17 @@ router.post('/items-from-products', async (req, res) => {
          ${priceSelect('f', 'old_')}
        FROM selected s
        JOIN ic_inventory_price_formula f ON f.ic_code = s.item_code
+       CROSS JOIN vat_option v
        LEFT JOIN ic_inventory i ON i.code = f.ic_code
        LEFT JOIN ic_category cat ON cat.code = i.item_category
        LEFT JOIN ic_unit_use u ON u.ic_code = f.ic_code AND u.code = f.unit_code
+       LEFT JOIN stock_costs sc ON sc.item_code = f.ic_code
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(d.is_premium, 0) AS is_premium
+         FROM ic_inventory_detail d
+         WHERE d.ic_code = f.ic_code
+         LIMIT 1
+       ) detail_info ON true
        LEFT JOIN LATERAL (
          SELECT ib.barcode, COALESCE(ib.description, '') AS description
          FROM ic_inventory_barcode ib
