@@ -159,6 +159,7 @@ function normalizeCartRow(row, currentUserId) {
     unit_stand_value: Number(row.unit_stand_value || 1),
     unit_divide_value: Number(row.unit_divide_value || 1),
     reference_price: Number(row.reference_price || 0),
+    tax_type: Number(row.tax_type || 0),
   }
 }
 
@@ -177,7 +178,24 @@ async function fetchCartRows(currentUserId, statuses = ['active']) {
      ORDER BY c.create_datetime, c.id`,
     [statuses, userColor(currentUserId)],
   )
-  return result.rows.map((row) => normalizeCartRow(row, currentUserId))
+  const rows = result.rows
+  const itemCodes = [...new Set(rows.map((row) => clean(row.item_code)).filter(Boolean))]
+  const taxByItem = new Map()
+  if (itemCodes.length) {
+    const taxResult = await posDB.query(
+      `SELECT code AS item_code, COALESCE(tax_type, 0)::int AS tax_type
+       FROM ic_inventory
+       WHERE code = ANY($1::text[])`,
+      [itemCodes],
+    )
+    for (const row of taxResult.rows) {
+      taxByItem.set(clean(row.item_code), Number(row.tax_type || 0))
+    }
+  }
+  return rows.map((row) => normalizeCartRow({
+    ...row,
+    tax_type: taxByItem.get(clean(row.item_code)) || 0,
+  }, currentUserId))
 }
 
 async function filterActiveCreatedPRRows(rows) {
@@ -901,6 +919,7 @@ function buildPlanningMetricsSql({
         ), '') AS barcode_text,
         COALESCE(i.unit_standard, '') AS unit_code,
         COALESCE(i.group_main, '') AS group_main,
+        COALESCE(i.tax_type, 0)::int AS item_tax_type,
         COALESCE(i.supplier_code, '') AS legacy_supplier_code,
         i.last_movement_date,
         COALESCE(d.is_hold_sale, 0) AS is_hold_sale,
@@ -3081,6 +3100,22 @@ router.post('/pr/create', requirePlanningAccess, async (req, res) => {
       const vatResult = await client.query(`SELECT vat_rate FROM erp_option LIMIT 1`)
       const vatRate = Number(vatResult.rows[0]?.vat_rate || 7)
       const divisor = 100 + vatRate
+      const itemCodes = [...new Set(groups
+        .flatMap((g) => Array.isArray(g.items) ? g.items : [])
+        .map((it) => clean(it.item_code))
+        .filter(Boolean))]
+      const itemTaxByCode = new Map()
+      if (itemCodes.length) {
+        const taxResult = await client.query(
+          `SELECT code AS item_code, COALESCE(tax_type, 0)::int AS tax_type
+           FROM ic_inventory
+           WHERE code = ANY($1::text[])`,
+          [itemCodes],
+        )
+        for (const row of taxResult.rows) {
+          itemTaxByCode.set(clean(row.item_code), Number(row.tax_type || 0))
+        }
+      }
 
       const prDocs = []
       for (const g of groups) {
@@ -3139,22 +3174,25 @@ router.post('/pr/create', requirePlanningAccess, async (req, res) => {
           const sumAmount = Math.round(lineQty * linePrice * 100) / 100
           const standValue = Number(it.unit_stand_value) || ratio || 1
           const divideValue = Number(it.unit_divide_value) || 1
+          const itemTaxType = itemTaxByCode.has(itemCode)
+            ? Number(itemTaxByCode.get(itemCode) || 0)
+            : Number(it.tax_type || 0)
           await client.query(
             `INSERT INTO ic_trans_detail (
               trans_type, trans_flag, doc_date, doc_time, doc_no, cust_code,
               item_code, item_name, unit_code, qty, price, sum_amount,
-              line_number, stand_value, divide_value, ratio, calc_flag, vat_type,
+              line_number, stand_value, divide_value, ratio, calc_flag, vat_type, tax_type,
               doc_date_calc, doc_time_calc, branch_code, creator_code, create_datetime
             ) VALUES (
               1, 2, $1::date, $2, $3, $4,
               $5, $6, $7, $8, $9, $10,
-              $11, $12, $13, $14, 1, 1,
+              $11, $12, $13, $14, 1, 1, $17::smallint,
               $1::date, $2, $15, $16, NOW()
             )`,
             [
               docDate, docTime, docNo, apCode,
               itemCode, itemName, unitCode, lineQty, linePrice, sumAmount,
-              lineNo, standValue, divideValue, ratio, branchCode, userCode,
+              lineNo, standValue, divideValue, ratio, branchCode, userCode, itemTaxType,
             ],
           )
           lineNo += 10

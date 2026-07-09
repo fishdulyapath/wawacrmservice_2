@@ -414,6 +414,7 @@ router.get('/documents', async (req, res) => {
   params.push(limit)
 
   try {
+    await ensureFormulaHistorySchema(posDB)
     const result = await posDB.query(
       `SELECT
          t.doc_no,
@@ -427,6 +428,14 @@ router.get('/documents', async (req, res) => {
          COALESCE(t.remark, '') AS remark,
          COALESCE(line_stats.line_count, 0)::int AS line_count,
          COALESCE(line_stats.item_count, 0)::int AS item_count,
+         COALESCE(line_stats.item_unit_count, 0)::int AS item_unit_count,
+         COALESCE(adjust_stats.adjusted_item_unit_count, 0)::int AS adjusted_item_unit_count,
+         CASE
+           WHEN COALESCE(line_stats.item_unit_count, 0) = 0 THEN 'none'
+           WHEN COALESCE(adjust_stats.adjusted_item_unit_count, 0) >= COALESCE(line_stats.item_unit_count, 0) THEN 'full'
+           WHEN COALESCE(adjust_stats.adjusted_item_unit_count, 0) > 0 THEN 'partial'
+           ELSE 'none'
+         END AS price_adjust_status,
          COALESCE(line_stats.vat_type, 0)::int AS vat_type,
          COALESCE(line_stats.vat_type_count, 0)::int AS vat_type_count
        FROM ic_trans t
@@ -435,6 +444,7 @@ router.get('/documents', async (req, res) => {
          SELECT
            COUNT(*) AS line_count,
            COUNT(DISTINCT d.item_code) AS item_count,
+           COUNT(DISTINCT COALESCE(d.item_code, '') || E'\\x1F' || COALESCE(d.unit_code, '')) AS item_unit_count,
            MIN(COALESCE(d.vat_type, 0)) AS vat_type,
            COUNT(DISTINCT COALESCE(d.vat_type, 0)) AS vat_type_count
          FROM ic_trans_detail d
@@ -443,6 +453,28 @@ router.get('/documents', async (req, res) => {
            AND COALESCE(d.status, 0) = 0
            AND COALESCE(d.last_status, 0) = 0
        ) line_stats ON true
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::int AS adjusted_item_unit_count
+         FROM (
+           SELECT DISTINCT
+             COALESCE(d.item_code, '') AS item_code,
+             COALESCE(d.unit_code, '') AS unit_code
+           FROM ic_trans_detail d
+           WHERE d.doc_no = t.doc_no
+             AND d.trans_flag = t.trans_flag
+             AND COALESCE(d.status, 0) = 0
+             AND COALESCE(d.last_status, 0) = 0
+             AND COALESCE(d.item_code, '') <> ''
+             AND COALESCE(d.unit_code, '') <> ''
+         ) doc_items
+         WHERE EXISTS (
+           SELECT 1
+           FROM pc_formular_doc_detail_temp_log h
+           WHERE h.ic_code = doc_items.item_code
+             AND h.unit_code = doc_items.unit_code
+           LIMIT 1
+         )
+       ) adjust_stats ON true
        WHERE ${where.join(' AND ')}
        ORDER BY t.doc_date DESC, t.doc_time DESC, t.doc_no DESC
        LIMIT $${params.length}`,
@@ -685,6 +717,7 @@ router.post('/items-from-documents', async (req, res) => {
          s.source_docs,
          s.source_doc_count,
          s.source_line_count,
+         COALESCE(TO_CHAR(f.create_date_time_now, 'YYYY-MM-DD HH24:MI:SS'), '') AS latest_price_update_at,
          ${priceSelect('f', 'old_')}
        FROM unit_rows u
        CROSS JOIN vat_option v
@@ -875,6 +908,7 @@ router.post('/items-from-products', async (req, res) => {
          COALESCE(other_prices.customer_price_count, 0) AS customer_price_count,
          COALESCE(other_prices.group_price_count, 0) AS group_price_count,
          COALESCE(other_prices.qty_price_count, 0) AS qty_price_count,
+         COALESCE(TO_CHAR(f.create_date_time_now, 'YYYY-MM-DD HH24:MI:SS'), '') AS latest_price_update_at,
          ${priceSelect('f', 'old_')}
        FROM selected s
        JOIN ic_inventory_price_formula f ON f.ic_code = s.item_code
