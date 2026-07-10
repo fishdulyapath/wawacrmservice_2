@@ -604,7 +604,7 @@ router.post('/items-from-documents', async (req, res) => {
        stock_costs AS (
          SELECT
            sb.ic_code AS item_code,
-           MAX(COALESCE(sb.average_cost, 0)) AS base_average_cost
+           MAX(COALESCE(sb.average_cost_end, 0)) AS base_average_cost
          FROM (SELECT DISTINCT item_code FROM detail_rows) items
          CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
            CURRENT_DATE,
@@ -879,7 +879,7 @@ router.post('/items-from-products', async (req, res) => {
        stock_costs AS (
          SELECT
            sb.ic_code AS item_code,
-           MAX(COALESCE(sb.average_cost, 0)) AS base_average_cost
+           MAX(COALESCE(sb.average_cost_end, 0)) AS base_average_cost
          FROM selected s
          CROSS JOIN LATERAL sml_ic_function_stock_balance_warehouse_location(
            now()::date,
