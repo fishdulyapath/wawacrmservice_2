@@ -138,6 +138,8 @@ async function ensureFormulaHistorySchema(client) {
       unit_code character varying(25) DEFAULT ''::character varying,
       sale_type smallint DEFAULT 0,
       tax_type smallint DEFAULT 0,
+      source_doc_no character varying(255) DEFAULT ''::character varying,
+      source_trans_flag smallint DEFAULT 0,
       formula_category_code character varying(25) DEFAULT ''::character varying,
       formula_category_name character varying(255) DEFAULT ''::character varying,
       old_price_available boolean DEFAULT false,
@@ -175,6 +177,8 @@ async function ensureFormulaHistorySchema(client) {
       unit_code character varying(25) DEFAULT ''::character varying,
       sale_type smallint DEFAULT 0,
       tax_type smallint DEFAULT 0,
+      source_doc_no character varying(255) DEFAULT ''::character varying,
+      source_trans_flag smallint DEFAULT 0,
       formula_category_code character varying(25) DEFAULT ''::character varying,
       formula_category_name character varying(255) DEFAULT ''::character varying,
       old_price_available boolean DEFAULT false,
@@ -214,6 +218,14 @@ async function ensureFormulaHistorySchema(client) {
     ALTER TABLE public.pc_formular_doc_detail_temp_log
       ADD COLUMN IF NOT EXISTS old_price_available boolean DEFAULT false;
     ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS source_doc_no character varying(255) DEFAULT ''::character varying;
+    ALTER TABLE public.pc_formular_doc_detail_temp
+      ADD COLUMN IF NOT EXISTS source_trans_flag smallint DEFAULT 0;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS source_doc_no character varying(255) DEFAULT ''::character varying;
+    ALTER TABLE public.pc_formular_doc_detail_temp_log
+      ADD COLUMN IF NOT EXISTS source_trans_flag smallint DEFAULT 0;
+    ALTER TABLE public.pc_formular_doc_detail_temp
       ADD COLUMN IF NOT EXISTS formula_category_code character varying(25) DEFAULT ''::character varying;
     ALTER TABLE public.pc_formular_doc_detail_temp
       ADD COLUMN IF NOT EXISTS formula_category_name character varying(255) DEFAULT ''::character varying;
@@ -226,6 +238,10 @@ async function ensureFormulaHistorySchema(client) {
       ADD COLUMN IF NOT EXISTS old_${field} numeric DEFAULT 0.0;
     ALTER TABLE public.pc_formular_doc_detail_temp_log
       ADD COLUMN IF NOT EXISTS old_${field} numeric DEFAULT 0.0;`).join('')}
+
+    CREATE INDEX IF NOT EXISTS idx_pc_formula_log_source_doc_item_unit
+      ON public.pc_formular_doc_detail_temp_log (source_doc_no, source_trans_flag, ic_code, unit_code)
+      WHERE COALESCE(source_doc_no, '') <> '';
   `)
 
   formulaHistorySchemaReady = true
@@ -416,7 +432,60 @@ router.get('/documents', async (req, res) => {
   try {
     await ensureFormulaHistorySchema(posDB)
     const result = await posDB.query(
-      `SELECT
+      `WITH filtered_docs AS (
+         SELECT t.*
+         FROM ic_trans t
+         WHERE ${where.join(' AND ')}
+         ORDER BY t.doc_date DESC, t.doc_time DESC, t.doc_no DESC
+         LIMIT $${params.length}
+       ),
+       line_stats AS (
+         SELECT
+           d.doc_no,
+           d.trans_flag,
+           COUNT(*) AS line_count,
+           COUNT(DISTINCT d.item_code) AS item_count,
+           COUNT(DISTINCT COALESCE(d.item_code, '') || E'\\x1F' || COALESCE(d.unit_code, '')) AS item_unit_count,
+           MIN(COALESCE(d.vat_type, 0)) AS vat_type,
+           COUNT(DISTINCT COALESCE(d.vat_type, 0)) AS vat_type_count
+         FROM ic_trans_detail d
+         JOIN filtered_docs t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+         WHERE COALESCE(d.status, 0) = 0
+           AND COALESCE(d.last_status, 0) = 0
+         GROUP BY d.doc_no, d.trans_flag
+       ),
+       doc_items AS (
+         SELECT DISTINCT
+           d.doc_no,
+           d.trans_flag,
+           COALESCE(d.item_code, '') AS item_code,
+           COALESCE(d.unit_code, '') AS unit_code
+         FROM ic_trans_detail d
+         JOIN filtered_docs t ON t.doc_no = d.doc_no AND t.trans_flag = d.trans_flag
+         WHERE COALESCE(d.status, 0) = 0
+           AND COALESCE(d.last_status, 0) = 0
+           AND COALESCE(d.item_code, '') <> ''
+           AND COALESCE(d.unit_code, '') <> ''
+       ),
+       adjust_stats AS (
+         SELECT
+           di.doc_no,
+           di.trans_flag,
+           COUNT(*)::int AS adjusted_item_unit_count
+         FROM doc_items di
+         WHERE EXISTS (
+           SELECT 1
+           FROM pc_formular_doc_detail_temp_log h
+           WHERE COALESCE(h.source_doc_no, '') <> ''
+             AND h.source_doc_no = di.doc_no
+             AND h.source_trans_flag = di.trans_flag
+             AND h.ic_code = di.item_code
+             AND h.unit_code = di.unit_code
+           LIMIT 1
+         )
+         GROUP BY di.doc_no, di.trans_flag
+       )
+       SELECT
          t.doc_no,
          TO_CHAR(t.doc_date::date, 'YYYY-MM-DD') AS doc_date,
          t.trans_flag,
@@ -438,46 +507,11 @@ router.get('/documents', async (req, res) => {
          END AS price_adjust_status,
          COALESCE(line_stats.vat_type, 0)::int AS vat_type,
          COALESCE(line_stats.vat_type_count, 0)::int AS vat_type_count
-       FROM ic_trans t
+       FROM filtered_docs t
        LEFT JOIN ap_supplier ap ON ap.code = t.cust_code
-       LEFT JOIN LATERAL (
-         SELECT
-           COUNT(*) AS line_count,
-           COUNT(DISTINCT d.item_code) AS item_count,
-           COUNT(DISTINCT COALESCE(d.item_code, '') || E'\\x1F' || COALESCE(d.unit_code, '')) AS item_unit_count,
-           MIN(COALESCE(d.vat_type, 0)) AS vat_type,
-           COUNT(DISTINCT COALESCE(d.vat_type, 0)) AS vat_type_count
-         FROM ic_trans_detail d
-         WHERE d.doc_no = t.doc_no
-           AND d.trans_flag = t.trans_flag
-           AND COALESCE(d.status, 0) = 0
-           AND COALESCE(d.last_status, 0) = 0
-       ) line_stats ON true
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*)::int AS adjusted_item_unit_count
-         FROM (
-           SELECT DISTINCT
-             COALESCE(d.item_code, '') AS item_code,
-             COALESCE(d.unit_code, '') AS unit_code
-           FROM ic_trans_detail d
-           WHERE d.doc_no = t.doc_no
-             AND d.trans_flag = t.trans_flag
-             AND COALESCE(d.status, 0) = 0
-             AND COALESCE(d.last_status, 0) = 0
-             AND COALESCE(d.item_code, '') <> ''
-             AND COALESCE(d.unit_code, '') <> ''
-         ) doc_items
-         WHERE EXISTS (
-           SELECT 1
-           FROM pc_formular_doc_detail_temp_log h
-           WHERE h.ic_code = doc_items.item_code
-             AND h.unit_code = doc_items.unit_code
-           LIMIT 1
-         )
-       ) adjust_stats ON true
-       WHERE ${where.join(' AND ')}
-       ORDER BY t.doc_date DESC, t.doc_time DESC, t.doc_no DESC
-       LIMIT $${params.length}`,
+       LEFT JOIN line_stats ON line_stats.doc_no = t.doc_no AND line_stats.trans_flag = t.trans_flag
+       LEFT JOIN adjust_stats ON adjust_stats.doc_no = t.doc_no AND adjust_stats.trans_flag = t.trans_flag
+       ORDER BY t.doc_date DESC, t.doc_time DESC, t.doc_no DESC`,
       params,
     )
     res.json({ data: result.rows })
@@ -1114,6 +1148,8 @@ router.post('/save', async (req, res) => {
     const icCode = clean(item.item_code)
     const unitCode = clean(item.unit_code)
     const taxType = 0
+    const sourceDocNo = clean(item.source_doc_no).slice(0, 255)
+    const sourceTransFlag = intValue(item.source_trans_flag, 0)
     const formulaCategoryCode = clean(item.formula_category_code || item.selected_category_code).slice(0, 25)
     const formulaCategoryName = clean(item.formula_category_name || item.selected_category_name).slice(0, 255)
     if (!icCode || !unitCode) return res.status(400).json({ error: 'พบรายการที่ไม่มีรหัสสินค้าหรือหน่วยนับ' })
@@ -1123,7 +1159,7 @@ router.post('/save', async (req, res) => {
       return res.status(400).json({ error: `ราคาของสินค้า ${icCode} ต้องเป็นตัวเลขและไม่ติดลบ` })
     }
 
-    normalizedItems.push({ icCode, unitCode, taxType, formulaCategoryCode, formulaCategoryName, prices })
+    normalizedItems.push({ icCode, unitCode, taxType, sourceDocNo, sourceTransFlag, formulaCategoryCode, formulaCategoryName, prices })
   }
 
   const client = await posDB.connect()
@@ -1202,6 +1238,8 @@ router.post('/save', async (req, res) => {
         item.unitCode,
         saleType,
         item.taxType,
+        item.sourceDocNo,
+        item.sourceTransFlag,
         item.formulaCategoryCode,
         item.formulaCategoryName,
         exists.rowCount > 0,
@@ -1214,6 +1252,7 @@ router.post('/save', async (req, res) => {
       await client.query(
         `INSERT INTO pc_formular_doc_detail_temp (
            doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           source_doc_no, source_trans_flag,
            formula_category_code, formula_category_name,
            old_price_available,
            ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
@@ -1225,6 +1264,7 @@ router.post('/save', async (req, res) => {
       await client.query(
         `INSERT INTO pc_formular_doc_detail_temp_log (
            doc_no, doc_date, creator_code, ic_code, unit_code, sale_type, tax_type,
+           source_doc_no, source_trans_flag,
            formula_category_code, formula_category_name,
            old_price_available,
            ${PRICE_FIELDS.map((field) => `old_${field}`).join(', ')},
