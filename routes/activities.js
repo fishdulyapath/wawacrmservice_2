@@ -1904,9 +1904,21 @@ router.patch('/:id/done', async (req, res) => {
             skip_retry_today,
             visit_met, visit_order, visit_order_amount } = req.body
 
+    let parsedVisitOrderAmount = null
     // visit validation
-    if (oldActivity.activity_type === 'visit' && visit_met === undefined) {
-      return res.status(400).json({ error: 'กรุณาระบุสถานะการพบลูกค้า' })
+    if (oldActivity.activity_type === 'visit') {
+      if (typeof visit_met !== 'boolean') {
+        return res.status(400).json({ error: 'กรุณาระบุสถานะการพบลูกค้า' })
+      }
+      if (typeof visit_order !== 'boolean') {
+        return res.status(400).json({ error: 'กรุณาระบุสถานะออเดอร์' })
+      }
+      if (visit_order === true) {
+        parsedVisitOrderAmount = Number(visit_order_amount)
+        if (!Number.isFinite(parsedVisitOrderAmount) || parsedVisitOrderAmount <= 0) {
+          return res.status(400).json({ error: 'กรุณาระบุยอดบิลให้มากกว่า 0' })
+        }
+      }
     }
 
     // update shared outcome/call/visit fields บน activity row
@@ -1924,7 +1936,11 @@ router.patch('/:id/done', async (req, res) => {
         call_result_at    = CASE WHEN $4 IS NOT NULL THEN COALESCE($10::timestamptz, $9::timestamptz, NOW()) ELSE call_result_at END,
         visit_met         = COALESCE($11, visit_met),
         visit_order       = COALESCE($12, visit_order),
-        visit_order_amount= COALESCE($13, visit_order_amount),
+        visit_order_amount= CASE
+          WHEN $12 IS TRUE THEN $13::numeric
+          WHEN $12 IS FALSE THEN NULL
+          ELSE visit_order_amount
+        END,
         updated_at        = NOW()
       WHERE id=$1 RETURNING *`,
       [req.params.id,
@@ -1932,7 +1948,7 @@ router.patch('/:id/done', async (req, res) => {
        cdr_uuid||null, cdr_recording_url||null, cdr_start_stamp||null, cdr_end_stamp||null,
        visit_met !== undefined ? visit_met : null,
        visit_order !== undefined ? visit_order : null,
-       visit_order !== undefined && visit_order && visit_order_amount ? parseFloat(visit_order_amount) : (visit_order === false ? null : null)]
+       parsedVisitOrderAmount]
     )
 
     // update status: meeting หรือ admin/manager → ปิดทุก owner; call/task ของ sales_rep → เฉพาะ user นี้
