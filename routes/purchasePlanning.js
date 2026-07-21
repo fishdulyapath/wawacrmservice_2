@@ -962,9 +962,19 @@ function buildPlanningMetricsSql({
         td.doc_date::date AS sales_date,
         SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS sales_qty
       FROM ic_trans_detail td
+      JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
       JOIN candidates c ON c.ic_code = td.item_code
       WHERE td.trans_flag = 44
         AND COALESCE(td.status, 0) = 0
+        AND COALESCE(t.last_status, 0) = 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ic_trans so
+          WHERE so.doc_no = td.ref_doc_no
+            AND so.trans_flag = 36
+            AND COALESCE(so.doc_format_code, '') = 'SOL'
+            AND COALESCE(so.last_status, 0) = 0
+        )
         AND td.doc_date::date BETWEEN ($1::date - (($3::int - 1) || ' day')::interval)::date AND $1::date
       GROUP BY td.item_code, td.doc_date::date
     ),
@@ -1474,8 +1484,18 @@ async function runReportJob(job) {
            td.item_code AS ic_code,
            SUM(td.qty * COALESCE(td.stand_value / NULLIF(td.divide_value, 0), 1)) AS sale_qty
          FROM ic_trans_detail td
+         JOIN ic_trans t ON t.doc_no = td.doc_no AND t.trans_flag = td.trans_flag
          WHERE td.trans_flag = 44
            AND COALESCE(td.status, 0) = 0
+           AND COALESCE(t.last_status, 0) = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM ic_trans so
+             WHERE so.doc_no = td.ref_doc_no
+               AND so.trans_flag = 36
+               AND COALESCE(so.doc_format_code, '') = 'SOL'
+               AND COALESCE(so.last_status, 0) = 0
+           )
            AND td.doc_date::date BETWEEN ($1::date - (($2::int - 1) || ' day')::interval)::date AND $1::date
          GROUP BY td.item_code
        )
