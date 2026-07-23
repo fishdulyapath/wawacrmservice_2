@@ -20,6 +20,24 @@ const isSA       = u => u.code?.toUpperCase() === 'SUPERADMIN' || ['admin','mana
 const canCreate  = u => isSA(u)   // supervisor ขึ้นไป
 const canViewAll = u => ['admin','manager','supervisor'].includes(u.role) || u.code?.toUpperCase() === 'SUPERADMIN'
 
+function resolveActivityArCode(activity) {
+  const current = activity?.ar_code && String(activity.ar_code).trim()
+  if (current) return current
+
+  const text = [activity?.subject, activity?.description].filter(Boolean).join('\n')
+  const match = text.match(/\bAR[0-9A-Z_-]+\b/i)
+  return match ? match[0].toUpperCase() : null
+}
+
+function normalizeActivityArCodePatch(incomingArCode, oldActivity) {
+  if (incomingArCode === undefined) return oldActivity.ar_code
+
+  const normalized = incomingArCode && String(incomingArCode).trim()
+  if (normalized) return normalized
+
+  return oldActivity.ar_code || resolveActivityArCode(oldActivity)
+}
+
 // ── Helper: สร้างรหัสกิจกรรม act_no ─────────────────────────
 // รูปแบบ: C-yyyymmdd-0001 (call), M-yyyymmdd-0001 (meeting), W-yyyymmdd-0001 (task)
 // running number แยกต่อวัน + แยกตาม prefix
@@ -1015,8 +1033,13 @@ router.get('/', async (req, res) => {
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params)
 
+    const rowsWithArCode = dataResult.rows.map(r => ({
+      ...r,
+      ar_code: resolveActivityArCode(r),
+    }))
+
     // ดึง customer names จาก POS
-    const arCodes = [...new Set(dataResult.rows.map(r => r.ar_code).filter(Boolean))]
+    const arCodes = [...new Set(rowsWithArCode.map(r => r.ar_code).filter(Boolean))]
     let customerMap = {}
     if (arCodes.length > 0) {
       const placeholders = arCodes.map((_, i) => `$${i + 1}`).join(',')
@@ -1034,7 +1057,7 @@ router.get('/', async (req, res) => {
     const pageInt  = parseInt(page)
     const limitInt = parseInt(limit)
     res.json({
-      data: dataResult.rows.map(r => ({
+      data: rowsWithArCode.map(r => ({
         ...r,
         status: r.my_status || r.derived_status || 'open',
         customer_name: customerMap[r.ar_code]?.name || null,
@@ -1065,6 +1088,7 @@ router.get('/:id', async (req, res) => {
     )
     if (!result.rows.length) return res.status(404).json({ error: 'ไม่พบ Activity' })
     const activity = result.rows[0]
+    activity.ar_code = resolveActivityArCode(activity)
 
     // ดึง owners ทั้งหมด
     const owners = await getOwners(activity.id)
@@ -1398,7 +1422,7 @@ router.put('/:id', async (req, res) => {
         meeting_url    !== undefined ? (meeting_url || null)    : old.meeting_url,
         outcome        !== undefined ? (outcome || null)        : old.outcome,
         all_day        !== undefined ? all_day                  : old.all_day,
-        ar_code        !== undefined ? (ar_code || null)        : old.ar_code,
+        normalizeActivityArCodePatch(ar_code, old),
         visit_met      !== undefined ? visit_met                : old.visit_met,
         visit_order    !== undefined ? visit_order              : old.visit_order,
         visit_order    !== undefined
